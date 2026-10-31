@@ -8,7 +8,16 @@ use std::time::Instant;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-    fn prctl(option: i32, a2: u64, a3: u64, a4: u64, a5: u64) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn mallopt(param: i32, value: i32) -> i32;
+}
+
+/// Keep transparent huge pages off a sparsely touched buffer: memory.peak charges a whole 2 MB
+/// page for its first touched byte. MADV_NOHUGEPAGE = 15.
+fn no_huge<T>(v: &mut Vec<T>) {
+    let lo = v.as_mut_ptr() as usize & !4095;
+    let hi = v.as_mut_ptr() as usize + v.capacity() * std::mem::size_of::<T>();
+    unsafe { madvise(lo as *mut u8, hi - lo, 15) };
 }
 
 /// Read-only private mapping of a whole file; the page cache is not charged to us, a heap copy would be.
@@ -206,6 +215,7 @@ fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
                 let claim = &claim;
                 s.spawn(move || {
                     let mut list: Vec<u32> = Vec::with_capacity(n); // only touched pages are charged
+                    no_huge(&mut list);
                     let (mut scan, end, mut head) = (t * n / threads, (t + 1) * n / threads, 0);
                     loop {
                         if head == list.len() {
@@ -524,11 +534,10 @@ impl Search {
 fn main() {
     let t0 = Instant::now();
     let env = |k: &str| std::env::var(k).ok();
-    if env("FW_THP").as_deref() != Some("1") {
-        // Transparent huge pages round sparse allocations (per-thread lists, malloc arenas) up to
-        // 2 MB, and memory.peak charges the whole page. PR_SET_THP_DISABLE = 41.
-        unsafe { prctl(41, 1, 0, 0, 0) };
-    }
+    // The scoring box backs anonymous memory with 2 MB pages. That helps the graph, but would round
+    // every thread's stack and malloc arena up to 2 MB: so small stacks, and one arena (M_ARENA_MAX).
+    std::env::set_var("RUST_MIN_STACK", "262144");
+    unsafe { mallopt(-8, 1) };
     let threads = env("FW_THREADS").and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |p| p.get()));
     let qtxt = map("/data/queries.txt");
