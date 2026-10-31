@@ -60,8 +60,23 @@ fn map(path: &str) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts(p, len) }
 }
 
+/// Parse the decimal number at b[i..] and step past the space or LF after it. Up to 7 digits in
+/// one go: load 8 bytes, find the first non-digit, shift the digits to the top (the empty low
+/// bytes act as leading zeros) and combine pairs, quads and octets with three multiplies.
 #[inline(always)]
 fn num(b: &[u8], i: &mut usize) -> u64 {
+    if let Some(w) = b.get(*i..*i + 8) {
+        let d = u64::from_le_bytes(w.try_into().unwrap()) ^ 0x3030_3030_3030_3030;
+        let stop = d.wrapping_add(0x7676_7676_7676_7676) & 0x8080_8080_8080_8080; // bytes >= 10: not a digit
+        let len = stop.trailing_zeros() as usize / 8;
+        if len < 8 {
+            *i += len + 1;
+            let v = if len == 0 { 0 } else { (d << (64 - 8 * len)) & 0x0F0F_0F0F_0F0F_0F0F };
+            let v = v.wrapping_mul(2561) >> 8 & 0x00FF_00FF_00FF_00FF;
+            let v = v.wrapping_mul(6553601) >> 16 & 0x0000_FFFF_0000_FFFF;
+            return v.wrapping_mul(42949672960001) >> 32;
+        }
+    }
     let mut x = 0u64;
     while let Some(&c) = b.get(*i).filter(|c| c.is_ascii_digit()) {
         x = x * 10 + (c - b'0') as u64;
