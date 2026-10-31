@@ -8,6 +8,7 @@ use std::time::Instant;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn prctl(option: i32, a2: u64, a3: u64, a4: u64, a5: u64) -> i32;
 }
 
 /// Read-only private mapping of a whole file; the page cache is not charged to us, a heap copy would be.
@@ -523,6 +524,11 @@ impl Search {
 fn main() {
     let t0 = Instant::now();
     let env = |k: &str| std::env::var(k).ok();
+    if env("FW_THP").as_deref() != Some("1") {
+        // Transparent huge pages round sparse allocations (per-thread lists, malloc arenas) up to
+        // 2 MB, and memory.peak charges the whole page. PR_SET_THP_DISABLE = 41.
+        unsafe { prctl(41, 1, 0, 0, 0) };
+    }
     let threads = env("FW_THREADS").and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |p| p.get()));
     let qtxt = map("/data/queries.txt");
