@@ -500,96 +500,47 @@ static SETTLES: AtomicU64 = AtomicU64::new(0);
 
 /// Distances in the two-ended search are 31 bits; the top bit marks "settled".
 const SETTLED: u32 = 1 << 31;
+const INF: u32 = SETTLED - 1;
+const NOPAGE: u32 = u32::MAX;
 
-/// One direction of the two-ended search: a hash table of every node it has labelled (open
-/// addressing, never deleted; a slot is live when its 8-bit generation is current, so clearing
-/// is one increment) and its queue. Slot = (node | generation << 24) << 32 | distance.
-struct Side {
-    slots: Vec<u64>,
-    mask: usize,
-    len: usize,
-    gen: u64,
-    heap: Radix,
+/// Labels of the two-ended search in pages of 128 consecutive node ids (neighbours in BFS order),
+/// allocated on first touch from a per-thread pool. A page holds 128 forward distances and then
+/// 128 backward ones, so one directory lookup answers both sides: other side = index ^ 128.
+struct Pages {
+    dir: Vec<u32>,
+    pool: Vec<u32>,
+    top: usize,
+    used: Vec<u32>,
 }
 
-impl Side {
-    fn new() -> Self {
-        Side { slots: vec![0; 1 << 13], mask: (1 << 13) - 1, len: 0, gen: 1, heap: Radix::new() }
+impl Pages {
+    fn new(n: usize) -> Self {
+        Pages { dir: vec![NOPAGE; (n >> 7) + 1], pool: Vec::new(), top: 0, used: Vec::new() }
     }
 
-    /// Slot of `v`, and whether it is live (else: the empty slot where it would go).
+    /// Index of v's forward label, allocating its page.
     #[inline(always)]
-    fn find(&self, v: u32) -> (usize, bool) {
-        let tag = (v as u64 | self.gen << 24) << 32;
-        let mut i = ((v as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & self.mask;
-        loop {
-            let s = self.slots[i];
-            if s >> 32 << 32 == tag {
-                return (i, true);
+    fn at(&mut self, v: u32) -> usize {
+        let d = (v >> 7) as usize;
+        if self.dir[d] == NOPAGE {
+            self.dir[d] = (self.top / 256) as u32;
+            self.top += 256;
+            if self.pool.len() < self.top {
+                self.pool.resize(self.top, INF);
+            } else {
+                self.pool[self.top - 256..self.top].fill(INF);
             }
-            if s >> 56 != self.gen {
-                return (i, false);
-            }
-            i = (i + 1) & self.mask;
+            self.used.push(d as u32);
         }
-    }
-
-    /// Distance label of `v` (tentative or settled), if any.
-    #[inline(always)]
-    fn dist(&self, v: u32) -> Option<u32> {
-        let (i, live) = self.find(v);
-        live.then(|| self.slots[i] as u32 & !SETTLED)
-    }
-
-    /// Lower v's tentative distance to d; false if v is settled or already as close.
-    #[inline(always)]
-    fn relax(&mut self, v: u32, d: u32) -> bool {
-        let (i, live) = self.find(v);
-        if live && (self.slots[i] as u32 & SETTLED != 0 || self.slots[i] as u32 <= d) {
-            return false;
-        }
-        self.slots[i] = (v as u64 | self.gen << 24) << 32 | d as u64;
-        if !live {
-            self.len += 1;
-            if self.len * 8 > self.slots.len() * 5 {
-                self.grow();
-            }
-        }
-        true
-    }
-
-    /// Settle u at distance d; false for a stale queue entry.
-    #[inline(always)]
-    fn settle(&mut self, u: u32, d: u32) -> bool {
-        let (i, _) = self.find(u);
-        let s = self.slots[i] as u32;
-        if s & SETTLED != 0 || s < d {
-            return false;
-        }
-        self.slots[i] |= SETTLED as u64;
-        true
-    }
-
-    fn grow(&mut self) {
-        let cap = self.slots.len() * 2;
-        let old = std::mem::replace(&mut self.slots, vec![0; cap]);
-        self.mask = self.slots.len() - 1;
-        for s in old {
-            if s >> 56 == self.gen {
-                let (i, _) = self.find((s >> 32) as u32 & 0xFF_FFFF);
-                self.slots[i] = s;
-            }
-        }
+        self.dir[d] as usize * 256 + (v & 127) as usize
     }
 
     fn clear(&mut self) {
-        self.gen += 1;
-        if self.gen == 256 {
-            self.gen = 1;
-            self.slots.fill(0);
+        for &d in &self.used {
+            self.dir[d as usize] = NOPAGE;
         }
-        self.len = 0;
-        self.heap.clear(|_| {});
+        self.used.clear();
+        self.top = 0;
     }
 }
 
@@ -597,26 +548,30 @@ impl Side {
 /// expanding the side with the smaller queue minimum. mu is the best s-t length seen through any
 /// node labelled by both sides; stop when the two minimums together reach mu. None when a
 /// distance would not fit 31 bits (the caller then runs the one-ended search with u64).
-fn bidir(f: &mut Side, b: &mut Side, g: &Graph, r: &Graph, s: usize, t: usize) -> Option<i64> {
-    let mut mu = u64::MAX;
-    let mut settled = 0u64;
-    f.relax(s as u32, 0);
-    f.heap.put(0, s as u32);
-    b.relax(t as u32, 0);
-    b.heap.put(0, t as u32);
-    let res = loop {
-        let (Some(kf), Some(kb)) = (f.heap.min(), b.heap.min()) else { break Some(mu) };
+fn bidir(pg: &mut Pages, hs: &mut [Radix; 2], g: &Graph, r: &Graph, s: usize, t: usize) -> Option<i64> {
+    let (mut mu, mut settled) = (u64::MAX, 0u64);
+    let i = pg.at(s as u32);
+    pg.pool[i] = 0;
+    hs[0].put(0, s as u32);
+    let i = pg.at(t as u32) ^ 128;
+    pg.pool[i] = 0;
+    hs[1].put(0, t as u32);
+    let res = 'search: loop {
+        let (Some(kf), Some(kb)) = (hs[0].min(), hs[1].min()) else { break Some(mu) };
         if kf + kb >= mu {
             break Some(mu);
         }
-        let (me, other, gr) = if kf <= kb { (&mut *f, &*b, g) } else { (&mut *b, &*f, r) };
-        let (d, u) = me.heap.pop().unwrap();
-        if !me.settle(u, d as u32) {
-            continue;
+        let side = (kf > kb) as usize;
+        let (gr, sx) = if side == 0 { (g, 0) } else { (r, 128) };
+        let (d, u) = hs[side].pop().unwrap();
+        let iu = pg.at(u) ^ sx;
+        let lu = pg.pool[iu];
+        if lu & SETTLED != 0 || (lu as u64) < d {
+            continue; // stale entry
         }
+        pg.pool[iu] = lu | SETTLED;
         settled += 1;
         let (mut e, end) = (gr.off(u as usize), gr.off(u as usize + 1));
-        let mut over = false;
         while e < end {
             let x = gr.edges[e];
             let v = x & ((1 << gr.vb) - 1);
@@ -627,24 +582,25 @@ fn bidir(f: &mut Side, b: &mut Side, g: &Graph, r: &Graph, s: usize, t: usize) -
                 e += 1;
             }
             let nd = d + wt as u64;
-            if nd >= SETTLED as u64 {
-                over = true;
-                break;
+            if nd >= INF as u64 {
+                break 'search None;
             }
-            if me.relax(v, nd as u32) {
-                me.heap.put(nd, v);
-                if let Some(o) = other.dist(v) {
-                    mu = mu.min(nd + o as u64);
-                }
+            let iv = pg.at(v) ^ sx;
+            let lv = pg.pool[iv];
+            if lv & SETTLED != 0 || lv as u64 <= nd {
+                continue;
             }
-        }
-        if over {
-            break None;
+            pg.pool[iv] = nd as u32;
+            hs[side].put(nd, v);
+            let o = pg.pool[iv ^ 128] & !SETTLED;
+            if o != INF {
+                mu = mu.min(nd + o as u64);
+            }
         }
     };
     SETTLES.fetch_add(settled, Relaxed);
-    f.clear();
-    b.clear();
+    pg.clear();
+    hs.iter_mut().for_each(|h| h.clear(|_| {}));
     res.map(|m| if m == u64::MAX { -1 } else { m as i64 })
 }
 
@@ -813,8 +769,7 @@ fn main() {
     }
     let g = build(map("/data/graph.txt"), threads, &mut qs, env("FW_RENUM").map_or(true, |v| v != "0"));
     let n = g.rel.len() - 1;
-    // Two-ended search packs node ids into 24 bits of a table slot.
-    let two = n < 1 << 24 && env("FW_BIDIR").map_or(true, |v| v != "0");
+    let two = env("FW_BIDIR").map_or(true, |v| v != "0");
     let tt = Instant::now();
     let r = if two { transpose(&g, threads) } else { Graph { edges: vec![], base: vec![], rel: vec![], sh: 0, vb: 0, esc: 0, has_in: vec![] } };
     let t_build = t0.elapsed();
@@ -825,7 +780,7 @@ fn main() {
     std::thread::scope(|sc| {
         for _ in 0..threads {
             sc.spawn(|| {
-                let (mut f, mut b) = (Side::new(), Side::new());
+                let (mut pg, mut hs) = (Pages::new(n), [Radix::new(), Radix::new()]);
                 let mut one: Option<Search> = None; // for the few queries beyond 31-bit distances
                 loop {
                     let k = next.fetch_add(1, Relaxed);
@@ -834,7 +789,7 @@ fn main() {
                         0
                     } else if g.off(s) == g.off(s + 1) || g.has_in[t >> 6] & (1 << (t & 63)) == 0 {
                         -1 // no way out of s, or no way into t
-                    } else if let Some(d) = two.then(|| bidir(&mut f, &mut b, &g, &r, s, t)).flatten() {
+                    } else if let Some(d) = two.then(|| bidir(&mut pg, &mut hs, &g, &r, s, t)).flatten() {
                         d
                     } else {
                         one.get_or_insert_with(|| Search::new(n)).run(&g, s, t)
