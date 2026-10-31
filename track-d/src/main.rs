@@ -12,12 +12,40 @@ extern "C" {
     fn mallopt(param: i32, value: i32) -> i32;
 }
 
-/// Keep transparent huge pages off a sparsely touched buffer: memory.peak charges a whole 2 MB
-/// page for its first touched byte. MADV_NOHUGEPAGE = 15.
-fn no_huge<T>(v: &mut Vec<T>) {
-    let lo = v.as_mut_ptr() as usize & !4095;
-    let hi = v.as_mut_ptr() as usize + v.capacity() * std::mem::size_of::<T>();
-    unsafe { madvise(lo as *mut u8, hi - lo, 15) };
+/// The scoring box backs anonymous memory with 2 MB pages (THP "always"), and memory.peak charges
+/// a whole 2 MB page for its first touched byte. So every allocation of 256 KB or more is marked
+/// MADV_NOHUGEPAGE, and only the graph arrays, which are dense and hot, opt back in (`huge`).
+struct Alloc;
+
+unsafe impl std::alloc::GlobalAlloc for Alloc {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        advise(std::alloc::System.alloc(l), l.size(), 15)
+    }
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        advise(std::alloc::System.alloc_zeroed(l), l.size(), 15)
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        std::alloc::System.dealloc(p, l)
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
+        advise(std::alloc::System.realloc(p, l, n), n, 15)
+    }
+}
+
+#[global_allocator]
+static ALLOC: Alloc = Alloc;
+
+/// madvise the whole pages inside [p, p + len) when len >= 256 KB (14 = HUGEPAGE, 15 = NOHUGEPAGE).
+fn advise(p: *mut u8, len: usize, advice: i32) -> *mut u8 {
+    let (lo, hi) = ((p as usize + 4095) & !4095, (p as usize + len) & !4095);
+    if len >= 1 << 18 && hi > lo {
+        unsafe { madvise(lo as *mut u8, hi - lo, advice) };
+    }
+    p
+}
+
+fn huge<T>(v: &mut Vec<T>) {
+    advise(v.as_mut_ptr() as *mut u8, v.capacity() * std::mem::size_of::<T>(), 14);
 }
 
 /// Read-only private mapping of a whole file; the page cache is not charged to us, a heap copy would be.
@@ -41,6 +69,15 @@ fn num(b: &[u8], i: &mut usize) -> u64 {
     }
     *i += 1; // the space or LF after the number
     x
+}
+
+/// Hint the cache to fetch the line holding `x`.
+#[inline(always)]
+fn prefetch<T>(x: &T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(x as *const T as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    };
 }
 
 /// Diagnostics: process RSS high-water mark and the container's memory.current / memory.peak (MB).
@@ -123,6 +160,7 @@ fn layout(n: usize, slots: impl Fn(usize) -> u32) -> (Vec<u32>, Vec<u8>, u32) {
         }
         base.push(total);
         if ok || sh == 0 {
+            huge(&mut rel);
             return (base, rel, sh);
         }
         sh -= 1;
@@ -147,20 +185,30 @@ impl Text {
         Text { body: &g[i..], parts: chunks(&g[i..], threads * 4), n, vb, esc: (1u32 << (32 - vb)) - 1 }
     }
 
-    /// Pass 1: slots per node (1, or 2 when the weight needs an escape word).
+    /// Pass 1: slots per node (1, or 2 when the weight needs an escape word). Lines go in batches
+    /// of 16: a locked add cannot overlap its cache miss with the next one, so the 16 counters are
+    /// prefetched first and their misses overlap.
     fn count(&self, threads: usize) -> Vec<AtomicU16> {
         let deg: Vec<AtomicU16> = (0..self.n + 1).map(|_| AtomicU16::new(0)).collect();
         let b = self.body;
         par(threads, &self.parts, |&(lo, hi)| {
             let mut i = lo;
+            let mut batch = [(0usize, 0u16); 16];
             while i < hi {
-                let u = num(b, &mut i) as usize;
-                while b[i] != b' ' {
+                let mut k = 0;
+                while k < 16 && i < hi {
+                    let u = num(b, &mut i) as usize;
+                    while b[i] != b' ' {
+                        i += 1;
+                    }
                     i += 1;
+                    batch[k] = (u, 1 + (num(b, &mut i) >= self.esc as u64) as u16);
+                    prefetch(&deg[u]);
+                    k += 1;
                 }
-                i += 1;
-                let k = 1 + (num(b, &mut i) >= self.esc as u64) as u16;
-                assert!(deg[u].fetch_add(k, Relaxed) < u16::MAX - 2, "out-degree above 65k");
+                for &(u, c) in &batch[..k] {
+                    assert!(deg[u].fetch_add(c, Relaxed) < u16::MAX - 2, "out-degree above 65k");
+                }
             }
         });
         deg
@@ -172,26 +220,42 @@ impl Text {
         let (base, rel, sh) = lay;
         let (b, vb, esc) = (self.body, self.vb, self.esc);
         let mut edges = vec![0u32; *base.last().unwrap() as usize];
+        huge(&mut edges);
         let out = Slots(edges.as_mut_ptr());
         let has_in: Vec<AtomicU64> = (0..self.n / 64 + 1).map(|_| AtomicU64::new(0)).collect();
         par(threads, &self.parts, |&(lo, hi)| {
             let out = &out;
             let mut i = lo;
+            let mut batch = [(0usize, 0usize, 0u64); 16];
             while i < hi {
-                let (u, v) = (num(b, &mut i) as usize, num(b, &mut i) as usize);
-                let w = num(b, &mut i);
-                let big = w >= esc as u64;
-                let k = 1 + big as u16;
-                let p = base[u >> sh] as usize + rel[u] as usize + (deg[u].fetch_sub(k, Relaxed) - k) as usize;
-                unsafe {
-                    *out.0.add(p) = v as u32 | (w.min(esc as u64) as u32) << vb;
-                    if big {
-                        *out.0.add(p + 1) = w as u32;
+                // A locked op waits for every earlier store to land, so take the 16 cursors first
+                // and only then issue the 16 scattered stores, which overlap their misses.
+                let mut k = 0;
+                while k < 16 && i < hi {
+                    let (u, v) = (num(b, &mut i) as usize, num(b, &mut i) as usize);
+                    batch[k] = (u, v, num(b, &mut i));
+                    prefetch(&deg[u]);
+                    k += 1;
+                }
+                for e in &mut batch[..k] {
+                    let (u, big) = (e.0, e.2 >= esc as u64);
+                    let c = 1 + big as u16;
+                    e.0 = base[u >> sh] as usize + rel[u] as usize + (deg[u].fetch_sub(c, Relaxed) - c) as usize;
+                    if e.1 == u {
+                        e.1 |= 1 << 63; // self-loop: not an in-edge for the precheck
                     }
                 }
-                let bit = 1u64 << (v & 63);
-                if targets[v >> 6] & bit != 0 && v != u {
-                    has_in[v >> 6].fetch_or(bit, Relaxed);
+                for &(p, v, w) in &batch[..k] {
+                    unsafe {
+                        *out.0.add(p) = v as u32 | (w.min(esc as u64) as u32) << vb;
+                        if w >= esc as u64 {
+                            *out.0.add(p + 1) = w as u32;
+                        }
+                    }
+                    let bit = 1u64 << (v & 63);
+                    if v >> 63 == 0 && targets[v >> 6] & bit != 0 {
+                        has_in[v >> 6].fetch_or(bit, Relaxed);
+                    }
                 }
             }
         });
@@ -215,7 +279,6 @@ fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
                 let claim = &claim;
                 s.spawn(move || {
                     let mut list: Vec<u32> = Vec::with_capacity(n); // only touched pages are charged
-                    no_huge(&mut list);
                     let (mut scan, end, mut head) = (t * n / threads, (t + 1) * n / threads, 0);
                     loop {
                         if head == list.len() {
@@ -272,6 +335,7 @@ fn relabel(g: &Graph, newid: &[u32], threads: usize) -> Graph {
     let (base, rel, sh) = layout(n, |k| deg[k].load(Relaxed) as u32);
     drop(deg);
     let mut edges = vec![0u32; *base.last().unwrap() as usize];
+    huge(&mut edges);
     let out = Slots(edges.as_mut_ptr());
     let mut has_in = vec![0u64; n / 64 + 1];
     par(threads, &ranges, |&(lo, hi)| {
@@ -303,6 +367,49 @@ fn relabel(g: &Graph, newid: &[u32], threads: usize) -> Graph {
     Graph { edges, base, rel, sh, vb: g.vb, esc: g.esc, has_in }
 }
 
+/// Reverse graph: v's slots list (u, w) for every edge u -> v of `g`.
+fn transpose(g: &Graph, threads: usize) -> Graph {
+    let n = g.rel.len() - 1;
+    let vmask = (1u32 << g.vb) - 1;
+    let ranges: Vec<(usize, usize)> = (0..threads * 4).map(|j| (j * n / (threads * 4), (j + 1) * n / (threads * 4))).collect();
+    // Calls f(u, e) for every edge slot e of every node u.
+    let each = |f: &(dyn Fn(usize, usize) + Sync)| {
+        par(threads, &ranges, |&(lo, hi)| {
+            for u in lo..hi {
+                let (mut e, end) = (g.off(u), g.off(u + 1));
+                while e < end {
+                    f(u, e);
+                    e += 1 + ((g.edges[e] >> g.vb) == g.esc) as usize;
+                }
+            }
+        })
+    };
+    let deg: Vec<AtomicU16> = (0..n + 1).map(|_| AtomicU16::new(0)).collect();
+    each(&|_, e| {
+        let x = g.edges[e];
+        deg[(x & vmask) as usize].fetch_add(1 + ((x >> g.vb) == g.esc) as u16, Relaxed);
+    });
+    let (base, rel, sh) = layout(n, |k| deg[k].load(Relaxed) as u32);
+    let mut edges = vec![0u32; *base.last().unwrap() as usize];
+    huge(&mut edges);
+    let out = Slots(edges.as_mut_ptr());
+    let out = &out;
+    each(&|u, e| {
+        let x = g.edges[e];
+        let v = (x & vmask) as usize;
+        let big = (x >> g.vb) == g.esc;
+        let k = 1 + big as u16;
+        let p = base[v >> sh] as usize + rel[v] as usize + (deg[v].fetch_sub(k, Relaxed) - k) as usize;
+        unsafe {
+            *out.0.add(p) = u as u32 | (x & !vmask);
+            if big {
+                *out.0.add(p + 1) = g.edges[e + 1];
+            }
+        }
+    });
+    Graph { edges, base, rel, sh, vb: g.vb, esc: g.esc, has_in: Vec::new() }
+}
+
 /// Parse and build the graph; with `renum`, relabel nodes in BFS order and copy the graph into
 /// that order. Rewrites the ids in `qs` to match.
 fn build(gtxt: &'static [u8], threads: usize, qs: &mut [(usize, usize)], renum: bool) -> Graph {
@@ -310,6 +417,7 @@ fn build(gtxt: &'static [u8], threads: usize, qs: &mut [(usize, usize)], renum: 
     let txt = Text::new(gtxt, threads);
     let n = txt.n;
     let deg = txt.count(threads);
+    let tc = t.elapsed();
     let lay = layout(n, |k| deg[k].load(Relaxed) as u32);
     let mut targets = vec![0u64; n / 64 + 1];
     qs.iter().for_each(|&(_, q)| targets[q >> 6] |= 1 << (q & 63));
@@ -325,7 +433,7 @@ fn build(gtxt: &'static [u8], threads: usize, qs: &mut [(usize, usize)], renum: 
     for q in qs.iter_mut() {
         *q = (newid[q.0] as usize, newid[q.1] as usize);
     }
-    eprintln!("build first {t1:?} bfs {:?} copy {:?} {}", t2 - t1, t.elapsed() - t2, mem());
+    eprintln!("build count {tc:?} fill {:?} bfs {:?} copy {:?} {}", t1 - tc, t2 - t1, t.elapsed() - t2, mem());
     g
 }
 
@@ -351,8 +459,9 @@ impl Radix {
         }
     }
 
+    /// Smallest key, after moving it into bucket 0.
     #[inline(always)]
-    fn pop(&mut self) -> Option<(u64, u32)> {
+    fn min(&mut self) -> Option<u64> {
         if self.b[0].is_empty() {
             if self.occ == 0 {
                 return None;
@@ -367,6 +476,12 @@ impl Radix {
             v.clear();
             self.b[i] = v;
         }
+        Some(self.last)
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) -> Option<(u64, u32)> {
+        self.min()?;
         self.b[0].pop()
     }
 
@@ -382,6 +497,156 @@ impl Radix {
 
 const EMPTY: u32 = u32::MAX;
 static SETTLES: AtomicU64 = AtomicU64::new(0);
+
+/// Distances in the two-ended search are 31 bits; the top bit marks "settled".
+const SETTLED: u32 = 1 << 31;
+
+/// One direction of the two-ended search: a hash table of every node it has labelled (open
+/// addressing, never deleted; a slot is live when its 8-bit generation is current, so clearing
+/// is one increment) and its queue. Slot = (node | generation << 24) << 32 | distance.
+struct Side {
+    slots: Vec<u64>,
+    mask: usize,
+    len: usize,
+    gen: u64,
+    heap: Radix,
+}
+
+impl Side {
+    fn new() -> Self {
+        Side { slots: vec![0; 1 << 13], mask: (1 << 13) - 1, len: 0, gen: 1, heap: Radix::new() }
+    }
+
+    /// Slot of `v`, and whether it is live (else: the empty slot where it would go).
+    #[inline(always)]
+    fn find(&self, v: u32) -> (usize, bool) {
+        let tag = (v as u64 | self.gen << 24) << 32;
+        let mut i = ((v as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & self.mask;
+        loop {
+            let s = self.slots[i];
+            if s >> 32 << 32 == tag {
+                return (i, true);
+            }
+            if s >> 56 != self.gen {
+                return (i, false);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    /// Distance label of `v` (tentative or settled), if any.
+    #[inline(always)]
+    fn dist(&self, v: u32) -> Option<u32> {
+        let (i, live) = self.find(v);
+        live.then(|| self.slots[i] as u32 & !SETTLED)
+    }
+
+    /// Lower v's tentative distance to d; false if v is settled or already as close.
+    #[inline(always)]
+    fn relax(&mut self, v: u32, d: u32) -> bool {
+        let (i, live) = self.find(v);
+        if live && (self.slots[i] as u32 & SETTLED != 0 || self.slots[i] as u32 <= d) {
+            return false;
+        }
+        self.slots[i] = (v as u64 | self.gen << 24) << 32 | d as u64;
+        if !live {
+            self.len += 1;
+            if self.len * 8 > self.slots.len() * 5 {
+                self.grow();
+            }
+        }
+        true
+    }
+
+    /// Settle u at distance d; false for a stale queue entry.
+    #[inline(always)]
+    fn settle(&mut self, u: u32, d: u32) -> bool {
+        let (i, _) = self.find(u);
+        let s = self.slots[i] as u32;
+        if s & SETTLED != 0 || s < d {
+            return false;
+        }
+        self.slots[i] |= SETTLED as u64;
+        true
+    }
+
+    fn grow(&mut self) {
+        let cap = self.slots.len() * 2;
+        let old = std::mem::replace(&mut self.slots, vec![0; cap]);
+        self.mask = self.slots.len() - 1;
+        for s in old {
+            if s >> 56 == self.gen {
+                let (i, _) = self.find((s >> 32) as u32 & 0xFF_FFFF);
+                self.slots[i] = s;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.gen += 1;
+        if self.gen == 256 {
+            self.gen = 1;
+            self.slots.fill(0);
+        }
+        self.len = 0;
+        self.heap.clear(|_| {});
+    }
+}
+
+/// Two-ended Dijkstra: forward from s on `g`, backward from t on the reverse graph `r`, always
+/// expanding the side with the smaller queue minimum. mu is the best s-t length seen through any
+/// node labelled by both sides; stop when the two minimums together reach mu. None when a
+/// distance would not fit 31 bits (the caller then runs the one-ended search with u64).
+fn bidir(f: &mut Side, b: &mut Side, g: &Graph, r: &Graph, s: usize, t: usize) -> Option<i64> {
+    let mut mu = u64::MAX;
+    let mut settled = 0u64;
+    f.relax(s as u32, 0);
+    f.heap.put(0, s as u32);
+    b.relax(t as u32, 0);
+    b.heap.put(0, t as u32);
+    let res = loop {
+        let (Some(kf), Some(kb)) = (f.heap.min(), b.heap.min()) else { break Some(mu) };
+        if kf + kb >= mu {
+            break Some(mu);
+        }
+        let (me, other, gr) = if kf <= kb { (&mut *f, &*b, g) } else { (&mut *b, &*f, r) };
+        let (d, u) = me.heap.pop().unwrap();
+        if !me.settle(u, d as u32) {
+            continue;
+        }
+        settled += 1;
+        let (mut e, end) = (gr.off(u as usize), gr.off(u as usize + 1));
+        let mut over = false;
+        while e < end {
+            let x = gr.edges[e];
+            let v = x & ((1 << gr.vb) - 1);
+            let mut wt = x >> gr.vb;
+            e += 1;
+            if wt == gr.esc {
+                wt = gr.edges[e];
+                e += 1;
+            }
+            let nd = d + wt as u64;
+            if nd >= SETTLED as u64 {
+                over = true;
+                break;
+            }
+            if me.relax(v, nd as u32) {
+                me.heap.put(nd, v);
+                if let Some(o) = other.dist(v) {
+                    mu = mu.min(nd + o as u64);
+                }
+            }
+        }
+        if over {
+            break None;
+        }
+    };
+    SETTLES.fetch_add(settled, Relaxed);
+    f.clear();
+    b.clear();
+    res.map(|m| if m == u64::MAX { -1 } else { m as i64 })
+}
 
 /// Tentative distances of unsettled nodes only: linear probing, backward-shift delete.
 struct Frontier {
@@ -548,14 +813,20 @@ fn main() {
     }
     let g = build(map("/data/graph.txt"), threads, &mut qs, env("FW_RENUM").map_or(true, |v| v != "0"));
     let n = g.rel.len() - 1;
+    // Two-ended search packs node ids into 24 bits of a table slot.
+    let two = n < 1 << 24 && env("FW_BIDIR").map_or(true, |v| v != "0");
+    let tt = Instant::now();
+    let r = if two { transpose(&g, threads) } else { Graph { edges: vec![], base: vec![], rel: vec![], sh: 0, vb: 0, esc: 0, has_in: vec![] } };
     let t_build = t0.elapsed();
+    eprintln!("transpose {:?}", tt.elapsed());
 
     let answers: Vec<AtomicI64> = qs.iter().map(|_| AtomicI64::new(-1)).collect();
     let next = AtomicUsize::new(0);
     std::thread::scope(|sc| {
         for _ in 0..threads {
             sc.spawn(|| {
-                let mut st = Search::new(n);
+                let (mut f, mut b) = (Side::new(), Side::new());
+                let mut one: Option<Search> = None; // for the few queries beyond 31-bit distances
                 loop {
                     let k = next.fetch_add(1, Relaxed);
                     let Some(&(s, t)) = qs.get(k) else { break };
@@ -563,8 +834,10 @@ fn main() {
                         0
                     } else if g.off(s) == g.off(s + 1) || g.has_in[t >> 6] & (1 << (t & 63)) == 0 {
                         -1 // no way out of s, or no way into t
+                    } else if let Some(d) = two.then(|| bidir(&mut f, &mut b, &g, &r, s, t)).flatten() {
+                        d
                     } else {
-                        st.run(&g, s, t)
+                        one.get_or_insert_with(|| Search::new(n)).run(&g, s, t)
                     };
                     answers[k].store(ans, Relaxed);
                 }
