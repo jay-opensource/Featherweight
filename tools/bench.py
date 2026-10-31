@@ -51,6 +51,9 @@ def run_once(track, tag, data, rel, threads):
     mount = (["--mount", f"type=volume,src={VOLUME},dst=/data,readonly,volume-subpath={rel}"] if VOLUME
              else ["-v", f"{data}:/data:ro"])
     env = ["-e", f"TRACK={track}"] + (["-e", f"FW_THREADS={threads}"] if threads else [])
+    # Experiment switches (FW_RENUM=0 and so on) pass straight through to the solution.
+    env += [x for k, v in os.environ.items() if k.startswith("FW_") and k not in ("FW_DATA", "FW_VOLUME")
+            for x in ("-e", f"{k}={v}")]
     cmd = ["docker", "run", "--rm", "--network=none", "--read-only", "--tmpfs", "/tmp:rw,size=1g,exec",
            "--memory=8g", "--memory-swap=8g", "--pids-limit=512", "--cap-drop=ALL",
            "--security-opt=no-new-privileges", "--user", "65534:65534", "--ulimit", "nofile=8192:8192",
@@ -94,6 +97,8 @@ def main():
         data = os.path.join(DATA_ROOT, *rel.split("/"))
         exp = want.get(f"{rel}/{OUTPUT[a.track]}")
         ts, ms, ok = [], [], True
+        if a.runs > 1:
+            run_once(a.track, tag, data, rel, a.threads)  # warm-up: page cache, as on the board
         for _ in range(a.runs):
             t, m, h, err = run_once(a.track, tag, data, rel, a.threads)
             ts.append(t); ms.append(m)
