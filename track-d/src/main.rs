@@ -290,6 +290,15 @@ fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
                             }
                             list.push(scan as u32);
                         }
+                        // Software pipeline over the queue: offsets 16 nodes ahead, edge lists 8
+                        // ahead, so the misses of upcoming nodes overlap with this one's work.
+                        if let Some(&w) = list.get(head + 16) {
+                            prefetch(&g.rel[w as usize]);
+                            prefetch(&g.base[w as usize >> g.sh]);
+                        }
+                        if let Some(x) = list.get(head + 8).and_then(|&w| g.edges.get(g.off(w as usize))) {
+                            prefetch(x);
+                        }
                         let u = list[head] as usize;
                         head += 1;
                         let (mut e, end_e) = (g.off(u), g.off(u + 1));
@@ -341,6 +350,15 @@ fn relabel(g: &Graph, newid: &[u32], threads: usize) -> Graph {
     par(threads, &ranges, |&(lo, hi)| {
         let out = &out;
         for u in lo..hi {
+            // Prefetch the new ids of the targets of the node 8 ahead, and where it will go.
+            if u + 8 < hi {
+                let w = newid[u + 8] as usize;
+                prefetch(&rel[w]);
+                prefetch(&base[w >> sh]);
+                for e in g.off(u + 8)..g.off(u + 9) {
+                    newid.get((g.edges[e] & vmask) as usize).map(prefetch); // escape words: harmless
+                }
+            }
             let k = newid[u] as usize;
             let mut p = base[k >> sh] as usize + rel[k] as usize;
             let (mut e, end) = (g.off(u), g.off(u + 1));
