@@ -462,17 +462,19 @@ struct Radix {
     b: Vec<Vec<u64>>,
     occ: u64, // bit i-1 set: bucket i (1..=32) is non-empty
     last: u32,
+    len: usize,
 }
 
 impl Radix {
     fn new() -> Self {
-        Radix { b: (0..33).map(|_| Vec::new()).collect(), occ: 0, last: 0 }
+        Radix { b: (0..33).map(|_| Vec::new()).collect(), occ: 0, last: 0, len: 0 }
     }
 
     #[inline(always)]
     fn put(&mut self, d: u32, x: u32) {
         let i = (32 - (d ^ self.last).leading_zeros()) as usize;
         unsafe { self.b.get_unchecked_mut(i) }.push((d as u64) << 32 | x as u64);
+        self.len += 1;
         if i > 0 {
             self.occ |= 1 << (i - 1);
         }
@@ -501,6 +503,7 @@ impl Radix {
     #[inline(always)]
     fn pop(&mut self) -> Option<(u32, u32)> {
         self.min()?;
+        self.len -= 1;
         self.b[0].pop().map(|e| ((e >> 32) as u32, e as u32))
     }
 
@@ -508,10 +511,12 @@ impl Radix {
         self.b.iter_mut().for_each(|b| b.clear());
         self.occ = 0;
         self.last = 0;
+        self.len = 0;
     }
 }
 
 static SETTLES: AtomicU64 = AtomicU64::new(0);
+static STATE: AtomicU64 = AtomicU64::new(0);
 static FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 /// Distances in the two-ended search are 31 bits; the top bit marks "settled".
@@ -519,11 +524,14 @@ const SETTLED: u32 = 1 << 31;
 const INF: u32 = SETTLED - 1;
 const NOPAGE: u32 = u32::MAX;
 
-/// Labels of the two-ended search in pages of 128 consecutive node ids (neighbours in BFS order),
-/// allocated on first touch from a per-thread pool. A page holds 128 forward distances and then
-/// 128 backward ones, so one directory lookup answers both sides: other side = index ^ 128.
+/// Labels of the two-ended search, per side, in pages of 64 consecutive node ids (neighbours in
+/// BFS order) allocated on first touch from a per-thread pool. The two balls grow around s and
+/// around t, so each side gets its own pages. dir holds a page's pool offset, side 0 then side 1.
+const PB: u32 = 6;
+
 struct Pages {
     dir: Vec<u32>,
+    half: usize,
     pool: Vec<u32>,
     top: usize,
     used: Vec<u32>,
@@ -531,24 +539,34 @@ struct Pages {
 
 impl Pages {
     fn new(n: usize) -> Self {
-        Pages { dir: vec![NOPAGE; (n >> 7) + 1], pool: Vec::new(), top: 0, used: Vec::new() }
+        let half = (n >> PB) + 1;
+        Pages { dir: vec![NOPAGE; 2 * half], half, pool: Vec::new(), top: 0, used: Vec::new() }
     }
 
-    /// Index of v's forward label, allocating its page.
+    /// Index of v's label on `side`, allocating its page.
     #[inline(always)]
-    fn at(&mut self, v: u32) -> usize {
-        let d = (v >> 7) as usize;
+    fn at(&mut self, v: u32, side: usize) -> usize {
+        let d = side * self.half + (v >> PB) as usize;
         if unsafe { *self.dir.get_unchecked(d) } == NOPAGE {
-            self.dir[d] = (self.top / 256) as u32;
-            self.top += 256;
+            self.dir[d] = self.top as u32;
+            self.top += 1 << PB;
             if self.pool.len() < self.top {
                 self.pool.resize(self.top, INF);
             } else {
-                self.pool[self.top - 256..self.top].fill(INF);
+                self.pool[self.top - (1 << PB)..self.top].fill(INF);
             }
             self.used.push(d as u32);
         }
-        unsafe { *self.dir.get_unchecked(d) as usize * 256 + (v & 127) as usize }
+        unsafe { *self.dir.get_unchecked(d) as usize + (v & ((1 << PB) - 1)) as usize }
+    }
+
+    /// v's label on `side` (tentative or settled), INF if none.
+    #[inline(always)]
+    fn get(&self, v: u32, side: usize) -> u32 {
+        match unsafe { *self.dir.get_unchecked(side * self.half + (v >> PB) as usize) } {
+            NOPAGE => INF,
+            p => unsafe { *self.pool.get_unchecked(p as usize + (v & ((1 << PB) - 1)) as usize) },
+        }
     }
 
     fn clear(&mut self) {
@@ -568,10 +586,10 @@ impl Pages {
 /// answer was found, return None and the caller runs the one-ended u64 search.
 fn bidir(pg: &mut Pages, hs: &mut [Radix; 2], g: &Graph, r: &Graph, s: usize, t: usize) -> Option<i64> {
     let (mut mu, mut settled, mut skipped) = (u64::MAX, 0u64, false);
-    let i = pg.at(s as u32);
+    let i = pg.at(s as u32, 0);
     pg.pool[i] = 0;
     hs[0].put(0, s as u32);
-    let i = pg.at(t as u32) ^ 128;
+    let i = pg.at(t as u32, 1);
     pg.pool[i] = 0;
     hs[1].put(0, t as u32);
     loop {
@@ -579,10 +597,10 @@ fn bidir(pg: &mut Pages, hs: &mut [Radix; 2], g: &Graph, r: &Graph, s: usize, t:
         if kf as u64 + kb as u64 >= mu {
             break;
         }
-        let side = (kf > kb) as usize;
-        let (gr, sx) = if side == 0 { (g, 0) } else { (r, 128) };
+        let side = (hs[0].len > hs[1].len) as usize; // the side with fewer queued entries
+        let gr = if side == 0 { g } else { r };
         let (d, u) = hs[side].pop().unwrap();
-        let iu = pg.at(u) ^ sx;
+        let iu = pg.at(u, side);
         let lu = pg.pool[iu];
         if lu & SETTLED != 0 || lu < d {
             continue; // stale entry
@@ -604,14 +622,14 @@ fn bidir(pg: &mut Pages, hs: &mut [Radix; 2], g: &Graph, r: &Graph, s: usize, t:
                 skipped = true;
                 continue;
             }
-            let iv = pg.at(v) ^ sx;
+            let iv = pg.at(v, side);
             let lv = unsafe { *pg.pool.get_unchecked(iv) };
             if lv & SETTLED != 0 || lv as u64 <= nd {
                 continue;
             }
             unsafe { *pg.pool.get_unchecked_mut(iv) = nd as u32 };
             hs[side].put(nd as u32, v);
-            let o = unsafe { *pg.pool.get_unchecked(iv ^ 128) } & !SETTLED;
+            let o = pg.get(v, 1 - side) & !SETTLED;
             if o != INF {
                 mu = mu.min(nd + o as u64);
             }
@@ -702,6 +720,9 @@ fn main() {
                     };
                     answers[k].store(ans, Relaxed);
                 }
+                let heap: usize = hs.iter().flat_map(|h| h.b.iter()).map(|b| b.capacity() * 8).sum();
+                STATE.fetch_add((pg.pool.capacity() * 4 + pg.dir.len() * 4) as u64, Relaxed);
+                SETTLES.fetch_add((heap as u64) << 40, Relaxed);
             });
         }
     });
@@ -713,6 +734,7 @@ fn main() {
         out.push(b'\n');
     }
     std::fs::write("/out/distances.txt", out).expect("write distances.txt");
-    eprintln!("phase build {t_build:?} queries {:?} total {:?} settles {} fallbacks {} {}", t_query - t_build, t0.elapsed(),
-        SETTLES.load(Relaxed), FALLBACKS.load(Relaxed), mem());
+    eprintln!("phase build {t_build:?} queries {:?} total {:?} settles {} fallbacks {} state {:.1} MB {}", t_query - t_build, t0.elapsed(),
+        SETTLES.load(Relaxed) & ((1 << 40) - 1), FALLBACKS.load(Relaxed), STATE.load(Relaxed) as f64 / 1e6, mem());
+    eprintln!("heap buckets {:.1} MB", (SETTLES.load(Relaxed) >> 40) as f64 / 1e6);
 }
