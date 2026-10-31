@@ -135,7 +135,7 @@ struct Graph {
 impl Graph {
     #[inline(always)]
     fn off(&self, k: usize) -> usize {
-        self.base[k >> self.sh] as usize + self.rel[k] as usize
+        unsafe { *self.base.get_unchecked(k >> self.sh) as usize + *self.rel.get_unchecked(k) as usize }
     }
 }
 
@@ -437,23 +437,24 @@ fn build(gtxt: &'static [u8], threads: usize, qs: &mut [(usize, usize)], renum: 
     g
 }
 
-/// Monotone priority queue for Dijkstra: bucket i holds keys whose highest bit differing from the
-/// last popped key is bit i-1. Pushing is O(1); a pop only re-sorts the smallest non-empty bucket.
+/// Monotone priority queue for Dijkstra on 31-bit distances: bucket i holds entries whose key's
+/// highest bit differing from the last popped key is bit i-1. Pushing is O(1); a pop only
+/// re-sorts the smallest non-empty bucket. An entry is key << 32 | node, 8 bytes.
 struct Radix {
-    b: Vec<Vec<(u64, u32)>>,
-    occ: u64, // bit i-1 set: bucket i (1..=64) is non-empty
-    last: u64,
+    b: Vec<Vec<u64>>,
+    occ: u64, // bit i-1 set: bucket i (1..=32) is non-empty
+    last: u32,
 }
 
 impl Radix {
     fn new() -> Self {
-        Radix { b: (0..65).map(|_| Vec::new()).collect(), occ: 0, last: 0 }
+        Radix { b: (0..33).map(|_| Vec::new()).collect(), occ: 0, last: 0 }
     }
 
     #[inline(always)]
-    fn put(&mut self, d: u64, x: u32) {
-        let i = (64 - (d ^ self.last).leading_zeros()) as usize;
-        self.b[i].push((d, x));
+    fn put(&mut self, d: u32, x: u32) {
+        let i = (32 - (d ^ self.last).leading_zeros()) as usize;
+        unsafe { self.b.get_unchecked_mut(i) }.push((d as u64) << 32 | x as u64);
         if i > 0 {
             self.occ |= 1 << (i - 1);
         }
@@ -461,7 +462,7 @@ impl Radix {
 
     /// Smallest key, after moving it into bucket 0.
     #[inline(always)]
-    fn min(&mut self) -> Option<u64> {
+    fn min(&mut self) -> Option<u32> {
         if self.b[0].is_empty() {
             if self.occ == 0 {
                 return None;
@@ -469,9 +470,9 @@ impl Radix {
             let i = self.occ.trailing_zeros() as usize + 1;
             self.occ &= !(1 << (i - 1));
             let mut v = std::mem::take(&mut self.b[i]);
-            self.last = v.iter().map(|e| e.0).min().unwrap();
-            for &(d, x) in &v {
-                self.put(d, x); // every element lands in a lower bucket
+            self.last = (v.iter().min().unwrap() >> 32) as u32;
+            for &e in &v {
+                self.put((e >> 32) as u32, e as u32); // every entry lands in a lower bucket
             }
             v.clear();
             self.b[i] = v;
@@ -480,16 +481,13 @@ impl Radix {
     }
 
     #[inline(always)]
-    fn pop(&mut self) -> Option<(u64, u32)> {
+    fn pop(&mut self) -> Option<(u32, u32)> {
         self.min()?;
-        self.b[0].pop()
+        self.b[0].pop().map(|e| ((e >> 32) as u32, e as u32))
     }
 
-    fn clear(&mut self, mut f: impl FnMut(u32)) {
-        for b in &mut self.b {
-            b.iter().for_each(|e| f(e.1));
-            b.clear();
-        }
+    fn clear(&mut self) {
+        self.b.iter_mut().for_each(|b| b.clear());
         self.occ = 0;
         self.last = 0;
     }
@@ -522,7 +520,7 @@ impl Pages {
     #[inline(always)]
     fn at(&mut self, v: u32) -> usize {
         let d = (v >> 7) as usize;
-        if self.dir[d] == NOPAGE {
+        if unsafe { *self.dir.get_unchecked(d) } == NOPAGE {
             self.dir[d] = (self.top / 256) as u32;
             self.top += 256;
             if self.pool.len() < self.top {
@@ -532,7 +530,7 @@ impl Pages {
             }
             self.used.push(d as u32);
         }
-        self.dir[d] as usize * 256 + (v & 127) as usize
+        unsafe { *self.dir.get_unchecked(d) as usize * 256 + (v & 127) as usize }
     }
 
     fn clear(&mut self) {
@@ -560,7 +558,7 @@ fn bidir(pg: &mut Pages, hs: &mut [Radix; 2], g: &Graph, r: &Graph, s: usize, t:
     hs[1].put(0, t as u32);
     loop {
         let (Some(kf), Some(kb)) = (hs[0].min(), hs[1].min()) else { break };
-        if kf + kb >= mu {
+        if kf as u64 + kb as u64 >= mu {
             break;
         }
         let side = (kf > kb) as usize;
@@ -568,14 +566,14 @@ fn bidir(pg: &mut Pages, hs: &mut [Radix; 2], g: &Graph, r: &Graph, s: usize, t:
         let (d, u) = hs[side].pop().unwrap();
         let iu = pg.at(u) ^ sx;
         let lu = pg.pool[iu];
-        if lu & SETTLED != 0 || (lu as u64) < d {
+        if lu & SETTLED != 0 || lu < d {
             continue; // stale entry
         }
         pg.pool[iu] = lu | SETTLED;
         settled += 1;
         let (mut e, end) = (gr.off(u as usize), gr.off(u as usize + 1));
         while e < end {
-            let x = gr.edges[e];
+            let x = unsafe { *gr.edges.get_unchecked(e) };
             let v = x & ((1 << gr.vb) - 1);
             let mut wt = x >> gr.vb;
             e += 1;
@@ -583,19 +581,19 @@ fn bidir(pg: &mut Pages, hs: &mut [Radix; 2], g: &Graph, r: &Graph, s: usize, t:
                 wt = gr.edges[e];
                 e += 1;
             }
-            let nd = d + wt as u64;
+            let nd = d as u64 + wt as u64;
             if nd >= INF as u64 {
                 skipped = true;
                 continue;
             }
             let iv = pg.at(v) ^ sx;
-            let lv = pg.pool[iv];
+            let lv = unsafe { *pg.pool.get_unchecked(iv) };
             if lv & SETTLED != 0 || lv as u64 <= nd {
                 continue;
             }
-            pg.pool[iv] = nd as u32;
-            hs[side].put(nd, v);
-            let o = pg.pool[iv ^ 128] & !SETTLED;
+            unsafe { *pg.pool.get_unchecked_mut(iv) = nd as u32 };
+            hs[side].put(nd as u32, v);
+            let o = unsafe { *pg.pool.get_unchecked(iv ^ 128) } & !SETTLED;
             if o != INF {
                 mu = mu.min(nd + o as u64);
             }
@@ -603,7 +601,7 @@ fn bidir(pg: &mut Pages, hs: &mut [Radix; 2], g: &Graph, r: &Graph, s: usize, t:
     }
     SETTLES.fetch_add(settled, Relaxed);
     pg.clear();
-    hs.iter_mut().for_each(|h| h.clear(|_| {}));
+    hs.iter_mut().for_each(|h| h.clear());
     match mu {
         _ if skipped && mu >= INF as u64 => None,
         u64::MAX => Some(-1),
