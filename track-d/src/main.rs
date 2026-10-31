@@ -495,8 +495,8 @@ impl Radix {
     }
 }
 
-const EMPTY: u32 = u32::MAX;
 static SETTLES: AtomicU64 = AtomicU64::new(0);
+static FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 /// Distances in the two-ended search are 31 bits; the top bit marks "settled".
 const SETTLED: u32 = 1 << 31;
@@ -546,20 +546,22 @@ impl Pages {
 
 /// Two-ended Dijkstra: forward from s on `g`, backward from t on the reverse graph `r`, always
 /// expanding the side with the smaller queue minimum. mu is the best s-t length seen through any
-/// node labelled by both sides; stop when the two minimums together reach mu. None when a
-/// distance would not fit 31 bits (the caller then runs the one-ended search with u64).
+/// node labelled by both sides; stop when the two minimums together reach mu.
+/// A label that would not fit 31 bits is skipped: every path through it is at least that long,
+/// so the search stays exact for answers below 2^31. If something was skipped and no shorter
+/// answer was found, return None and the caller runs the one-ended u64 search.
 fn bidir(pg: &mut Pages, hs: &mut [Radix; 2], g: &Graph, r: &Graph, s: usize, t: usize) -> Option<i64> {
-    let (mut mu, mut settled) = (u64::MAX, 0u64);
+    let (mut mu, mut settled, mut skipped) = (u64::MAX, 0u64, false);
     let i = pg.at(s as u32);
     pg.pool[i] = 0;
     hs[0].put(0, s as u32);
     let i = pg.at(t as u32) ^ 128;
     pg.pool[i] = 0;
     hs[1].put(0, t as u32);
-    let res = 'search: loop {
-        let (Some(kf), Some(kb)) = (hs[0].min(), hs[1].min()) else { break Some(mu) };
+    loop {
+        let (Some(kf), Some(kb)) = (hs[0].min(), hs[1].min()) else { break };
         if kf + kb >= mu {
-            break Some(mu);
+            break;
         }
         let side = (kf > kb) as usize;
         let (gr, sx) = if side == 0 { (g, 0) } else { (r, 128) };
@@ -583,7 +585,8 @@ fn bidir(pg: &mut Pages, hs: &mut [Radix; 2], g: &Graph, r: &Graph, s: usize, t:
             }
             let nd = d + wt as u64;
             if nd >= INF as u64 {
-                break 'search None;
+                skipped = true;
+                continue;
             }
             let iv = pg.at(v) ^ sx;
             let lv = pg.pool[iv];
@@ -597,159 +600,48 @@ fn bidir(pg: &mut Pages, hs: &mut [Radix; 2], g: &Graph, r: &Graph, s: usize, t:
                 mu = mu.min(nd + o as u64);
             }
         }
-    };
+    }
     SETTLES.fetch_add(settled, Relaxed);
     pg.clear();
     hs.iter_mut().for_each(|h| h.clear(|_| {}));
-    res.map(|m| if m == u64::MAX { -1 } else { m as i64 })
-}
-
-/// Tentative distances of unsettled nodes only: linear probing, backward-shift delete.
-struct Frontier {
-    keys: Vec<u32>,
-    vals: Vec<u64>,
-    mask: usize,
-    len: usize,
-}
-
-impl Frontier {
-    fn new(cap: usize) -> Self {
-        Frontier { keys: vec![EMPTY; cap], vals: vec![0; cap], mask: cap - 1, len: 0 }
-    }
-
-    #[inline(always)]
-    fn home(&self, k: u32) -> usize {
-        ((k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & self.mask
-    }
-
-    /// Lower k's distance to d; true if k is new or improved.
-    #[inline(always)]
-    fn relax(&mut self, k: u32, d: u64) -> bool {
-        let mut i = self.home(k);
-        loop {
-            let key = self.keys[i];
-            if key == k {
-                if self.vals[i] <= d {
-                    return false;
-                }
-                self.vals[i] = d;
-                return true;
-            }
-            if key == EMPTY {
-                self.keys[i] = k;
-                self.vals[i] = d;
-                self.len += 1;
-                if self.len * 2 > self.keys.len() {
-                    self.grow();
-                }
-                return true;
-            }
-            i = (i + 1) & self.mask;
-        }
-    }
-
-    fn remove(&mut self, k: u32) {
-        let mut i = self.home(k);
-        while self.keys[i] != k {
-            if self.keys[i] == EMPTY {
-                return;
-            }
-            i = (i + 1) & self.mask;
-        }
-        self.len -= 1;
-        let mut j = i;
-        loop {
-            j = (j + 1) & self.mask;
-            let key = self.keys[j];
-            if key == EMPTY {
-                break;
-            }
-            let h = self.home(key);
-            let stays = if i <= j { i < h && h <= j } else { i < h || h <= j };
-            if !stays {
-                self.keys[i] = key;
-                self.vals[i] = self.vals[j];
-                i = j;
-            }
-        }
-        self.keys[i] = EMPTY;
-    }
-
-    fn grow(&mut self) {
-        let old = std::mem::replace(self, Frontier::new(self.keys.len() * 2));
-        for (k, v) in old.keys.into_iter().zip(old.vals) {
-            if k != EMPTY {
-                self.relax(k, v);
-            }
-        }
+    match mu {
+        _ if skipped && mu >= INF as u64 => None,
+        u64::MAX => Some(-1),
+        _ => Some(mu as i64),
     }
 }
 
-/// Per-thread search state: settled bitset with a one-bit-per-word dirty summary, frontier, queue.
-struct Search {
-    done: Vec<u64>,
-    dirty: Vec<u64>,
-    front: Frontier,
-    heap: Radix,
-}
-
-impl Search {
-    fn new(n: usize) -> Self {
-        let words = n / 64 + 1;
-        Search { done: vec![0; words], dirty: vec![0; words / 64 + 1], front: Frontier::new(8192), heap: Radix::new() }
-    }
-
-    fn run(&mut self, g: &Graph, s: usize, t: usize) -> i64 {
-        let mut res = -1;
-        let mut settled = 0u64;
-        self.front.relax(s as u32, 0);
-        self.heap.put(0, s as u32);
-        while let Some((d, u)) = self.heap.pop() {
-            let (w, bit) = (u as usize >> 6, 1u64 << (u & 63));
-            if self.done[w] & bit != 0 {
-                continue; // stale entry
-            }
-            if self.done[w] == 0 {
-                self.dirty[w >> 6] |= 1 << (w & 63);
-            }
-            self.done[w] |= bit;
-            settled += 1;
-            self.front.remove(u);
-            if u as usize == t {
-                res = d as i64;
-                break;
-            }
-            let (mut e, end) = (g.off(u as usize), g.off(u as usize + 1));
-            while e < end {
-                let x = g.edges[e];
-                let v = x & ((1 << g.vb) - 1);
-                let mut wt = x >> g.vb;
+/// One-ended Dijkstra with u64 distances, for the few queries whose distances need more than
+/// 31 bits (edges of weight near 2^32 at the special nodes). Speed does not matter here.
+fn plain(g: &Graph, s: usize, t: usize) -> i64 {
+    FALLBACKS.fetch_add(1, Relaxed);
+    use std::cmp::Reverse;
+    let mut dist = std::collections::HashMap::from([(s, 0u64)]);
+    let mut heap = std::collections::BinaryHeap::from([Reverse((0u64, s))]);
+    while let Some(Reverse((d, u))) = heap.pop() {
+        if u == t {
+            return d as i64;
+        }
+        if dist[&u] < d {
+            continue; // stale entry
+        }
+        let (mut e, end) = (g.off(u), g.off(u + 1));
+        while e < end {
+            let x = g.edges[e];
+            let (v, mut w) = ((x & ((1 << g.vb) - 1)) as usize, x >> g.vb);
+            e += 1;
+            if w == g.esc {
+                w = g.edges[e];
                 e += 1;
-                if wt == g.esc {
-                    wt = g.edges[e];
-                    e += 1;
-                }
-                if self.done[v as usize >> 6] & (1 << (v & 63)) != 0 {
-                    continue;
-                }
-                let nd = d + wt as u64;
-                if self.front.relax(v, nd) {
-                    self.heap.put(nd, v);
-                }
+            }
+            let nd = d + w as u64;
+            if dist.get(&v).map_or(true, |&o| nd < o) {
+                dist.insert(v, nd);
+                heap.push(Reverse((nd, v)));
             }
         }
-        SETTLES.fetch_add(settled, Relaxed);
-        let front = &mut self.front;
-        self.heap.clear(|x| front.remove(x));
-        for i in 0..self.dirty.len() {
-            let mut m = std::mem::take(&mut self.dirty[i]);
-            while m != 0 {
-                self.done[i * 64 + m.trailing_zeros() as usize] = 0;
-                m &= m - 1;
-            }
-        }
-        res
     }
+    -1
 }
 
 fn main() {
@@ -769,9 +661,8 @@ fn main() {
     }
     let g = build(map("/data/graph.txt"), threads, &mut qs, env("FW_RENUM").map_or(true, |v| v != "0"));
     let n = g.rel.len() - 1;
-    let two = env("FW_BIDIR").map_or(true, |v| v != "0");
     let tt = Instant::now();
-    let r = if two { transpose(&g, threads) } else { Graph { edges: vec![], base: vec![], rel: vec![], sh: 0, vb: 0, esc: 0, has_in: vec![] } };
+    let r = transpose(&g, threads);
     let t_build = t0.elapsed();
     eprintln!("transpose {:?}", tt.elapsed());
 
@@ -781,7 +672,6 @@ fn main() {
         for _ in 0..threads {
             sc.spawn(|| {
                 let (mut pg, mut hs) = (Pages::new(n), [Radix::new(), Radix::new()]);
-                let mut one: Option<Search> = None; // for the few queries beyond 31-bit distances
                 loop {
                     let k = next.fetch_add(1, Relaxed);
                     let Some(&(s, t)) = qs.get(k) else { break };
@@ -789,10 +679,10 @@ fn main() {
                         0
                     } else if g.off(s) == g.off(s + 1) || g.has_in[t >> 6] & (1 << (t & 63)) == 0 {
                         -1 // no way out of s, or no way into t
-                    } else if let Some(d) = two.then(|| bidir(&mut pg, &mut hs, &g, &r, s, t)).flatten() {
+                    } else if let Some(d) = bidir(&mut pg, &mut hs, &g, &r, s, t) {
                         d
                     } else {
-                        one.get_or_insert_with(|| Search::new(n)).run(&g, s, t)
+                        plain(&g, s, t)
                     };
                     answers[k].store(ans, Relaxed);
                 }
@@ -807,6 +697,6 @@ fn main() {
         out.push(b'\n');
     }
     std::fs::write("/out/distances.txt", out).expect("write distances.txt");
-    eprintln!("phase build {t_build:?} queries {:?} total {:?} settles {} {}", t_query - t_build, t0.elapsed(),
-        SETTLES.load(Relaxed), mem());
+    eprintln!("phase build {t_build:?} queries {:?} total {:?} settles {} fallbacks {} {}", t_query - t_build, t0.elapsed(),
+        SETTLES.load(Relaxed), FALLBACKS.load(Relaxed), mem());
 }
