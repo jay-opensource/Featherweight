@@ -1,10 +1,10 @@
-// Track D, featherweight: every edge is 4 bytes and every node costs 1 byte plus 1/16 of a word.
-// Nodes are relabelled in breadth-first order, so a search touches nearby memory. Each search
-// carries a settled bitset and a small frontier map, not a distance array the size of the graph.
+// Track D, featherweight. Every edge is 4 bytes and every node 1 byte plus 1/16 of a word.
+// Nodes are relabelled in breadth-first order, so a search touches nearby memory, and each query
+// runs as a two-ended Dijkstra whose labels live in small per-thread pages, not in arrays the
+// size of the graph. See PERF.md for the measurements behind each choice.
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::time::Instant;
+use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -80,14 +80,6 @@ fn prefetch<T>(x: &T) {
     };
 }
 
-/// Diagnostics: process RSS high-water mark and the container's memory.current / memory.peak (MB).
-fn mem() -> String {
-    let st = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let hwm = st.lines().find(|l| l.starts_with("VmHWM")).unwrap_or("").replace(' ', "");
-    let rd = |f: &str| std::fs::read_to_string(f).ok().and_then(|x| x.trim().parse::<f64>().ok()).unwrap_or(0.0) / 1e6;
-    format!("[{hwm} cur {:.1} peak {:.1}]", rd("/sys/fs/cgroup/memory.current"), rd("/sys/fs/cgroup/memory.peak"))
-}
-
 /// Split `b` into `k` byte ranges that start and end on line boundaries.
 fn chunks(b: &[u8], k: usize) -> Vec<(usize, usize)> {
     let mut cut = vec![0];
@@ -100,6 +92,11 @@ fn chunks(b: &[u8], k: usize) -> Vec<(usize, usize)> {
     }
     cut.push(b.len());
     cut.windows(2).map(|w| (w[0], w[1])).collect()
+}
+
+/// `0..n` in `k` ranges.
+fn spans(n: usize, k: usize) -> Vec<(usize, usize)> {
+    (0..k).map(|j| (j * n / k, (j + 1) * n / k)).collect()
 }
 
 /// Run `f` on `threads` threads, each pulling work items from `items` until they run out.
@@ -116,12 +113,25 @@ fn par<T: Sync>(threads: usize, items: &[T], f: impl Fn(&T) + Sync) {
     });
 }
 
-/// Shared mutable array written at disjoint indices by the fill threads.
-struct Slots(*mut u32);
-unsafe impl Sync for Slots {}
+/// Shared mutable array written at disjoint indices by several threads.
+struct Slots<T>(*mut T);
+unsafe impl<T> Sync for Slots<T> {}
 
-/// Compact CSR. Node k's slots start at base[k >> sh] + rel[k]; an edge slot is `v | w << vb`,
-/// and w == esc means the next slot holds the full 32-bit weight.
+/// Write edge (v, w) at slot p: one slot `v | w << vb`, or, when w does not fit, the escape
+/// value in that slot and the full weight in the next. Returns the slots used.
+#[inline(always)]
+fn store(out: &Slots<u32>, p: usize, v: u32, w: u32, vb: u32, esc: u32) -> usize {
+    unsafe {
+        *out.0.add(p) = v | w.min(esc) << vb;
+        if w >= esc {
+            *out.0.add(p + 1) = w;
+            return 2;
+        }
+    }
+    1
+}
+
+/// Compact CSR. Node k's slots start at base[k >> sh] + rel[k] (see `store` for a slot).
 struct Graph {
     edges: Vec<u32>,
     base: Vec<u32>,
@@ -129,13 +139,28 @@ struct Graph {
     sh: u32,
     vb: u32,
     esc: u32,
-    has_in: Vec<u64>, // valid for query targets only
 }
 
 impl Graph {
     #[inline(always)]
     fn off(&self, k: usize) -> usize {
         unsafe { *self.base.get_unchecked(k >> self.sh) as usize + *self.rel.get_unchecked(k) as usize }
+    }
+
+    /// Call f(v, w) for every edge u -> v of weight w.
+    #[inline(always)]
+    fn adj(&self, u: usize, mut f: impl FnMut(u32, u32)) {
+        let (mut e, end) = (self.off(u), self.off(u + 1));
+        while e < end {
+            let x = unsafe { *self.edges.get_unchecked(e) };
+            let mut w = x >> self.vb;
+            e += 1;
+            if w == self.esc {
+                w = self.edges[e];
+                e += 1;
+            }
+            f(x & ((1 << self.vb) - 1), w);
+        }
     }
 }
 
@@ -167,101 +192,59 @@ fn layout(n: usize, slots: impl Fn(usize) -> u32) -> (Vec<u32>, Vec<u8>, u32) {
     }
 }
 
-/// The edge lines of graph.txt, split for parallel parsing.
-struct Text {
-    body: &'static [u8],
-    parts: Vec<(usize, usize)>,
-    n: usize,
-    vb: u32,
-    esc: u32,
-}
-
-impl Text {
-    fn new(g: &'static [u8], threads: usize) -> Text {
-        let mut i = 0;
-        let n = num(g, &mut i) as usize;
-        let _m = num(g, &mut i);
-        let vb = (usize::BITS - (n.max(2) - 1).leading_zeros()).max(1);
-        Text { body: &g[i..], parts: chunks(&g[i..], threads * 4), n, vb, esc: (1u32 << (32 - vb)) - 1 }
-    }
-
-    /// Pass 1: slots per node (1, or 2 when the weight needs an escape word). Lines go in batches
-    /// of 16: a locked add cannot overlap its cache miss with the next one, so the 16 counters are
-    /// prefetched first and their misses overlap.
-    fn count(&self, threads: usize) -> Vec<AtomicU16> {
-        let deg: Vec<AtomicU16> = (0..self.n + 1).map(|_| AtomicU16::new(0)).collect();
-        let b = self.body;
-        par(threads, &self.parts, |&(lo, hi)| {
-            let mut i = lo;
-            let mut batch = [(0usize, 0u16); 16];
-            while i < hi {
-                let mut k = 0;
-                while k < 16 && i < hi {
-                    let u = num(b, &mut i) as usize;
-                    while b[i] != b' ' {
-                        i += 1;
-                    }
-                    i += 1;
-                    batch[k] = (u, 1 + (num(b, &mut i) >= self.esc as u64) as u16);
-                    prefetch(&deg[u]);
-                    k += 1;
-                }
-                for &(u, c) in &batch[..k] {
-                    assert!(deg[u].fetch_add(c, Relaxed) < u16::MAX - 2, "out-degree above 65k");
-                }
+/// Build a CSR over n nodes from an edge stream: `each(item, emit)` calls emit(u, v, w) for the
+/// edges of one work item. It runs twice, to count each node's slots and then to fill them
+/// through per-node countdown cursors, so threads write disjoint slots. The locked updates go in
+/// batches of 16: a locked op waits for every earlier store, so one at a time the scattered stores
+/// would not overlap their cache misses.
+fn csr<T: Sync>(n: usize, threads: usize, vb: u32, esc: u32, items: &[T], each: impl Fn(&T, &mut dyn FnMut(usize, u32, u32)) + Sync) -> Graph {
+    let deg: Vec<AtomicU16> = (0..n + 1).map(|_| AtomicU16::new(0)).collect();
+    par(threads, items, |it| {
+        let (mut b, mut k) = ([(0usize, 0u16); 16], 0);
+        let add = |b: &[(usize, u16)]| {
+            for &(u, c) in b {
+                assert!(deg[u].fetch_add(c, Relaxed) < u16::MAX - 2, "out-degree above 65k");
+            }
+        };
+        each(it, &mut |u, _, w| {
+            prefetch(&deg[u]);
+            b[k] = (u, 1 + (w >= esc) as u16);
+            k += 1;
+            if k == 16 {
+                add(&b);
+                k = 0;
             }
         });
-        deg
-    }
-
-    /// Pass 2: write every edge through its node's countdown cursor, so threads write disjoint
-    /// slots. In-edges are recorded for nodes marked in `targets` only.
-    fn fill(&self, threads: usize, deg: &[AtomicU16], lay: &(Vec<u32>, Vec<u8>, u32), targets: &[u64]) -> Graph {
-        let (base, rel, sh) = lay;
-        let (b, vb, esc) = (self.body, self.vb, self.esc);
-        let mut edges = vec![0u32; *base.last().unwrap() as usize];
-        huge(&mut edges);
-        let out = Slots(edges.as_mut_ptr());
-        let has_in: Vec<AtomicU64> = (0..self.n / 64 + 1).map(|_| AtomicU64::new(0)).collect();
-        par(threads, &self.parts, |&(lo, hi)| {
-            let out = &out;
-            let mut i = lo;
-            let mut batch = [(0usize, 0usize, 0u64); 16];
-            while i < hi {
-                // A locked op waits for every earlier store to land, so take the 16 cursors first
-                // and only then issue the 16 scattered stores, which overlap their misses.
-                let mut k = 0;
-                while k < 16 && i < hi {
-                    let (u, v) = (num(b, &mut i) as usize, num(b, &mut i) as usize);
-                    batch[k] = (u, v, num(b, &mut i));
-                    prefetch(&deg[u]);
-                    k += 1;
-                }
-                for e in &mut batch[..k] {
-                    let (u, big) = (e.0, e.2 >= esc as u64);
-                    let c = 1 + big as u16;
-                    e.0 = base[u >> sh] as usize + rel[u] as usize + (deg[u].fetch_sub(c, Relaxed) - c) as usize;
-                    if e.1 == u {
-                        e.1 |= 1 << 63; // self-loop: not an in-edge for the precheck
-                    }
-                }
-                for &(p, v, w) in &batch[..k] {
-                    unsafe {
-                        *out.0.add(p) = v as u32 | (w.min(esc as u64) as u32) << vb;
-                        if w >= esc as u64 {
-                            *out.0.add(p + 1) = w as u32;
-                        }
-                    }
-                    let bit = 1u64 << (v & 63);
-                    if v >> 63 == 0 && targets[v >> 6] & bit != 0 {
-                        has_in[v >> 6].fetch_or(bit, Relaxed);
-                    }
-                }
+        add(&b[..k]);
+    });
+    let (base, rel, sh) = layout(n, |k| deg[k].load(Relaxed) as u32);
+    let mut edges = vec![0u32; *base.last().unwrap() as usize];
+    huge(&mut edges);
+    let out = Slots(edges.as_mut_ptr());
+    par(threads, items, |it| {
+        let out = &out;
+        let (mut b, mut k) = ([(0usize, 0u32, 0u32); 16], 0);
+        let fill = |b: &mut [(usize, u32, u32)]| {
+            for e in b.iter_mut() {
+                let c = 1 + (e.2 >= esc) as u16;
+                e.0 = base[e.0 >> sh] as usize + rel[e.0] as usize + (deg[e.0].fetch_sub(c, Relaxed) - c) as usize;
+            }
+            for &(p, v, w) in b.iter() {
+                store(out, p, v, w, vb, esc);
+            }
+        };
+        each(it, &mut |u, v, w| {
+            prefetch(&deg[u]);
+            b[k] = (u, v, w);
+            k += 1;
+            if k == 16 {
+                fill(&mut b);
+                k = 0;
             }
         });
-        let has_in = has_in.into_iter().map(|a| a.into_inner()).collect();
-        Graph { edges, base: base.clone(), rel: rel.clone(), sh: *sh, vb, esc, has_in }
-    }
+        fill(&mut b[..k]);
+    });
+    Graph { edges, base, rel, sh, vb, esc }
 }
 
 /// Breadth-first relabelling, in parallel: each thread grows its own region from a seed in its
@@ -270,7 +253,6 @@ impl Text {
 fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
     const FREE: u32 = u32::MAX;
     let n = g.rel.len() - 1;
-    let vmask = (1u32 << g.vb) - 1;
     let id: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(FREE)).collect();
     let claim = |v: usize| id[v].load(Relaxed) == FREE && id[v].compare_exchange(FREE, 0, Relaxed, Relaxed).is_ok();
     let lists: Vec<Vec<u32>> = std::thread::scope(|s| {
@@ -299,16 +281,12 @@ fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
                         if let Some(x) = list.get(head + 8).and_then(|&w| g.edges.get(g.off(w as usize))) {
                             prefetch(x);
                         }
-                        let u = list[head] as usize;
                         head += 1;
-                        let (mut e, end_e) = (g.off(u), g.off(u + 1));
-                        while e < end_e {
-                            let x = g.edges[e];
-                            e += 1 + ((x >> g.vb) == g.esc) as usize;
-                            if claim((x & vmask) as usize) {
-                                list.push(x & vmask);
+                        g.adj(list[head - 1] as usize, |v, _| {
+                            if claim(v as usize) {
+                                list.push(v);
                             }
-                        }
+                        });
                     }
                     list
                 })
@@ -329,13 +307,12 @@ fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
     id.into_iter().map(|a| a.into_inner()).collect()
 }
 
-/// Copy `g` into the order given by `newid` (old id -> new id). Node k's slots are copied in
-/// parallel, with each target rewritten to its new id.
+/// Copy `g` into the order given by `newid` (old id -> new id), each node's slots by one thread,
+/// with every target rewritten to its new id.
 fn relabel(g: &Graph, newid: &[u32], threads: usize) -> Graph {
     let n = newid.len();
-    let vmask = (1u32 << g.vb) - 1;
+    let ranges = spans(n, threads * 4);
     let deg: Vec<AtomicU16> = (0..n).map(|_| AtomicU16::new(0)).collect();
-    let ranges: Vec<(usize, usize)> = (0..threads * 4).map(|j| (j * n / (threads * 4), (j + 1) * n / (threads * 4))).collect();
     par(threads, &ranges, |&(lo, hi)| {
         for u in lo..hi {
             deg[newid[u] as usize].store((g.off(u + 1) - g.off(u)) as u16, Relaxed);
@@ -346,113 +323,22 @@ fn relabel(g: &Graph, newid: &[u32], threads: usize) -> Graph {
     let mut edges = vec![0u32; *base.last().unwrap() as usize];
     huge(&mut edges);
     let out = Slots(edges.as_mut_ptr());
-    let mut has_in = vec![0u64; n / 64 + 1];
     par(threads, &ranges, |&(lo, hi)| {
         let out = &out;
         for u in lo..hi {
-            // Prefetch the new ids of the targets of the node 8 ahead, and where it will go.
             if u + 8 < hi {
+                // Prefetch where node u+8 goes and the new ids of its targets.
                 let w = newid[u + 8] as usize;
                 prefetch(&rel[w]);
                 prefetch(&base[w >> sh]);
-                for e in g.off(u + 8)..g.off(u + 9) {
-                    newid.get((g.edges[e] & vmask) as usize).map(prefetch); // escape words: harmless
-                }
+                g.adj(u + 8, |v, _| prefetch(&newid[v as usize]));
             }
             let k = newid[u] as usize;
             let mut p = base[k >> sh] as usize + rel[k] as usize;
-            let (mut e, end) = (g.off(u), g.off(u + 1));
-            while e < end {
-                let x = g.edges[e];
-                let big = (x >> g.vb) == g.esc;
-                unsafe {
-                    *out.0.add(p) = newid[(x & vmask) as usize] | (x & !vmask);
-                    if big {
-                        *out.0.add(p + 1) = g.edges[e + 1];
-                    }
-                }
-                e += 1 + big as usize;
-                p += 1 + big as usize;
-            }
+            g.adj(u, |v, w| p += store(out, p, newid[v as usize], w, g.vb, g.esc));
         }
     });
-    for u in 0..n {
-        if g.has_in[u >> 6] & (1 << (u & 63)) != 0 {
-            let k = newid[u] as usize;
-            has_in[k >> 6] |= 1 << (k & 63);
-        }
-    }
-    Graph { edges, base, rel, sh, vb: g.vb, esc: g.esc, has_in }
-}
-
-/// Reverse graph: v's slots list (u, w) for every edge u -> v of `g`.
-fn transpose(g: &Graph, threads: usize) -> Graph {
-    let n = g.rel.len() - 1;
-    let vmask = (1u32 << g.vb) - 1;
-    let ranges: Vec<(usize, usize)> = (0..threads * 4).map(|j| (j * n / (threads * 4), (j + 1) * n / (threads * 4))).collect();
-    // Calls f(u, e) for every edge slot e of every node u.
-    let each = |f: &(dyn Fn(usize, usize) + Sync)| {
-        par(threads, &ranges, |&(lo, hi)| {
-            for u in lo..hi {
-                let (mut e, end) = (g.off(u), g.off(u + 1));
-                while e < end {
-                    f(u, e);
-                    e += 1 + ((g.edges[e] >> g.vb) == g.esc) as usize;
-                }
-            }
-        })
-    };
-    let deg: Vec<AtomicU16> = (0..n + 1).map(|_| AtomicU16::new(0)).collect();
-    each(&|_, e| {
-        let x = g.edges[e];
-        deg[(x & vmask) as usize].fetch_add(1 + ((x >> g.vb) == g.esc) as u16, Relaxed);
-    });
-    let (base, rel, sh) = layout(n, |k| deg[k].load(Relaxed) as u32);
-    let mut edges = vec![0u32; *base.last().unwrap() as usize];
-    huge(&mut edges);
-    let out = Slots(edges.as_mut_ptr());
-    let out = &out;
-    each(&|u, e| {
-        let x = g.edges[e];
-        let v = (x & vmask) as usize;
-        let big = (x >> g.vb) == g.esc;
-        let k = 1 + big as u16;
-        let p = base[v >> sh] as usize + rel[v] as usize + (deg[v].fetch_sub(k, Relaxed) - k) as usize;
-        unsafe {
-            *out.0.add(p) = u as u32 | (x & !vmask);
-            if big {
-                *out.0.add(p + 1) = g.edges[e + 1];
-            }
-        }
-    });
-    Graph { edges, base, rel, sh, vb: g.vb, esc: g.esc, has_in: Vec::new() }
-}
-
-/// Parse and build the graph; with `renum`, relabel nodes in BFS order and copy the graph into
-/// that order. Rewrites the ids in `qs` to match.
-fn build(gtxt: &'static [u8], threads: usize, qs: &mut [(usize, usize)], renum: bool) -> Graph {
-    let t = Instant::now();
-    let txt = Text::new(gtxt, threads);
-    let n = txt.n;
-    let deg = txt.count(threads);
-    let tc = t.elapsed();
-    let lay = layout(n, |k| deg[k].load(Relaxed) as u32);
-    let mut targets = vec![0u64; n / 64 + 1];
-    qs.iter().for_each(|&(_, q)| targets[q >> 6] |= 1 << (q & 63));
-    let g = txt.fill(threads, &deg, &lay, &targets);
-    drop((deg, lay));
-    if !renum {
-        return g;
-    }
-    let t1 = t.elapsed();
-    let newid = bfs_order(&g, threads);
-    let t2 = t.elapsed();
-    let g = relabel(&g, &newid, threads);
-    for q in qs.iter_mut() {
-        *q = (newid[q.0] as usize, newid[q.1] as usize);
-    }
-    eprintln!("build count {tc:?} fill {:?} bfs {:?} copy {:?} {}", t1 - tc, t2 - t1, t.elapsed() - t2, mem());
-    g
+    Graph { edges, base, rel, sh, vb: g.vb, esc: g.esc }
 }
 
 /// Monotone priority queue for Dijkstra on 31-bit distances: bucket i holds entries whose key's
@@ -494,6 +380,7 @@ impl Radix {
             for &e in &v {
                 self.put((e >> 32) as u32, e as u32); // every entry lands in a lower bucket
             }
+            self.len -= v.len();
             v.clear();
             self.b[i] = v;
         }
@@ -509,15 +396,9 @@ impl Radix {
 
     fn clear(&mut self) {
         self.b.iter_mut().for_each(|b| b.clear());
-        self.occ = 0;
-        self.last = 0;
-        self.len = 0;
+        (self.occ, self.last, self.len) = (0, 0, 0);
     }
 }
-
-static SETTLES: AtomicU64 = AtomicU64::new(0);
-static STATE: AtomicU64 = AtomicU64::new(0);
-static FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 /// Distances in the two-ended search are 31 bits; the top bit marks "settled".
 const SETTLED: u32 = 1 << 31;
@@ -579,26 +460,24 @@ impl Pages {
 }
 
 /// Two-ended Dijkstra: forward from s on `g`, backward from t on the reverse graph `r`, always
-/// expanding the side with the smaller queue minimum. mu is the best s-t length seen through any
-/// node labelled by both sides; stop when the two minimums together reach mu.
+/// expanding the side with fewer queued entries. mu is the best s-t length seen through any node
+/// labelled by both sides; stop when the two queue minimums together reach mu. A source with no
+/// way out or a target with no way in empties its queue at once, so those answer -1 immediately.
 /// A label that would not fit 31 bits is skipped: every path through it is at least that long,
-/// so the search stays exact for answers below 2^31. If something was skipped and no shorter
-/// answer was found, return None and the caller runs the one-ended u64 search.
+/// so the search stays exact for shorter answers. If something was skipped and no shorter answer
+/// was found, return None and the caller runs the one-ended u64 search.
 fn bidir(pg: &mut Pages, hs: &mut [Radix; 2], g: &Graph, r: &Graph, s: usize, t: usize) -> Option<i64> {
-    let (mut mu, mut settled, mut skipped) = (u64::MAX, 0u64, false);
-    let i = pg.at(s as u32, 0);
-    pg.pool[i] = 0;
-    hs[0].put(0, s as u32);
-    let i = pg.at(t as u32, 1);
-    pg.pool[i] = 0;
-    hs[1].put(0, t as u32);
-    loop {
-        let (Some(kf), Some(kb)) = (hs[0].min(), hs[1].min()) else { break };
+    let (mut mu, mut skipped) = (u64::MAX, false);
+    for (side, x) in [(0, s), (1, t)] {
+        let i = pg.at(x as u32, side);
+        pg.pool[i] = 0;
+        hs[side].put(0, x as u32);
+    }
+    while let (Some(kf), Some(kb)) = (hs[0].min(), hs[1].min()) {
         if kf as u64 + kb as u64 >= mu {
             break;
         }
-        let side = (hs[0].len > hs[1].len) as usize; // the side with fewer queued entries
-        let gr = if side == 0 { g } else { r };
+        let side = (hs[0].len > hs[1].len) as usize;
         let (d, u) = hs[side].pop().unwrap();
         let iu = pg.at(u, side);
         let lu = pg.pool[iu];
@@ -606,38 +485,28 @@ fn bidir(pg: &mut Pages, hs: &mut [Radix; 2], g: &Graph, r: &Graph, s: usize, t:
             continue; // stale entry
         }
         pg.pool[iu] = lu | SETTLED;
-        settled += 1;
-        let (mut e, end) = (gr.off(u as usize), gr.off(u as usize + 1));
-        while e < end {
-            let x = unsafe { *gr.edges.get_unchecked(e) };
-            let v = x & ((1 << gr.vb) - 1);
-            let mut wt = x >> gr.vb;
-            e += 1;
-            if wt == gr.esc {
-                wt = gr.edges[e];
-                e += 1;
-            }
-            let nd = d as u64 + wt as u64;
+        let (gr, h) = (if side == 0 { g } else { r }, &mut hs[side]);
+        gr.adj(u as usize, |v, w| {
+            let nd = d as u64 + w as u64;
             if nd >= INF as u64 {
                 skipped = true;
-                continue;
+                return;
             }
             let iv = pg.at(v, side);
             let lv = unsafe { *pg.pool.get_unchecked(iv) };
             if lv & SETTLED != 0 || lv as u64 <= nd {
-                continue;
+                return;
             }
             unsafe { *pg.pool.get_unchecked_mut(iv) = nd as u32 };
-            hs[side].put(nd as u32, v);
+            h.put(nd as u32, v);
             let o = pg.get(v, 1 - side) & !SETTLED;
             if o != INF {
                 mu = mu.min(nd + o as u64);
             }
-        }
+        });
     }
-    SETTLES.fetch_add(settled, Relaxed);
     pg.clear();
-    hs.iter_mut().for_each(|h| h.clear());
+    hs.iter_mut().for_each(Radix::clear);
     match mu {
         _ if skipped && mu >= INF as u64 => None,
         u64::MAX => Some(-1),
@@ -648,7 +517,6 @@ fn bidir(pg: &mut Pages, hs: &mut [Radix; 2], g: &Graph, r: &Graph, s: usize, t:
 /// One-ended Dijkstra with u64 distances, for the few queries whose distances need more than
 /// 31 bits (edges of weight near 2^32 at the special nodes). Speed does not matter here.
 fn plain(g: &Graph, s: usize, t: usize) -> i64 {
-    FALLBACKS.fetch_add(1, Relaxed);
     use std::cmp::Reverse;
     let mut dist = std::collections::HashMap::from([(s, 0u64)]);
     let mut heap = std::collections::BinaryHeap::from([Reverse((0u64, s))]);
@@ -659,46 +527,56 @@ fn plain(g: &Graph, s: usize, t: usize) -> i64 {
         if dist[&u] < d {
             continue; // stale entry
         }
-        let (mut e, end) = (g.off(u), g.off(u + 1));
-        while e < end {
-            let x = g.edges[e];
-            let (v, mut w) = ((x & ((1 << g.vb) - 1)) as usize, x >> g.vb);
-            e += 1;
-            if w == g.esc {
-                w = g.edges[e];
-                e += 1;
-            }
-            let nd = d + w as u64;
+        g.adj(u, |v, w| {
+            let (v, nd) = (v as usize, d + w as u64);
             if dist.get(&v).map_or(true, |&o| nd < o) {
                 dist.insert(v, nd);
                 heap.push(Reverse((nd, v)));
             }
-        }
+        });
     }
     -1
 }
 
 fn main() {
-    let t0 = Instant::now();
-    let env = |k: &str| std::env::var(k).ok();
     // The scoring box backs anonymous memory with 2 MB pages. That helps the graph, but would round
     // every thread's stack and malloc arena up to 2 MB: so small stacks, and one arena (M_ARENA_MAX).
     std::env::set_var("RUST_MIN_STACK", "262144");
     unsafe { mallopt(-8, 1) };
-    let threads = env("FW_THREADS").and_then(|v| v.parse().ok())
+    let t0 = std::time::Instant::now();
+    let threads = std::env::var("FW_THREADS").ok().and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |p| p.get()));
-    let qtxt = map("/data/queries.txt");
-    let mut qs = Vec::new();
-    let mut j = 0;
-    while j < qtxt.len() {
-        qs.push((num(qtxt, &mut j) as usize, num(qtxt, &mut j) as usize));
+    let q = map("/data/queries.txt");
+    let (mut qs, mut j) = (Vec::new(), 0);
+    while j < q.len() {
+        qs.push((num(q, &mut j) as usize, num(q, &mut j) as usize));
     }
-    let g = build(map("/data/graph.txt"), threads, &mut qs, env("FW_RENUM").map_or(true, |v| v != "0"));
-    let n = g.rel.len() - 1;
-    let tt = Instant::now();
-    let r = transpose(&g, threads);
-    let t_build = t0.elapsed();
-    eprintln!("transpose {:?}", tt.elapsed());
+
+    let gt = map("/data/graph.txt");
+    let mut i = 0;
+    let n = num(gt, &mut i) as usize;
+    num(gt, &mut i); // m: the edge lines are simply read to the end
+    let body = &gt[i..];
+    let vb = (usize::BITS - (n.max(2) - 1).leading_zeros()).max(1);
+    let esc = (1u32 << (32 - vb)) - 1;
+    let g = {
+        let g0 = csr(n, threads, vb, esc, &chunks(body, threads * 4), |&(lo, hi), emit| {
+            let mut i = lo;
+            while i < hi {
+                let (u, v) = (num(body, &mut i) as usize, num(body, &mut i) as u32);
+                emit(u, v, num(body, &mut i) as u32);
+            }
+        });
+        let newid = bfs_order(&g0, threads);
+        qs.iter_mut().for_each(|q| *q = (newid[q.0] as usize, newid[q.1] as usize));
+        relabel(&g0, &newid, threads)
+    };
+    let r = csr(n, threads, vb, esc, &spans(n, threads * 4), |&(lo, hi), emit| {
+        for u in lo..hi {
+            g.adj(u, |v, w| emit(v as usize, u as u32, w));
+        }
+    });
+    let t1 = t0.elapsed();
 
     let answers: Vec<AtomicI64> = qs.iter().map(|_| AtomicI64::new(-1)).collect();
     let next = AtomicUsize::new(0);
@@ -709,24 +587,12 @@ fn main() {
                 loop {
                     let k = next.fetch_add(1, Relaxed);
                     let Some(&(s, t)) = qs.get(k) else { break };
-                    let ans = if s == t {
-                        0
-                    } else if g.off(s) == g.off(s + 1) || g.has_in[t >> 6] & (1 << (t & 63)) == 0 {
-                        -1 // no way out of s, or no way into t
-                    } else if let Some(d) = bidir(&mut pg, &mut hs, &g, &r, s, t) {
-                        d
-                    } else {
-                        plain(&g, s, t)
-                    };
+                    let ans = if s == t { 0 } else { bidir(&mut pg, &mut hs, &g, &r, s, t).unwrap_or_else(|| plain(&g, s, t)) };
                     answers[k].store(ans, Relaxed);
                 }
-                let heap: usize = hs.iter().flat_map(|h| h.b.iter()).map(|b| b.capacity() * 8).sum();
-                STATE.fetch_add((pg.pool.capacity() * 4 + pg.dir.len() * 4) as u64, Relaxed);
-                SETTLES.fetch_add((heap as u64) << 40, Relaxed);
             });
         }
     });
-    let t_query = t0.elapsed();
 
     let mut out = Vec::with_capacity(qs.len() * 12);
     for a in &answers {
@@ -734,7 +600,5 @@ fn main() {
         out.push(b'\n');
     }
     std::fs::write("/out/distances.txt", out).expect("write distances.txt");
-    eprintln!("phase build {t_build:?} queries {:?} total {:?} settles {} fallbacks {} state {:.1} MB {}", t_query - t_build, t0.elapsed(),
-        SETTLES.load(Relaxed) & ((1 << 40) - 1), FALLBACKS.load(Relaxed), STATE.load(Relaxed) as f64 / 1e6, mem());
-    eprintln!("heap buckets {:.1} MB", (SETTLES.load(Relaxed) >> 40) as f64 / 1e6);
+    eprintln!("build {t1:?} total {:?}", t0.elapsed());
 }
