@@ -180,26 +180,37 @@ impl Graph {
 }
 
 /// Offsets for nodes 0..n with `slots(k)` slots each: the largest block (16 nodes on these graphs)
-/// whose in-block offsets fit a u8. Returns (base per block + sentinel, rel per node + sentinel, shift).
-fn layout(n: usize, slots: impl Fn(usize) -> u32) -> (Vec<u32>, Vec<u8>, u32) {
+/// whose in-block offsets fit a u8. Blocks are independent, so threads fill them; only the u32
+/// block bases are a serial prefix sum. Returns (base per block + sentinel, rel per node + sentinel,
+/// shift).
+fn layout(n: usize, threads: usize, slots: impl Fn(usize) -> u32 + Sync) -> (Vec<u32>, Vec<u8>, u32) {
     let mut sh = 4u32;
     loop {
-        let bs = 1usize << sh;
-        let mut rel = vec![0u8; n + 1];
-        let mut base = Vec::with_capacity((n >> sh) + 2);
-        let (mut total, mut ok) = (0u32, true);
-        for b0 in (0..=n).step_by(bs) {
-            base.push(total);
-            let mut acc = 0u32;
-            for k in b0..(b0 + bs).min(n + 1) {
-                ok &= acc <= 255;
-                rel[k] = acc as u8;
-                acc += if k < n { slots(k) } else { 0 };
+        let nb = (n >> sh) + 1;
+        let (mut rel, mut sums) = (vec![0u8; n + 1], vec![0u32; nb]);
+        let (rp, sp, ok) = (Slots(rel.as_mut_ptr()), Slots(sums.as_mut_ptr()), std::sync::atomic::AtomicBool::new(true));
+        par(threads, &spans(nb, threads * 4), |&(lo, hi)| {
+            let (rp, sp) = (&rp, &sp);
+            for b in lo..hi {
+                let mut acc = 0u32;
+                for k in b << sh..((b + 1) << sh).min(n + 1) {
+                    if acc > 255 {
+                        ok.store(false, Relaxed);
+                    }
+                    unsafe { *rp.0.add(k) = acc as u8 };
+                    acc += if k < n { slots(k) } else { 0 };
+                }
+                unsafe { *sp.0.add(b) = acc };
             }
-            total += acc;
-        }
-        base.push(total);
-        if ok || sh == 0 {
+        });
+        if ok.into_inner() || sh == 0 {
+            let mut base = Vec::with_capacity(nb + 1);
+            let mut total = 0u32;
+            for &x in &sums {
+                base.push(total);
+                total += x;
+            }
+            base.push(total);
             huge(&mut rel);
             return (base, rel, sh);
         }
@@ -232,7 +243,7 @@ fn csr<T: Sync>(n: usize, threads: usize, vb: u32, esc: u32, items: &[T], each: 
         });
         add(&b[..k]);
     });
-    let (base, rel, sh) = layout(n, |k| deg[k].load(Relaxed) as u32);
+    let (base, rel, sh) = layout(n, threads, |k| deg[k].load(Relaxed) as u32);
     let mut edges = vec![0u32; *base.last().unwrap() as usize];
     huge(&mut edges);
     let out = Slots(edges.as_mut_ptr());
@@ -333,7 +344,7 @@ fn relabel(g: &Graph, newid: &[u32], threads: usize) -> Graph {
             deg[newid[u] as usize].store((g.off(u + 1) - g.off(u)) as u16, Relaxed);
         }
     });
-    let (base, rel, sh) = layout(n, |k| deg[k].load(Relaxed) as u32);
+    let (base, rel, sh) = layout(n, threads, |k| deg[k].load(Relaxed) as u32);
     drop(deg);
     let mut edges = vec![0u32; *base.last().unwrap() as usize];
     huge(&mut edges);
