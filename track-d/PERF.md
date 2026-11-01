@@ -38,6 +38,8 @@ Local box: i5-11400H laptop (6 cores, 12 MB L3) running Docker; the scoring box 
 | 24 | a7961c3 | No 2 MB pages for the graph arrays either (only the NOHUGEPAGE advice left) | run-4f9060930961 | 0.142 | 64.3 | 623 | 70.5 |
 | 25 | bd5f56e | One prctl(PR_SET_THP_DISABLE) + one malloc arena instead of the custom allocator (-25 lines) | run-39e2f47ac593 | 0.142 | 64.2 | 598 | 70.6 |
 | 26 | cdf5158 | Branch-free label check (one signed compare); query side -40 lines; BFS prefetches claim words 4 ahead; calloc'd id/degree arrays | run-f73ce8bfc7b4 | 0.134 | 64.1 | 562 | 71.4 |
+| 27 | 64d75ea | Build side in 47 fewer lines (layout returns an edge-less Graph, bfs_order through par(), branch-free store) | run-fb48d5373f7f | 0.136 | 64.3 | 515 | 71.5 |
+| 28 | b4be5d5 | 33 more lines off both sides (tagged spans(), checked_shl in num, Pages literal, shorter pop) | run-0ca006a8a756 | 0.145 | 63.8 | 482 | 71.1 |
 
 ## How it works now
 
@@ -149,6 +151,9 @@ with fewer queued entries instead of the smaller key, 7.15M.
 | 6 or 8 threads instead of 12 | more L2 per search | 12 threads fastest | the search waits on memory, and hyper-threads hide that |
 | Prefetch the next node a side will settle (step 14) | overlap its offset miss with the current edge loop | board 0.180 s vs 0.178 s | the next pop is already likely in cache; the extra loads cost as much |
 | The BFS writes the relabelled graph directly (step 19) | skip the copy | -0.9% time, +2.4 MB, +81 lines: net loss | the copy is cheap once prefetched; the fused version needed more code than it saved |
+| 256-node buckets with a u8 side array in the CSR builder | -2.7 MB | M 63.4 -> 60.7 MB, but text fill 15.5 -> 31.4 ms, reverse fill 8.6 -> 17.6 ms | ~6,800 append streams per work item thrash the write path |
+| Serial layout() | -5 lines | ~5-6 ms per call x 3 calls on one thread | the parallel version is 1-2 ms per call |
+| Fixed M_MMAP_THRESHOLD of 1 MB | freed blocks return to the OS | M 67.1 -> 64.1 MB locally, reverse phase min 25 -> 32 ms | fresh mappings fault on every reuse |
 | Reverse graph through atomic countdown cursors (step 16) | 5 MB less than the bucketed builder's u16 side array | board 0.208 s vs 0.178 s, 72.2 vs 77.0 MB | on the scoring box the locked updates cost far more than the memory saved |
 
 ## Correctness
