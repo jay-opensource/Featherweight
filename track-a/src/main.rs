@@ -194,9 +194,10 @@ impl Pool {
         unsafe { std::slice::from_raw_parts(self.base.add(h * self.region), self.used[h].load(Relaxed) * B) }
     }
 
-    /// Hour h's region seen as group statistics (it holds them once its records are consumed).
-    fn stats(&self, h: usize) -> &mut [[u32; 6]] {
-        unsafe { std::slice::from_raw_parts_mut(self.base.add(h * self.region) as *mut [u32; 6], 2048) }
+    /// Hour h's region seen as group statistics by endpoint id: count, p50, p95, p99, errors
+    /// (it holds them once its records are consumed).
+    fn stats(&self, h: usize) -> &mut [[u32; 5]] {
+        unsafe { std::slice::from_raw_parts_mut(self.base.add(h * self.region) as *mut [u32; 5], 2048) }
     }
 
     /// Give bytes [lo, hi) of hour h's region, widened to whole pages at the top, back to the kernel.
@@ -328,13 +329,14 @@ fn main() {
     let b = map("/data/requests.log");
     let names = Names { slots: Box::new([const { AtomicU64::new(0) }; SLOTS]), keys: Mutex::new(Vec::new()), text: anon(2048 * 128) };
     // Any hour may hold every line (two words each at worst) plus a partly filled block per thread,
-    // and later 2,048 groups of six words.
+    // and later five words for each of up to 2,048 endpoint ids.
     let region = (b.len() / 19 + (threads + 1) * B + 6 * 2048 + 1023) & !1023;
     let pool = Pool { base: anon(HOURS * region * 4), region, used: (0..HOURS).map(|_| AtomicUsize::new(0)).collect() };
     let parts = chunks(b, threads * 16);
     let next: [AtomicUsize; 3] = Default::default();
-    let (bytes, groups): (Vec<AtomicUsize>, Vec<AtomicUsize>) = (0..HOURS).map(|_| Default::default()).unzip();
+    let bytes: Vec<AtomicUsize> = (0..HOURS).map(|_| Default::default()).collect();
     let (bar, order, out) = (Barrier::new(threads), OnceLock::new(), OnceLock::new());
+    let sorted = OnceLock::new();
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| {
@@ -345,19 +347,20 @@ fn main() {
                     zap(b[lo..].as_ptr(), hi - lo);
                 }
                 if bar.wait().is_leader() {
-                    // Endpoint ids in byte order of their names.
-                    let keys = names.keys.lock().unwrap();
-                    let mut ids: Vec<usize> = (1..=keys.len()).collect();
-                    ids.sort_unstable_by_key(|&id| names.text(keys[id - 1]));
                     // Hours largest first, so the last ones to start are short.
                     let mut hrs: Vec<usize> = (0..HOURS).collect();
                     hrs.sort_by_key(|&h| std::cmp::Reverse(pool.used[h].load(Relaxed)));
-                    assert!(order.set((ids, keys.clone(), hrs)).is_ok());
+                    let (keys, _) = order.get_or_init(|| (names.keys.lock().unwrap().clone(), hrs));
+                    // Endpoint ids in byte order of their names, for the output only: meanwhile the
+                    // other threads already work on the hours.
+                    let mut ids: Vec<usize> = (1..=keys.len()).collect();
+                    ids.sort_unstable_by_key(|&id| names.text(keys[id - 1]));
+                    assert!(sorted.set(ids).is_ok());
                 }
-                bar.wait();
-                let (order, keys, hrs) = order.get().unwrap();
+                let (keys, hrs) = order.wait();
+                let nk = keys.len();
 
-                // Each hour: count per endpoint, scatter the latencies in name order, select.
+                // Each hour: count per endpoint, scatter the latencies by endpoint, select.
                 let most = B * pool.used.iter().fold(0, |m, u| m.max(u.load(Relaxed)));
                 let lat = unsafe { std::slice::from_raw_parts_mut(anon::<u32>(most * 4), most) };
                 let (mut cnt, mut at) = ([0u64; 2048], [0u32; 2048]); // count | errors << 32, next slot
@@ -371,7 +374,7 @@ fn main() {
                         cnt[(w & 2047) as usize] += 1 + ((w as u64 & 0x800) << 21);
                     }
                     let mut total = 0;
-                    for &id in order {
+                    for id in 1..=nk {
                         at[id] = total;
                         total += cnt[id] as u32;
                     }
@@ -387,18 +390,18 @@ fn main() {
                     }
                     let nw = words.len();
                     let st = pool.stats(h);
-                    let (mut g, mut lo, mut size) = (0, 0, 0);
-                    for &id in order.iter().filter(|&&id| cnt[id] as u32 > 0) {
+                    st[..=nk].fill([0; 5]);
+                    let (mut lo, mut size) = (0, 0);
+                    for id in (1..=nk).filter(|&id| cnt[id] as u32 > 0) {
                         let (n, e) = (cnt[id] as u32, (cnt[id] >> 32) as u32);
                         let [p50, p95, p99] = pct(&mut lat[lo..lo + n as usize]);
                         lo += n as usize;
-                        st[g] = [id as u32, n, e, p50, p95, p99];
+                        st[id] = [n, p50, p95, p99, e];
                         let line = [n, p50, p95, p99, e, ppm(e, n)].map(digits);
                         size += 28 + keys[id - 1].1 + line.iter().sum::<usize>();
-                        g += 1;
                     }
-                    pool.free(h, g * 24, nw * 4);
-                    (bytes[h].store(size, Relaxed), groups[h].store(g, Relaxed));
+                    pool.free(h, (nk + 1) * 20, nw * 4);
+                    bytes[h].store(size, Relaxed);
                 }
                 unsafe { madvise(lat.as_mut_ptr() as *mut u8, most * 4, 4) };
 
@@ -421,6 +424,7 @@ fn main() {
                 }
                 bar.wait();
                 let (o, off, _, shared) = out.get().unwrap();
+                let st = sorted.get().unwrap();
 
                 // Each hour: format its groups into its range of the output.
                 while let Some(&h) = hrs.get(next[2].fetch_add(1, Relaxed)) {
@@ -430,8 +434,10 @@ fn main() {
                     let (mo, d) = if d > 31 { (11, d - 31) } else { (10, d) };
                     let stamp = format!("2026-{mo}-{d:02}T{hh:02}:00:00Z ");
                     let mut i = 0;
-                    for &[id, n, e, p50, p95, p99] in &pool.stats(h)[..groups[h].load(Relaxed)] {
-                        let k = names.text(keys[id as usize - 1]);
+                    let sh = pool.stats(h);
+                    for &id in st.iter().filter(|&&id| sh[id][0] > 0) {
+                        let [n, p50, p95, p99, e] = sh[id];
+                        let k = names.text(keys[id - 1]);
                         o[i..i + 21].copy_from_slice(stamp.as_bytes());
                         o[i + 21..i + 21 + k.len()].copy_from_slice(k);
                         i += 21 + k.len();
@@ -441,7 +447,7 @@ fn main() {
                         o[i] = b'\n';
                         i += 1;
                     }
-                    pool.free(h, 0, groups[h].load(Relaxed) * 24);
+                    pool.free(h, 0, (nk + 1) * 20);
                     // Drop this hour's whole output pages from our page tables now, in parallel; the
                     // data stays in the file. Exit would otherwise unmap them all on one core.
                     if *shared {

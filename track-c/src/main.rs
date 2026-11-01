@@ -319,6 +319,9 @@ fn run(b: &[u8], tab: &[AtomicU8], attempt: u32, threads: usize) -> Option<Vec<A
     let aggs = par(threads, || {
         let mut me: Local = ([NEW; 256], (0, 0), ([[0; 64]; 64], [0; 64]));
         for j in jobs(&next, cut.len() - 1) {
+            // Chunks in strided order: chunks parsed at the same time lie 1/threads of the file
+            // apart, so their page faults do not queue on the same page-table lock.
+            let j = j % threads * (cut.len() - 1) / threads + j / threads;
             ends[j].store(chunk(b, cut[j], cut[j + 1], &sh, &mut me), Relaxed);
         }
         (0..64).for_each(|r| sh.apply(&me.2 .0[r], &mut me.2 .1[r], r, &mut me.0));
