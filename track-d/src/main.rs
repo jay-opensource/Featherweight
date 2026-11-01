@@ -3,7 +3,7 @@
 // runs as a two-ended Dijkstra whose labels live in small per-thread pages, not in arrays the
 // size of the graph. See PERF.md for the measurements behind each choice.
 use std::{fs::File, os::unix::io::AsRawFd};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering::*};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -184,61 +184,73 @@ impl Edges for (&Graph, usize, usize) {
     }
 }
 
-/// Build a CSR over n nodes from the edges of `items`, read twice. Every random access stays
-/// inside a small region:
-/// 1. count each item's slots per bucket of 8192 nodes (213 counters per item, no atomics);
-/// 2. append each slot to its bucket's region through the item's own cursor, with the node's
-///    place inside the bucket in a parallel u16 array (213 sequential streams per thread; both
-///    slots of an escaped edge get it, so the slots can be counted and moved one by one);
-/// 3. per bucket, count each node's slots from the u16s alone; once the layout is known, reorder
-///    the bucket's ~94 KB of slots by node through a scratch copy.
+/// Build a CSR over n nodes from the edges of `items` (about `est` slots), reading them once if
+/// `est` is right. Every random access stays inside a small region:
+/// 1. each item appends each slot to its own segment of the slot's bucket of 8192 nodes (213
+///    sequential streams per thread), with 1 + the node's place inside the bucket in a parallel
+///    u16 array (both slots of an escaped edge get it, so the slots can be counted and moved one
+///    by one; 0 marks unused room). A segment has room for its share of `est` plus 6 standard
+///    deviations; if one overflows (it only counts then), the pass is repeated with exact room;
+/// 2. per bucket, count each node's slots from the u16s alone;
+/// 3. once the layout is known, reorder the bucket's ~94 KB of slots by node through a scratch
+///    copy. They move down by the unused room before them, maybe into the room of earlier
+///    buckets: wait until those have been copied.
 /// Nothing is locked, and no store lands outside the bucket being worked on.
-fn csr(n: usize, threads: usize, vb: u32, esc: u32, items: &[impl Edges]) -> Graph {
+fn csr(n: usize, threads: usize, items: &[impl Edges], est: usize) -> Graph {
     const BS: u32 = 13;
-    let (nb, ni) = ((n >> BS) + 1, items.len());
-    let mut cur = vec![0u32; ni * nb];
-    let cp = Slots(cur.as_mut_ptr());
-    par(threads, &(0..ni).collect::<Vec<_>>(), |&i| {
-        let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
-        items[i].each(|u, _, w| c[u >> BS] += 1 + (w >= esc) as u32);
-    });
-    let (mut start, mut acc) = (vec![0usize; nb + 1], 0u32);
-    for b in 0..nb {
-        for i in 0..ni {
-            (cur[i * nb + b], acc) = (acc, acc + cur[i * nb + b]);
+    let vb = (usize::BITS - (n.max(2) - 1).leading_zeros()).max(1); // bits of a target
+    let (nb, ni, esc) = ((n >> BS) + 1, items.len(), u32::MAX >> vb);
+    let mut room = vec![est / ni / nb + 6 * (est / ni / nb).isqrt(); ni * nb];
+    let (mut edges, loc, beg, ep) = loop {
+        let (mut cur, mut lim, mut acc) = (vec![0; ni * nb], vec![0; ni * nb], 0);
+        for j in (0..ni * nb).map(|j| j % ni * nb + j / ni) {
+            (cur[j], lim[j], acc) = (acc, acc + room[j], acc + room[j]); // segment i * nb + b
         }
-        start[b + 1] = acc as usize;
-    }
-    let (mut edges, mut loc) = (vec![0u32; acc as usize], vec![0u16; acc as usize]);
-    let (ep, lp) = (Slots(edges.as_mut_ptr()), Slots(loc.as_mut_ptr()));
-    par(threads, &(0..ni).collect::<Vec<_>>(), |&i| {
-        let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
-        items[i].each(|u, v, w| {
-            let (p, l) = (c[u >> BS] as usize, (u & ((1 << BS) - 1)) as u16);
-            let k = store(&ep, p, v, w, vb, esc);
-            c[u >> BS] += k as u32;
-            unsafe { (*(&lp).0.add(p), *(&lp).0.add(p + k - 1)) = (l, l) };
+        let beg = [&cur[..nb], &[acc]].concat(); // bucket b's room starts at beg[b]
+        let (mut ed, mut lc) = (vec![0u32; acc], vec![0u16; acc]);
+        let (ep, lp) = (Slots(ed.as_mut_ptr()), Slots(lc.as_mut_ptr()));
+        let cp = Slots(cur.as_mut_ptr());
+        par(threads, &(0..ni).collect::<Vec<_>>(), |&i| {
+            let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
+            let lim = &lim[i * nb..][..nb];
+            items[i].each(|u, v, w| {
+                let (b, k, l) = (u >> BS, 1 + (w >= esc) as usize, (u % (1 << BS)) as u16 + 1);
+                if c[b] + k <= lim[b] {
+                    store(&ep, c[b], v, w, vb, esc);
+                    unsafe { (*(&lp).0.add(c[b]), *(&lp).0.add(c[b] + k - 1)) = (l, l) };
+                }
+                c[b] += k;
+            });
         });
-    });
+        if cur.iter().zip(&lim).all(|(c, l)| c <= l) {
+            break (ed, lc, beg, ep);
+        }
+        room = (0..ni * nb).map(|j| cur[j] + room[j] - lim[j]).collect(); // the exact counts
+    };
     let mut deg = vec![0u16; n + 1];
     let dp = Slots(deg.as_mut_ptr());
-    let buckets: Vec<usize> = (0..nb).collect();
-    par(threads, &buckets, |&b| {
-        for &l in &loc[start[b]..start[b + 1]] {
-            let d = unsafe { &mut *(&dp).0.add(b << BS | l as usize) };
+    let bk: Vec<_> = (0..nb).map(|b| (b, AtomicBool::new(false))).collect(); // (bucket, gathered)
+    par(threads, &bk, |&(b, _)| {
+        for &l in loc[beg[b]..beg[b + 1]].iter().filter(|&&l| l > 0) {
+            let d = unsafe { &mut *(&dp).0.add((b << BS) + l as usize - 1) };
             *d = d.checked_add(1).expect("out-degree above 65k");
         }
     });
     let lay = layout(n, threads, vb, esc, |k| deg[k] as u32);
-    par(threads, &buckets, |&b| {
-        let (lo, hi) = (start[b], start[b + 1]);
+    par(threads, &bk, |&(b, _)| {
+        let (lo, hi) = (beg[b], beg[b + 1]);
         let e = unsafe { std::slice::from_raw_parts((&ep).0.add(lo), hi - lo) }.to_vec();
+        bk[b].1.store(true, Release);
         let mut at = Vec::from_iter((b << BS..((b + 1) << BS).min(n + 1)).map(|k| lay.off(k)));
-        for (&x, &l) in e.iter().zip(&loc[lo..hi]) {
-            unsafe { *(&ep).0.add(at[l as usize]) = x };
-            at[l as usize] += 1;
+        let r = at[0]..lay.off(((b + 1) << BS).min(n)); // where the slots go
+        while (0..b).any(|x| beg[x] < r.end && beg[x + 1] > r.start && !bk[x].1.load(Acquire)) {}
+        for (&x, &l) in e.iter().zip(&loc[lo..hi]).filter(|p| *p.1 > 0) {
+            unsafe { *(&ep).0.add(at[l as usize - 1]) = x };
+            at[l as usize - 1] += 1;
         }
     });
+    edges.truncate(lay.off(n));
+    edges.shrink_to_fit(); // frees the unused room at the end
     Graph { edges, ..lay }
 }
 
@@ -534,17 +546,15 @@ fn main() {
     }
 
     let (gt, mut i) = (map("/data/graph.txt"), 0);
-    let (n, _m) = (num(gt, &mut i) as usize, num(gt, &mut i)); // the edge lines are read to the end
+    let (n, m) = (num(gt, &mut i) as usize, num(gt, &mut i) as usize); // m: only an estimate
     let body = &gt[i..];
-    let vb = (usize::BITS - (n.max(2) - 1).leading_zeros()).max(1);
-    let esc = (1u32 << (32 - vb)) - 1;
     let g = {
-        let g0 = csr(n, threads, vb, esc, &spans(body, body.len(), threads * 4));
+        let g0 = csr(n, threads, &spans(body, body.len(), threads * 4), m);
         let newid = bfs_order(&g0, threads);
         qs.iter_mut().for_each(|q| *q = (newid[q.0] as usize, newid[q.1] as usize));
         relabel(&g0, &newid, threads)
     };
-    let r = csr(n, threads, vb, esc, &spans(&g, n, threads * 4));
+    let r = csr(n, threads, &spans(&g, n, threads * 4), 0); // no estimate: count first
     let t1 = t0.elapsed();
 
     let ans: Vec<AtomicI64> = qs.iter().map(|_| AtomicI64::new(-1)).collect();
