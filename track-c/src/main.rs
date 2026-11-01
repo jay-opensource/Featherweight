@@ -17,7 +17,6 @@ use std::{fs::File, os::unix::io::AsRawFd};
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    fn mallopt(param: i32, value: i32) -> i32;
 }
 
 /// n zeroed values in fresh anonymous memory: charged only when touched, never freed (the process
@@ -344,7 +343,6 @@ fn money(c: i64) -> String {
 
 fn main() {
     std::env::set_var("RUST_MIN_STACK", "262144"); // small thread stacks, never on a 2 MB page
-    unsafe { mallopt(-8, 1) }; // one malloc arena, not one per thread (M_ARENA_MAX)
     let cores = std::thread::available_parallelism().map_or(1, |p| p.get());
     let threads = std::env::var("FW_THREADS").map_or(cores, |v| v.parse().unwrap());
 
