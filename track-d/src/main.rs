@@ -608,6 +608,7 @@ fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: &Graph, r: &Graph, s: usize, t: 
                 }
                 unsafe { *pg.pool.get_unchecked_mut(iv) = nd as u32 };
                 h.put(nd as u32, v);
+                prefetch(unsafe { gr.edges.get_unchecked(gr.off(v as usize)) });
                 let o = pg.get(v, 1 - side) & !SETTLED;
                 if o != INF {
                     mu = mu.min(nd + o as u64);
