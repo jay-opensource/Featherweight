@@ -285,6 +285,34 @@ fn csr<T: Sync>(n: usize, threads: usize, vb: u32, esc: u32, items: &[T], each: 
     Graph { edges, base, rel, sh, vb, esc }
 }
 
+/// The reverse of `g`. Its edges are local (BFS order), so a shared atomic cursor per node is
+/// cheap: count in-degrees, lay out, then fill each node's slots through its countdown cursor.
+fn transpose(g: &Graph, threads: usize) -> Graph {
+    let n = g.rel.len() - 1;
+    let ranges = spans(n, threads * 4);
+    let deg: Vec<AtomicU16> = (0..n + 1).map(|_| AtomicU16::new(0)).collect();
+    par(threads, &ranges, |&(lo, hi)| {
+        for u in lo..hi {
+            g.adj(u, |v, w| assert!(deg[v as usize].fetch_add(1 + (w >= g.esc) as u16, Relaxed) < u16::MAX - 2, "in-degree above 65k"));
+        }
+    });
+    let (base, rel, sh) = layout(n, threads, |k| deg[k].load(Relaxed) as u32);
+    let mut edges = vec![0u32; *base.last().unwrap() as usize];
+    huge(&mut edges);
+    let out = Slots(edges.as_mut_ptr());
+    par(threads, &ranges, |&(lo, hi)| {
+        let out = &out;
+        for u in lo..hi {
+            g.adj(u, |v, w| {
+                let (v, c) = (v as usize, 1 + (w >= g.esc) as u16);
+                let p = base[v >> sh] as usize + rel[v] as usize + (deg[v].fetch_sub(c, Relaxed) - c) as usize;
+                store(out, p, u as u32, w, g.vb, g.esc);
+            });
+        }
+    });
+    Graph { edges, base, rel, sh, vb: g.vb, esc: g.esc }
+}
+
 /// Breadth-first relabelling, in parallel: each thread grows its own region from a seed in its
 /// slice of the id range (claiming nodes with a CAS) and re-seeds from that slice when its region
 /// is enclosed. New ids follow thread 0's visit order, then thread 1's, and so on.
@@ -610,11 +638,7 @@ fn main() {
         qs.iter_mut().for_each(|q| *q = (newid[q.0] as usize, newid[q.1] as usize));
         relabel(&g0, &newid, threads)
     };
-    let r = csr(n, threads, vb, esc, &spans(n, threads * 4), |&(lo, hi), emit| {
-        for u in lo..hi {
-            g.adj(u, |v, w| emit(v as usize, u as u32, w));
-        }
-    });
+    let r = transpose(&g, threads);
     let t1 = t0.elapsed();
 
     let answers: Vec<AtomicI64> = qs.iter().map(|_| AtomicI64::new(-1)).collect();
