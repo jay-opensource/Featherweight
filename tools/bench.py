@@ -84,7 +84,7 @@ def main():
     ap.add_argument("--stderr", action="store_true", help="print the solution's stderr (phase timers)")
     a = ap.parse_args()
 
-    tag = f"featherweight/track-{a.track}"
+    tag = os.environ.get("FW_TAG", f"featherweight/track-{a.track}")  # one tag per worktree
     if not a.no_build:
         build(a.track, tag)
     want = expected_hashes()
