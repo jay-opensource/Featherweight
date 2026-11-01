@@ -1,15 +1,39 @@
-// Track C, featherweight: little memory per unit of speed.
-//
-// Parsing. Threads take byte ranges of records.csv that start at a guessed record boundary; the
-// guess is proved afterwards (each range must end exactly where the next one begins, see `run`).
-// Each 64-byte block gives bit masks of quotes and LFs; a carry-less multiply turns the quote bits
-// into an inside-quotes mask, and the LFs outside quotes end the records. Inside a record the
-// layout is fixed, so its fields are found by its shape (see `record`), not by a scan.
-//
-// Aggregation. Names go to one shared dictionary (names inline in 64-byte buckets, dense ids), and
-// distinct names per country are one bit per (country, name id): about 3 MB in all, instead of a
-// hash set per thread. The input is mapped, not copied, and is never compared against: a name is
-// compared with its dictionary bucket, which the parser prefetched.
+//! Track C (Join), Featherweight: little memory per unit of speed. Reads `/data/records.csv`
+//! (192.6 MB, 3.32M records of a hostile CSV: quoted commas, escaped quotes, embedded LFs, mixed
+//! CRLF/LF, stray byte order marks) and `/data/regions.csv`, joins each record to its country, and
+//! writes `/out/aggregates.txt`: per country the count, id sum, amount sum, min and max in cents,
+//! distinct names, name bytes and note bytes. README.md has the design in prose, PERF.md every
+//! board run; the numbers in brackets below are PERF.md mechanism numbers.
+//!
+//! Pipeline (`main`, `run`; one pool of threads, started once, with barriers between phases):
+//! 1. Regions: all threads parse `regions.csv` into a byte table region id -> country number (11).
+//! 2. Records: byte ranges (48 per thread) are claimed from a counter; `read` pulls each in 32 KB
+//!    pieces, finds records with 64-byte quote/LF bit masks (`inside` is a carry-less multiply) and
+//!    `record` finds the fields by the record's shape, not by scanning. Records are batched 32 at a
+//!    time and `flush` does the dictionary lookups and aggregation (1, 2, 3, 5).
+//! 3. Distinct names: one bit per (country, name id) in a shared bitset; every thread then popcounts
+//!    its share. Then the per-thread aggregates are merged, sorted by code, and written (6).
+//!
+//! Data structures: `Shared` is the name dictionary (64-byte buckets, three slots each, names
+//! inline up to 16 bytes, hashed with two AES rounds) plus the bitset; `Agg` is one group's running
+//! sums; `Rec` is a parsed record waiting for its lookups.
+//!
+//! Correctness of the split: a range starts at a guessed record boundary ("LF followed by a digit
+//! or a byte order mark") and the guess is proved afterwards: each range must stop exactly where
+//! the next one started. Otherwise, or if the dictionary fills, `run` is redone on one thread (10).
+//!
+//! Box-specific decisions (scoring box: i5-13500, THP "always", every thread faulting on one
+//! address-space lock; PERF.md "Findings specific to the scoring box"):
+//! - Records are `pread` into a per-thread buffer that stays in L2, not mapped: no page-table
+//!   entries to fault in while parsing or to tear down at exit (8; run-6c8cfb2db4cb, 32.68 ms).
+//! - Page-table lock: shared tables are mapped up front with MADV_POPULATE_WRITE, a 2 MB page by
+//!   exactly one thread; the bitset is updated by queued plain stores under region locks, not by
+//!   locked ORs (6, 7, 13).
+//! - THP: all memory is MADV_NOHUGEPAGE (a 2 MB page is charged whole to memory.peak) except the
+//!   first 6 MB of the dictionary and bitset, which are fully used anyway (9; run-be0296de8c66).
+//! - One thread pool, no second round of thread starts (11). The process ends without freeing.
+//! - Build flags are in .cargo/config.toml (x86-64-v3 plus PCLMULQDQ and AES; the unsafe intrinsics
+//!   below rely on them).
 use std::arch::x86_64::*;
 use std::sync::{atomic::Ordering::*, atomic::*, Barrier, Mutex};
 use std::{fs::File, os::unix::fs::FileExt, os::unix::io::AsRawFd};
@@ -24,9 +48,14 @@ extern "C" {
 /// pages, and memory.peak would charge a whole one for its first touched byte.
 fn zeroed<T>(n: usize) -> &'static [T] {
     let len = n * std::mem::size_of::<T>();
+    // SAFETY: a fresh anonymous mapping; 3 = PROT_READ|PROT_WRITE, 0x22 = MAP_PRIVATE|MAP_ANONYMOUS.
+    // Over-allocated by 2 MB so the start can be rounded up to a 2 MB boundary inside it.
     let p = unsafe { mmap(std::ptr::null_mut(), len + (2 << 20), 3, 0x22, -1, 0) }; // RW, anon
     let p = (p as usize + (2 << 20) - 1 & !((2 << 20) - 1)) as *mut u8; // 2 MB aligned
+    // SAFETY: p..p + len lies inside the mapping above. 15 = MADV_NOHUGEPAGE.
     unsafe { madvise(p, len, 15) };
+    // SAFETY: n zeroed T in the mapping. Used with T = u8 or atomics, for which all-zero is valid, and
+    // the memory is never freed, so the 'static lifetime holds.
     unsafe { std::slice::from_raw_parts(p as *const T, n) }
 }
 
@@ -34,6 +63,8 @@ fn zeroed<T>(n: usize) -> &'static [T] {
 /// first would each fault on its pages, twice when a read comes first (the zero page, then a copy),
 /// and queue on the same page-table lock.
 fn populate<T>(s: &[T]) {
+    // SAFETY: madvise only changes page mapping, never contents. 23 = MADV_POPULATE_WRITE. Failure is
+    // ignored (an unaligned slice fails with EINVAL; callers pass 4 KB-aligned slices).
     unsafe { madvise(s.as_ptr() as *mut u8, std::mem::size_of_val(s), 23) };
 }
 
@@ -43,15 +74,21 @@ fn map(path: &str) -> &'static [u8] {
     let f = File::open(path).unwrap();
     let len = f.metadata().unwrap().len() as usize;
     let p = zeroed::<u8>(len + 8192).as_ptr() as *mut u8;
+    // SAFETY: p is our own zeroed mapping of len + 8192 bytes; MAP_FIXED replaces its first len bytes
+    // with the file, leaving the zero tail. The slice below covers only those len bytes.
     let q = unsafe { mmap(p, len, 1, 0x12, f.as_raw_fd(), 0) }; // read-only, private, fixed
     assert!(len == 0 || p == q);
     unsafe { std::slice::from_raw_parts(p, len) }
 }
 
+/// Unaligned 8-byte load at b[i], not bounds-checked: the parser may look past a record, which is safe
+/// because buffers have zero padding (64 bytes in front in `read`, at least 4 KB behind in `map`).
 fn word(b: &[u8], i: usize) -> u64 {
+    // SAFETY: callers stay within the padding described above (a record looks back at most 64 bytes).
     unsafe { (b.as_ptr().add(i) as *const u64).read_unaligned() }
 }
 
+/// The byte at b[i], read through `word` (so with the same padding rule).
 fn at(b: &[u8], i: usize) -> u8 {
     word(b, i) as u8
 }
@@ -63,11 +100,13 @@ fn find(b: &[u8], i: usize, c: u8) -> usize {
 
 /// The 32 bytes of b from i.
 fn load(b: &[u8], i: usize) -> __m256i {
+    // SAFETY: 32 bytes inside the padded buffer (see `word`); AVX2 comes from .cargo/config.toml.
     unsafe { _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i) }
 }
 
 /// Bit k is set where byte k of v is c.
 fn eq(v: __m256i, c: u8) -> u64 {
+    // SAFETY: register-only AVX2 (enabled by the build flags).
     unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 as u64 }
 }
 
@@ -75,6 +114,7 @@ fn eq(v: __m256i, c: u8) -> u64 {
 /// number of quotes sit at or before k, that is inside a quoted field or on its opening quote. An
 /// escaped `""` toggles twice and changes nothing.
 fn inside(q: u64) -> u64 {
+    // SAFETY: register-only SSE2 and PCLMULQDQ (target features in .cargo/config.toml).
     let (q, ones) = unsafe { (_mm_set_epi64x(0, q as i64), _mm_set1_epi8(-1)) };
     unsafe { _mm_cvtsi128_si64(_mm_clmulepi64_si128(q, ones, 0)) as u64 }
 }
@@ -83,6 +123,9 @@ fn inside(q: u64) -> u64 {
 /// vector: the bytes below the digits are masked off, then digits are joined in pairs, the pairs
 /// in fours, and the fours in eights. Lane 3 is unused.
 fn numbers(w: [u64; 3], n: [usize; 3]) -> [i64; 4] {
+// SAFETY: register-only AVX2; the final transmute is __m256i to [i64; 4], the same size.
+// Constants: 0x010A are the digit weights (10, 1) of `maddubs`, 0x0001_0064 the weights (100, 1)
+// of `madd`, and 10000 joins two 4-digit halves; the first digit is the lowest byte of the lane.
     unsafe {
         let v = _mm256_set_epi64x(0, w[2] as i64, w[1] as i64, w[0] as i64);
         let n = _mm256_set_epi64x(0, n[2] as i64, n[1] as i64, n[0] as i64);
@@ -98,6 +141,7 @@ fn numbers(w: [u64; 3], n: [usize; 3]) -> [i64; 4] {
 /// Word j of the name b[s..s + n], zero-padded past its end.
 fn kw(b: &[u8], s: usize, n: usize, j: usize) -> u64 {
     let len = (8 * n.saturating_sub(8 * j)).min(64) as u32;
+    // SAFETY: BMI2 (build flags); bzhi with len = 64 keeps all bits.
     unsafe { _bzhi_u64(word(b, s + 8 * j), len) }
 }
 
@@ -110,6 +154,7 @@ fn text(b: &[u8], p: usize) -> (usize, u32) {
         let v = load(b, i);
         let (q, x) = (eq(v, b'"'), inside(eq(v, b'"')) ^ carry);
         let stop = (eq(v, b',') & !x).trailing_zeros();
+        // SAFETY: BMI2 (build flags); stop <= 64, and bzhi keeps the quotes before the stop position.
         let k = quotes + unsafe { _bzhi_u64(q, stop) }.count_ones();
         if stop < 32 {
             return (i + stop as usize, k);
@@ -151,7 +196,10 @@ type Locks = Vec<Mutex<()>>;
 #[repr(C, align(64))]
 struct Bucket([AtomicU64; 2], [[AtomicU64; 2]; 3]);
 
+// A header whose tag bit 13 is clear never occurs for a real name (tags always set it), so this
+// value marks a slot being filled by another thread; 0 marks an empty slot.
 const BUSY: u32 = 0xFFFF_C000;
+// Bit 63 of a key's second word: the name is over 16 bytes and the low bits hold its offset in `long`.
 const LONG: u64 = 1 << 63;
 
 /// One thread's state: aggregates per group, its block of free ids, its bit queues (64 regions x 64
@@ -234,6 +282,7 @@ impl Shared<'_> {
     fn apply(&self, q: &[u32; 64], len: &mut usize, r: usize) {
         for &x in &q[..*len] {
             let p = self.4.as_ptr().wrapping_add(x as usize >> 6) as *const i8;
+            // SAFETY: a prefetch for write is only a hint and never faults.
             unsafe { _mm_prefetch(p, _MM_HINT_ET0) };
         }
         let _lock = self.5[r].lock().unwrap();
@@ -245,8 +294,10 @@ impl Shared<'_> {
     }
 }
 
-/// The slots of a bucket with headers h whose tag is `tag`, that are BUSY, and that are empty.
+/// The slots of a bucket with headers h whose tag is `tag`, that are BUSY, and that are empty, as
+/// 3-bit masks (the fourth 32-bit lane of the two header words is not a slot and is masked off).
 fn lanes(h: [u64; 2], tag: u32) -> [u32; 3] {
+// SAFETY: register-only SSE2.
     unsafe {
         let h = _mm_set_epi64x(h[1] as i64, h[0] as i64); // the fourth header is always 0
         let is = |x, v: u32| _mm_cmpeq_epi32(x, _mm_set1_epi32(v as i32));
@@ -270,12 +321,18 @@ struct Rec([u64; 2], usize, usize, u64, usize, i64, i64, i64, i64);
 /// - the note is what remains, and its quotes are the record's minus the name's.
 fn record(b: &[u8], rs: usize, lf: usize, quotes: u32, sh: &Shared) -> Rec {
     let p = rs + 3 * (at(b, rs) == 0xEF) as usize; // a byte order mark
+// 0xEF starts the 3-byte UTF-8 byte order mark. 0x1010...: a digit (0x30-0x39) has bit 4 set and
+// the comma (0x2C) does not, so the first clear bit marks the end of the id.
     let c0 = p + (!word(b, p) & 0x1010_1010_1010_1010).trailing_zeros() as usize / 8;
     let (c1, nq) = text(b, c0 + 1);
     let e = lf - (at(b, lf - 1) == b'\r') as usize;
     let m = eq(load(b, e - 32), b',') as u32;
     let c3 = e - 1 - m.leading_zeros() as usize;
+    // c3 is the last comma before the terminator, c2 the one before it (both within 32 bytes of e).
+    // SAFETY (bzhi): BMI2 (build flags); c3 + 32 - e < 32 as c3 < e, so only the bits below c3 stay.
     let c2 = e - 1 - unsafe { _bzhi_u32(m, (c3 + 32 - e) as u32) }.leading_zeros() as usize;
+// The last 8 bytes before e end in ".dd": the integer digits move up one byte over the dot and
+// the two cents digits stay in bytes 6-7, so `numbers` reads one run of digits.
     // The amount `-?d+.dd` is read as cents, with its dot squeezed out.
     let (neg, x) = ((at(b, c3 + 1) == b'-') as usize, word(b, e - 8));
     let x = (x & 0xFF_FFFF_FFFF) << 8 | x & 0xFFFF << 48;
@@ -285,6 +342,8 @@ fn record(b: &[u8], rs: usize, lf: usize, quotes: u32, sh: &Shared) -> Rec {
     let s = c0 + 1 + quoted;
     let (n, tq) = (c1 - s - quoted, (quotes - nq) as usize); // tq: the note's quotes
     // The name's first 16 bytes, zero-padded, and a hash of them and n (two AES rounds).
+// SAFETY: a 16-byte load at s stays in the padded buffer; the rest is register-only AES/SSE2.
+// The AES round keys are the first hex digits of pi. Bytes past n are masked to zero.
     let (key, h) = unsafe {
         let iota = _mm_set_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
         let v = _mm_loadu_si128(b.as_ptr().add(s) as *const __m128i);
@@ -294,9 +353,13 @@ fn record(b: &[u8], rs: usize, lf: usize, quotes: u32, sh: &Shared) -> Rec {
         let h = _mm_cvtsi128_si64(_mm_aesenc_si128(h, r)) as u64;
         (std::mem::transmute(k), h)
     };
+    // bucket = (high 32 bits of the hash * bucket count) >> 32, kept in bits 32..; tag = 13 hash bits
+    // plus a set bit 13, so that no header is 0 (empty) or BUSY.
     let h = (h >> 32) * sh.1.len() as u64 & !0xFFFF_FFFF | h & 0x1FFF | 0x2000; // bucket, tag
     let (k, region) = (h as usize >> 32, region as usize);
+    // SAFETY: k < sh.1.len() by the range reduction above, and a prefetch never faults anyway.
     unsafe { _mm_prefetch(sh.1.as_ptr().add(k) as *const i8, _MM_HINT_T0) }; // the name's bucket
+    // SAFETY: a prefetch never faults, even for a region id past the table (wrapping_add).
     unsafe { _mm_prefetch(sh.0.as_ptr().wrapping_add(region) as *const i8, _MM_HINT_T0) };
     let nb = (n + quoted - nq as usize / 2) as i64;
     let tb = (c2 - c1 - 1 - tq / 2 - (tq > 0) as usize) as i64;
@@ -308,6 +371,7 @@ fn record(b: &[u8], rs: usize, lf: usize, quotes: u32, sh: &Shared) -> Rec {
 /// does not map the file: no page-table entries to fault in while reading, none to tear down at
 /// exit, and the kernel copies from the page cache in big strides. 32 KB costs no time against 64
 /// KB and 0.4 MB less memory; 16 KB costs kernel time.
+// The per-thread buffer is PIECE + 192 bytes: 64 in front, the piece, and 128 zero bytes behind.
 const PIECE: usize = 1 << 15;
 
 /// Parse the records of f (len bytes) that start in [from, to), one piece at a time through the
@@ -322,9 +386,12 @@ fn read(f: &File, len: usize, from: usize, to: usize, sh: &Shared, me: &mut Loca
     let (mut batch, mut nb) = ([Rec::default(); 32], 0);
     loop {
         let n = PIECE.min(len - pos);
+        // SAFETY: buf is this thread's own buffer of PIECE + 192 bytes (see `run`); n <= PIECE, so
+        // 64..64 + n + 64 is inside it, and no other thread has a reference to it.
         let piece = unsafe { std::slice::from_raw_parts_mut(buf.add(64), n + 64) };
         f.read_exact_at(&mut piece[..n], pos as u64).unwrap();
         piece[n..].fill(0); // no stale LF after the data
+        // SAFETY: the whole buffer, still only this thread's; the piece above is not used past this point.
         let b = unsafe { std::slice::from_raw_parts(buf, PIECE + 192) };
         let find = || (65..64 + n).find(|&i| line_start(b, i)).unwrap_or(64 + n);
         let first = if start.is_none() { find() } else { 64 };
@@ -339,6 +406,7 @@ fn read(f: &File, len: usize, from: usize, to: usize, sh: &Shared, me: &mut Loca
             let mut lfs = (eq(lo, b'\n') | eq(hi, b'\n') << 32) & !x;
             while lfs != 0 && rs < end {
                 let lf = base + lfs.trailing_zeros() as usize;
+                // SAFETY: BMI2 (build flags); lf - base < 64, so bzhi keeps the quotes before the LF.
                 let qlf = quotes + unsafe { _bzhi_u64(q, (lf - base) as u32) }.count_ones();
                 batch[nb] = record(b, rs, lf, qlf - qrs, sh);
                 (nb, qrs, rs, lfs) = (nb + 1, qlf, lf + 1, lfs & (lfs - 1));
@@ -367,6 +435,8 @@ fn flush(b: &[u8], batch: &[Rec], sh: &Shared, (agg, ids, (q, len), _): &mut Loc
         let a = &mut agg[g];
         (a[0], a[1], a[2], a[3]) = (a[0] + 1, a[1] + id, a[2] + cents, a[3].min(cents));
         (a[4], a[5], a[6]) = (a[4].max(cents), a[5] + nb, a[6] + tb);
+// word << 6 | bit of the bitset [page][group][64 words]: page << 20 | group << 12 | name & 0xFFF.
+// The region (lock) is a function of the word alone, so one word is always updated under one lock.
         let r = (name as usize >> 6 ^ g) & 63; // the region of the name's word
         q[r][len[r]] = (name >> 12) << 20 | (g as u32) << 12 | name & 0xFFF; // word << 6 | bit
         len[r] += 1;
@@ -405,8 +475,10 @@ fn jobs(next: &AtomicUsize, n: usize) -> impl Iterator<Item = usize> + '_ {
 /// share of the dictionary, then wait for each other: one round of thread starts, not two.
 fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) -> Option<Vec<Agg>> {
     let threads = if round > 0 { 1 } else { threads };
+// cap buckets: 3 << 14 = 49,152 (3.1 MB) in the parallel round, 4 times larger in a redo.
     let cap = 3 << (14 + 2 * round);
     (round > 0).then(|| eprintln!("warning: parallel run rejected; attempt {round} on 1 thread"));
+// 48 ranges per thread balance the tail (PERF.md mechanism 10: 8 per thread cost 51.6 against 49.4 ms).
     let k = if threads > 1 { threads * 48 } else { 1 };
     // records.csv is read, not mapped (see `read`); its records start after the header line.
     let (f, mut head) = (File::open("/data/records.csv").unwrap(), [0; 64]);
@@ -419,8 +491,11 @@ fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) ->
     // dictionary, and the bits of the first 98,304 names), so they cost no memory.
     let n = (cap * 3 / 8 * 7 / 4096 + 1) * 256 * 64;
     let hot = zeroed::<AtomicU64>(cap * 8 + n);
+    // SAFETY: the first 6 MB of `hot` (three 2 MB pages) are inside the mapping.
     unsafe { madvise(hot.as_ptr() as *mut u8, 6 << 20, 14) }; // MADV_HUGEPAGE
     let (buckets, bits) = hot.split_at(cap * 8);
+    // SAFETY: `Bucket` is 64 bytes of atomics (8 u64), cap * 8 words were split off above, the region
+    // is 2 MB aligned (so 64-byte aligned), and zero is a valid (empty) bucket.
     let buckets = unsafe { std::slice::from_raw_parts(buckets.as_ptr() as *const Bucket, cap) };
     let locks = (0..64).map(|_| Mutex::new(())).collect();
     let dict = (buckets, zeroed(1 << 23), (0.into(), 0.into()));
@@ -433,9 +508,11 @@ fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) ->
         let t = me.fetch_add(1, Relaxed); // this thread's buffer, and 2 MB page to map
         // One thread maps each 2 MB page: threads racing to fault one in would each clear and charge
         // a 2 MB page, and all but one would then free theirs.
+// Threads 0, 1, 2 take one 2 MB page each (1 << 18 words); the others get an empty range.
         populate(&hot[t.min(3) << 18..(t + 1).min(3) << 18]);
         pre();
         wait.wait();
+        // Disjoint per-thread slice of `bufs`, which only this thread reads or writes from here on.
         let buf = bufs[t * (PIECE + 192)..].as_ptr() as *mut u8;
         let mut me: Local = ([NEW; 256], (0, 0), ([[0; 64]; 64], [0; 64]), buf);
         for j in jobs(&next, k) {
@@ -459,6 +536,7 @@ fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) ->
     (proved && !overfull).then(|| total.into_inner().unwrap().to_vec())
 }
 
+/// Cents as "[-]d.dd" with at least one integer digit.
 fn money(c: i64) -> String {
     let sign = if c < 0 { "-" } else { "" };
     format!("{sign}{}.{:02}", c.abs() / 100, c.abs() % 100)
@@ -473,6 +551,7 @@ fn main() {
     // _UNMATCHED, and countries are numbered 1.. in order of first sight (codes[g]). Ids ascend, so
     // the last line holds the largest, and ids above it are unknown without a lookup.
     let rg = map("/data/regions.csv");
+// The last line is "id,CCC\n": 5 bytes from the comma to the end (the spec ends it with an LF).
     let c = rg.len() - 5; // the comma of the last line
     let p = rg[..c].iter().rposition(|&x| x == b'\n').unwrap() + 1;
     let tab: &[AtomicU8] = zeroed(numbers([word(rg, c - 8), 0, 0], [c - p, 0, 0])[0] as usize + 1);
@@ -485,6 +564,7 @@ fn main() {
             let mut p = line.unwrap_or(rg.len());
             while p < cut(j + 1) {
                 let c = find(rg, p, b',');
+                // SAFETY: BMI2 (build flags). pext packs the low 5 bits of the three letters into a 15-bit code.
                 let code = unsafe { _pext_u64(word(rg, c + 1), 0x1F1F1F) } as usize;
                 if seen[code].load(Acquire) == 0 {
                     let mut list = codes.lock().unwrap();

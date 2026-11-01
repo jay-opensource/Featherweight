@@ -1,7 +1,33 @@
-// Track D, featherweight. Every edge is 4 bytes and every node 1 byte plus 1/16 of a word.
-// Nodes are relabelled in breadth-first order, so a search touches nearby memory, and each query
-// runs as a two-ended Dijkstra whose labels live in small per-thread pages, not in arrays the
-// size of the graph. See PERF.md for the measurements behind each choice.
+//! Track D (Traverse), Featherweight: minimum memory per unit of speed. Reads `/data/graph.txt` (a
+//! directed weighted road-like graph, 1,740,512 nodes, 5M edges, 88 MB of text) and
+//! `/data/queries.txt` (2,000 source-target pairs) and writes `/out/distances.txt`: each
+//! shortest-path length, or -1. README.md has the design in prose; PERF.md every board run (step
+//! numbers below are its "steps" and "Findings specific to the scoring box").
+//!
+//! Pipeline (`main`; every stage runs on a pool of scoped threads via `par`):
+//! 1. Parse + build (`csr`, `finish`): the text is parsed once, in byte ranges, into a compact CSR
+//!    built in buckets of 8,192 nodes, so every random access stays in a small region.
+//! 2. Relabel (`bfs_order`): nodes are renumbered in breadth-first order, so neighbours in the road
+//!    network are neighbours in memory; the graph is rebuilt with the new ids by the same builder,
+//!    then the reverse graph is built from it into the first graph's already-mapped edge array.
+//! 3. Queries (`bidir`, `step`): a two-ended Dijkstra per query, farthest pairs first, with labels
+//!    in small per-thread pages (`Pages`) and a Dial bucket queue (`Dial`) per side. Rare queries
+//!    that need edges of weight W or more or 32-bit overflow fall back to `via`, then `plain`.
+//! 4. Output and exit: write the answers, give the big mappings back on all threads, `exit(0)`.
+//!
+//! Data structures: `Graph` is a CSR with a 4-byte edge slot (`target | weight << vb`, an escape
+//! value for the 0.07% of weights that do not fit) and about 1.25 bytes of offsets per node
+//! (a u32 base per block of 16 nodes plus a u8 offset). No atomics or locks guard the data: every
+//! writer owns a disjoint range, which is what the `unsafe` blocks below rely on.
+//!
+//! Box-specific decisions (scoring box: i5-13500, THP "always", memory.peak charges whole 2 MB
+//! pages, exit teardown runs on one core; PERF.md "Findings specific to the scoring box"):
+//! - THP off for the process (`prctl` in `main`): once BFS order made the searches local, 2 MB pages
+//!   gained nothing, and turning them off took the board from 76.5 to 64.3 MB (steps 4-6, 24-25).
+//! - `graph.txt` and `queries.txt` are mapped read-only, never copied: the page cache is not charged.
+//! - Lock-free builders: atomic cursors saved 5 MB but ran 0.208 s against 0.178 s (step 16).
+//! - Exit: no frees, and every thread `MADV_DONTNEED`s its share of the big arrays first, taking
+//!   the exit teardown from 8.45 to 3.62 ms (steps 22, 40).
 use std::{fs::File, os::unix::io::AsRawFd};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering::*};
 
@@ -16,8 +42,11 @@ extern "C" {
 fn map(path: &str) -> &'static [u8] {
     let f = File::open(path).expect(path);
     let len = f.metadata().unwrap().len() as usize; // an empty file still maps a page, never read
+// SAFETY: a read-only private file mapping (1 = PROT_READ, 2 = MAP_PRIVATE); the checked result is
+// the whole file, never written or unmapped, so 'static holds.
     let p = unsafe { mmap(std::ptr::null_mut(), len.max(1), 1, 2, f.as_raw_fd(), 0) };
     assert!(p as isize != -1, "mmap {path}");
+// SAFETY: len bytes of the mapping above.
     unsafe { std::slice::from_raw_parts(p, len) }
 }
 
@@ -49,16 +78,19 @@ fn num(b: &[u8], i: &mut usize) -> u64 {
 
 /// Hint the cache to fetch the line holding `x`.
 fn prefetch<T>(x: *const T) {
+    // SAFETY: a prefetch is only a hint and never faults, whatever the address.
     unsafe { std::arch::x86_64::_mm_prefetch(x as *const i8, std::arch::x86_64::_MM_HINT_T0) };
 }
 
 /// s[i] without a bounds check, for the hot lookups (their indices come from the graph).
 fn ld<T: Copy>(s: &[T], i: usize) -> T {
+// SAFETY: callers pass node ids (< n) or slot offsets that the builders produced, in bounds.
     unsafe { *s.get_unchecked(i) }
 }
 
 /// &mut s[i] without a bounds check.
 fn mt<T>(s: &mut [T], i: usize) -> &mut T {
+// SAFETY: as in `ld`.
     unsafe { s.get_unchecked_mut(i) }
 }
 
@@ -80,20 +112,27 @@ fn par<T: Sync>(threads: usize, items: &[T], f: impl Fn(&T) + Sync) {
 
 /// Shared mutable array written at disjoint indices by several threads.
 struct Slots<T>(*mut T);
+// SAFETY: the users (`csr`, `finish`, `bfs_order`) write only indices that no other thread writes
+// (see the comment at each use), and the array outlives the `par` scope that shares it.
 unsafe impl<T> Sync for Slots<T> {}
 
 /// Compact CSR. Node k's slots start at base[k >> sh] + rel[k] (see `store` for a slot).
 #[derive(Default)]
 struct Graph {
+    // Edge slots: `target | weight << vb`; the weight value `esc` means the full weight is in the next slot.
     edges: Vec<u32>,
+    // First slot of each block of 2^sh nodes; rel[k] is node k's offset inside its block.
     base: Vec<u32>,
     rel: Vec<u8>,
+    // sh: log2 of the block size (4, i.e. 16 nodes, unless an offset overflowed a u8); vb: bits of a
+    // target (ceil(log2 n)); esc: the all-ones weight, `u32::MAX >> vb`.
     sh: u32,
     vb: u32,
     esc: u32,
 }
 
 impl Graph {
+    /// First slot of node k (and, for k + 1, one past its last); defined for k <= n.
     #[inline(always)]
     fn off(&self, k: usize) -> usize {
         ld(&self.base, k >> self.sh) as usize + ld(&self.rel, k) as usize
@@ -189,6 +228,8 @@ fn csr(n: usize, t: usize, vb: u32, it: &[impl Edges], bf: Result<[Vec<u32>; 2],
     let cp = Slots(cur.as_mut_ptr());
     if est == 0 && edges.is_empty() {
         par(t, &(0..ni).collect::<Vec<_>>(), |&i| {
+            // SAFETY: item i owns the counters i * nb..(i + 1) * nb of `cur` and one thread runs each item,
+            // so the slice is not aliased. `(&cp).0` borrows the whole `Slots` so the closure stays `Sync`.
             let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
             // v = MAX: w is all of node u's slots (see `Edges`)
             it[i].each(false, |u, v, w| {
@@ -210,6 +251,7 @@ fn csr(n: usize, t: usize, vb: u32, it: &[impl Edges], bf: Result<[Vec<u32>; 2],
     let (ep, lp) = (Slots(edges.as_mut_ptr()), Slots(loc.as_mut_ptr()));
     let ok = AtomicBool::new(true);
     par(t, &(0..ni).collect::<Vec<_>>(), |&i| {
+        // SAFETY: as in step 1 (item i alone uses its own counters).
         let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
         it[i].each(true, |u, v, w| {
             let (b, l) = (u >> BS, (u & ((1 << BS) - 1)) as u16 + 1);
@@ -220,8 +262,12 @@ fn csr(n: usize, t: usize, vb: u32, it: &[impl Edges], bf: Result<[Vec<u32>; 2],
             // value in that slot and the full weight in the next (written first, so that without
             // an escape it is overwritten).
             let (p, k) = (c[b] as usize, 1 + (w >= esc) as usize);
+            // SAFETY: slots p..p + k belong to item i's segment of bucket b: with an estimate they are checked
+            // against `end` above, with exact counts they are reserved by step 1. Segments are disjoint, so
+            // no other thread writes these slots.
             unsafe { (*(&ep).0.add(p + k - 1), *(&ep).0.add(p)) = (w, v | w.min(esc) << vb) };
             c[b] += k as u32;
+            // SAFETY: the same slots of `loc`, owned by the same segment.
             unsafe { (*(&lp).0.add(p), *(&lp).0.add(p + k - 1)) = (l, l) };
         });
     });
@@ -236,6 +282,7 @@ fn csr(n: usize, t: usize, vb: u32, it: &[impl Edges], bf: Result<[Vec<u32>; 2],
 }
 
 /// Bits of a bucket's node range in `csr`.
+// 13 bits = 8,192 nodes per bucket: ~94 KB of slots, small enough to reorder in cache (213 buckets).
 const BS: u32 = 13;
 
 /// The slots of a graph grouped by bucket, 1 + the node's place in its bucket for each slot (0:
@@ -253,18 +300,23 @@ fn finish(rc: &mut [u32], (edges, loc, st, n, threads, vb): Staged) -> Graph {
     let ep = Slots(g.edges.as_mut_ptr());
     let copied = Vec::from_iter((0..nb).map(|_| AtomicBool::new(false)));
     let cp = Slots(rc.as_mut_ptr());
+// Try blocks of 2^4 = 16 nodes first; if an in-block offset does not fit a u8, lay out again with
+// half-size blocks (the slots stay where they are).
     for sh in (0..=4).rev() {
         (g.sh, g.rel, g.base) = (sh, vec![0; n + 1], vec![0; (n >> sh) + 1]);
         let (rp, bp) = (Slots(g.rel.as_mut_ptr()), Slots(g.base.as_mut_ptr()));
         let ok = AtomicBool::new(true);
         par(threads, &(0..nb).collect::<Vec<_>>(), |&b| {
             let ([s0, lo], [s1, _], k0) = (st[b], st[b + 1], b << BS);
+            // SAFETY: s0..s1 is bucket b's staged range inside `edges`. It is copied out before `copied[b]`
+            // is set, and packed writes into any earlier bucket's staged range wait for that flag (below).
             let e = unsafe { std::slice::from_raw_parts((&ep).0.add(s0), s1 - s0) }.to_vec();
             copied[b].store(true, Release);
             let (mut j, row, esc) = (0, (&cp).0.wrapping_add(b * nb), u32::MAX >> vb);
             let end = if sh == 4 && rc.len() > 0 { e.len() } else { 0 };
             while j < end {
                 let (x, k) = (ld(&e, j), 1 + (ld(&e, j) >> vb == esc) as usize);
+                // SAFETY: row b of `rc` (nb counters) is written only by bucket b's thread; the index is < nb.
                 unsafe { *row.add(((x & (1 << vb) - 1) >> BS) as usize) += k as u32 };
                 j += k;
             }
@@ -275,10 +327,13 @@ fn finish(rc: &mut [u32], (edges, loc, st, n, threads, vb): Staged) -> Graph {
             let (mut p, mut p0) = (lo as u32, 0);
             for (k, a) in (k0..).zip(&mut at) {
                 if k & ((1 << sh) - 1) == 0 {
+                    // SAFETY: bucket b owns nodes k0.. of its 8,192 (a multiple of the block size), so it alone
+                    // writes these `base` entries.
                     (p0, _) = (p, unsafe { *(&bp).0.add(k >> sh) = p }); // a block starts at p
                 }
                 (p - p0 > 255).then(|| ok.store(false, Relaxed));
                 (*a, p) = (p, p + *a);
+                // SAFETY: k <= n is in this bucket's node range of `rel`, written by this thread only.
                 unsafe { *(&rp).0.add(k) = (*a - p0) as u8 };
             }
             let mut w = b; // wait for the earlier buckets whose staged slots end after lo
@@ -287,6 +342,8 @@ fn finish(rc: &mut [u32], (edges, loc, st, n, threads, vb): Staged) -> Graph {
             }
             for (&x, &l) in e.iter().zip(&loc[s0..s1]).filter(|_| sh == 4) {
                 if let Some(a) = at.get_mut(l as usize - 1) {
+                    // SAFETY: *a is inside bucket b's packed range, which is disjoint from all other packed
+                    // ranges and, by the wait above, no longer needed by the buckets that staged slots there.
                     unsafe { *(&ep).0.add(*a as usize) = x };
                     *a += 1;
                 }
@@ -338,13 +395,16 @@ fn bfs_order(g: &Graph, n: usize, threads: usize) -> Vec<u32> {
     par(threads, &(0..lists.len()).collect::<Vec<_>>(), |&j| {
         let start = lists[..j].iter().map(|l| l.len()).sum::<usize>();
         for (i, &v) in lists[j].iter().enumerate() {
+            // SAFETY: every node was claimed by exactly one thread (the bit set), so it is in exactly one
+            // list and this is the only write to id[v].
             unsafe { *(&ip).0.add(v as usize) = (start + i) as u32 };
         }
     });
     id
 }
 
-/// Buckets per queue: the search relaxes only edges lighter than W (see `bidir`).
+/// Buckets per queue: the search relaxes only edges lighter than W (see `bidir`). 8,192 is above
+/// the largest main-body weight, and the queue is W list heads (32 KB) per side.
 const W: usize = 1 << 13;
 
 /// Monotone bucket queue (Dial): one bucket per key modulo W. Each key pushed is the popped key
@@ -411,6 +471,8 @@ struct Pages {
 }
 
 impl Pages {
+    /// Empty labels for n nodes. Page numbers are u16 (< 32,766 pages), so pb, the log2 of the page
+    /// size, grows beyond 6 (64 nodes) only if n needs more pages than that.
     fn new(n: usize) -> Self {
         let pb = 6.max(usize::BITS - (n / 32766).leading_zeros());
         let dir = [0; 2].map(|_| vec![0; (n >> pb) + 1]);
@@ -552,6 +614,8 @@ fn main() {
     // charges a whole 2 MB page for its first touched byte. Nothing here gains from 2 MB pages
     // (measured on the board), so the process opts out: PR_SET_THP_DISABLE = 41. One malloc arena
     // (M_ARENA_MAX = 1) instead of one per thread keeps the search's small vectors packed.
+// SAFETY: plain libc calls made before any thread starts (41 = PR_SET_THP_DISABLE, -8 =
+// M_ARENA_MAX); they only change allocator and page-size policy for this process.
     unsafe { (prctl(41, 1, 0, 0, 0), mallopt(-8, 1)) };
     let par0 = std::thread::available_parallelism().map_or(1, |p| p.get());
     let threads = std::env::var("FW_THREADS").map_or(par0, |v| v.parse().unwrap());
@@ -599,10 +663,13 @@ fn main() {
     // The kernel's exit unmaps every page on one core (~0.1-0.4 us per 4 KB page; 5 ms locally
     // for the text and the two graphs). Drop those pages on all threads first: MADV_DONTNEED on the
     // whole pages inside each thread's share (nothing reads them again).
+// SAFETY: u32 to u8 (the same bytes, no padding), so `align_to` gives the whole array as bytes.
     let big = unsafe { [gt, g.edges.align_to().1, r.edges.align_to().1] };
     let parts = Vec::from_iter(big.iter().flat_map(|&b| spans(b, b.len(), threads)));
     par(threads, &parts, |&(b, lo, hi)| {
         let [a, e] = [lo + 4095, hi].map(|x| b.as_ptr() as usize + x & !4095);
+// SAFETY: a..e is whole pages inside the slice (a rounded up, e down; 4 = MADV_DONTNEED), and
+// nothing reads the arrays again: the next step is `exit`.
         unsafe { madvise(a as *mut u8, e.saturating_sub(a), 4) };
     });
     std::process::exit(0); // the kernel reclaims the rest; do not free the big arrays one by one

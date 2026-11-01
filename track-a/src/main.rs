@@ -1,16 +1,36 @@
-// Track A (Ingest), featherweight.
-//
-// One parse pass turns every line into a 4-byte record (endpoint id, 5xx bit, 20-bit latency; an
-// escape word follows the rare larger latency) and files it in a memory region of its own hour.
-// Threads take the input in file order, and an hour is summarised while the parse goes on, as soon
-// as the parsed prefix of the file has moved two hours past it: count per endpoint, scatter the
-// latencies by endpoint, select p50, p95 and p99, and keep five words per endpoint where the
-// records were, giving the rest back to the kernel. So only a few hours of records are ever alive.
-// The input promises no bound on disorder: if a line turns up in an hour that was already
-// summarised, the run starts over and summarises every hour after the whole parse.
-// Last, the output file is sized, mapped, and every thread formats whole hours straight into it.
-// /out is a tmpfs, so the output is charged as memory: records, statistics and output are never
-// all alive at once. One pool of threads runs the phases, with a barrier between them.
+//! Track A (Ingest), Featherweight. Reads `/data/requests.log` (239 MB, 3.1M lines of timestamp,
+//! method, endpoint, status, latency) and writes `/out/summary.txt`: for every hour and endpoint the
+//! request count, nearest-rank p50/p95/p99 latency, 5xx count and 5xx rate in ppm.
+//! README.md describes the design in prose; PERF.md has every step with its board run ID.
+//!
+//! Pipeline (one pool of threads runs all of it; one barrier sits between parse and output):
+//! 1. Parse (`parse`): the input is cut into line-aligned chunks claimed in file order. Each line
+//!    becomes a 4-byte record `latency(20) | 5xx(1) | endpoint id(11)` filed in its hour's region
+//!    of `Pool`; a latency of ESC or more adds an escape word (PERF.md mechanisms 1, 3, 6).
+//! 2. Summarise (`summarise`), during the parse: once the parsed prefix of the file holds a line of
+//!    hour h + 2, hour h is complete. Count per endpoint, scatter latencies by endpoint, select
+//!    p50/p95/p99 (`pct`), keep five words per endpoint, give the records back (mechanism 10).
+//! 3. Output (`write_hour`): the leader sorts endpoint ids by name and maps `summary.txt`; each
+//!    hour is formatted straight into it once it and all earlier hours are summarised (mechanism 11).
+//!
+//! Data structures: `Names` is the endpoint interner shared by all threads (8,192 open-addressing
+//! slots, CRC32 hash, name copies padded to 64-byte lines); `Pool` holds the per-hour record
+//! regions and the per-hour statistics tables. Both are lock-free on the hot path; only a new name
+//! takes a lock (1,842 times in all).
+//!
+//! Box-specific decisions (scoring box: i5-13500, THP "always", `/out` is a tmpfs charged as memory;
+//! PERF.md "Findings specific to the scoring box"):
+//! - Memory: hours are summarised and freed while the parse runs, so the 12.55 MB of records are
+//!   never all alive. Board memory about 20 MB to 13.1 MB (mechanism 10, run-eaa93041cda1).
+//! - THP: every big buffer is our own `mmap` with MADV_NOHUGEPAGE (`anon`), thread stacks are 256 KB
+//!   and malloc keeps one arena, because a 2 MB page is charged whole for its first touched byte.
+//! - Page-table work: threads give back their chunk's input pages (`zap`) and each hour's output
+//!   pages as they go, and the process ends with `exit(0)` and no frees, so the one-core exit
+//!   teardown is nearly empty (mechanism 8: `exit_mmap` below 0.05% of cycles).
+//! - Prefetch two lines 1 KB ahead in `parse`: the hardware prefetcher stops at every 4 KB page and
+//!   page-cache pages are scattered (mechanism 4: separator-load stall 13.4% to 5.8%).
+//! - If a line turns up in an hour already summarised (never in generated data), the whole run
+//!   starts over with no early release, so the output is exact for any line order.
 use std::arch::x86_64::*;
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
@@ -29,15 +49,21 @@ const SLOTS: usize = 8192; // interner slots, a power of two well above 1,842 en
 // Latency fields from ESC up are escapes: they keep the latency's low 11 bits, and the next word
 // (an escape word, endpoint id 0) holds the rest. Every word then stands alone: the stats loops
 // step one word at a time, with no load-dependent stride.
+// 2048 = 2^11: a big latency's low 11 bits stay in the record, the rest goes to the escape word.
 const ESC: u32 = (1 << 20) - 2048;
 const B: usize = 1024; // words per record block: one page, so each page has one writer
+// 32 bounds how far claims run ahead of the oldest unparsed chunk (PERF.md mechanism 10): unbounded,
+// the parse prefix lagged 31-111 chunks on a loaded laptop and the parse-phase peak reached 15-17.9 MB.
 const LAG: usize = 32; // chunks that may be in work past the first one still parsed
 
 /// `len` bytes of fresh anonymous memory without huge pages (the box has THP "always", and a 2 MB
 /// page is charged whole): only the 4 KB pages that get touched are charged.
 fn anon<T>(len: usize) -> *mut T {
+    // SAFETY: a fresh anonymous mapping, so no existing memory is touched. 3 = PROT_READ|PROT_WRITE,
+    // 0x4022 = MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE (charged only where touched).
     let p = unsafe { mmap(std::ptr::null_mut(), len.max(1), 3, 0x4022, -1, 0) };
     assert!(p as isize != -1, "mmap {len}");
+    // SAFETY: p..p + len is the mapping just made. 15 = MADV_NOHUGEPAGE.
     unsafe { madvise(p, len.max(1), 15) };
     p as *mut T
 }
@@ -46,6 +72,8 @@ fn anon<T>(len: usize) -> *mut T {
 fn zap(p: *const u8, len: usize) {
     let (x, y) = ((p as usize + 4095) & !4095, (p as usize + len) & !4095);
     if y > x {
+        // SAFETY: x..y lies inside the caller's range and is whole pages. 4 = MADV_DONTNEED; callers
+        // pass only data that nothing reads again (anonymous pages would read back as zeros).
         unsafe { madvise(x as *mut u8, y - x, 4) };
     }
 }
@@ -56,6 +84,10 @@ fn map(path: &str) -> &'static [u8] {
     let f = File::open(path).expect(path);
     let len = f.metadata().unwrap().len() as usize;
     assert!(len < 1 << 32);
+// SAFETY: len + 4096 bytes of zeroed anonymous memory are reserved (PROT_READ), then the file is
+// mapped over the first len bytes with MAP_FIXED (0x12 = MAP_PRIVATE|MAP_FIXED), so the 4 KB tail
+// stays zero. The slice stays inside the mapping, is never written, and is unmapped only by the
+// leader after the parse barrier, when no thread reads it any more. 2 = MADV_SEQUENTIAL.
     unsafe {
         let p = mmap(std::ptr::null_mut(), len + 4096, 1, 0x22, -1, 0);
         assert!(p as isize != -1 && (len == 0 || mmap(p, len, 1, 0x12, f.as_raw_fd(), 0) == p));
@@ -64,8 +96,11 @@ fn map(path: &str) -> &'static [u8] {
     }
 }
 
+/// Unaligned 8-byte load at b[i], not bounds-checked: the parser may read past the end of a chunk,
+/// which is safe because the input is followed by zeros (see `map`).
 #[inline(always)]
 fn ld8(b: &[u8], i: usize) -> u64 {
+    // SAFETY: every caller keeps i + 8 inside the mapping: a line is far shorter than the 4 KB zero tail.
     unsafe { (b.as_ptr().add(i) as *const u64).read_unaligned() }
 }
 
@@ -74,6 +109,9 @@ fn ld8(b: &[u8], i: usize) -> u64 {
 #[inline(always)]
 fn seps(b: &[u8], i: usize) -> u64 {
     unsafe {
+// SAFETY: two unaligned 32-byte loads at i..i + 64, inside the mapping by the zero-tail rule of
+// `map` (the zeros count as separators, so callers never scan beyond them). AVX2 comes from the
+// target features in .cargo/config.toml. 0x21: space (0x20), LF (0x0A) and 0 all compare below it.
         let (p, v) = (b.as_ptr().add(i) as *const __m256i, _mm256_set1_epi8(0x21));
         let m = |k| _mm256_movemask_epi8(_mm256_cmpgt_epi8(v, _mm256_loadu_si256(p.add(k)))) as u32;
         m(0) as u64 | (m(1) as u64) << 32
@@ -85,6 +123,9 @@ fn seps(b: &[u8], i: usize) -> u64 {
 fn same(p: *const u8, q: *const u8, n: usize) -> bool {
     let mut i = 0;
     loop {
+// SAFETY: p points at a name copy in `Names::text` (copies are padded to whole 64-byte lines, so
+// the block read is in bounds) and q at the name in the input (zero tail). Bytes past n in the
+// last block are shifted out by the final compare, so they never decide the result.
         let ne = unsafe {
             let (p, q) = (p.add(i) as *const __m256i, q.add(i) as *const __m256i);
             let e = |k| {
@@ -104,7 +145,9 @@ fn same(p: *const u8, q: *const u8, n: usize) -> bool {
 }
 
 /// The number whose decimal digits are the low nibbles of v's bytes, most significant digit in the
-/// lowest byte (empty bytes at the bottom read as leading zeros).
+/// lowest byte (empty bytes at the bottom read as leading zeros). Each multiply joins neighbouring
+/// groups: 2561 = 10 << 8 | 1 pairs digits, 6553601 = 100 << 16 | 1 pairs the pairs, and
+/// 42949672960001 = 10000 << 32 | 1 joins the quads into the final value.
 #[inline(always)]
 fn swar(v: u64) -> u32 {
     let v = v & 0x0F0F_0F0F_0F0F_0F0F;
@@ -131,19 +174,28 @@ struct Names {
     next: Mutex<(usize, usize)>,  // ids handed out, and where the next copy goes
     text: *mut u8,
 }
+// SAFETY: `slots` and `keys` are atomics. `text` is written only under the `next` lock, into lines
+// no reader can reach until the slot that holds their offset is published with Release (readers
+// load it with Acquire), and a published copy is never modified again.
 unsafe impl Sync for Names {}
 
 impl Names {
+    /// The name of endpoint `id` (an id returned by `id`), as the bytes in the input.
     fn name(&self, id: usize) -> &[u8] {
         let k = self.keys[id].load(Acquire) as usize;
+        // SAFETY: keys[id] (Acquire) pairs with the Release store in `add`: the copy is fully written.
         unsafe { std::slice::from_raw_parts(self.text.add(k >> 8), k & 255) }
     }
 
+    /// Id (1..2047) of the endpoint name q[..n] with CRC32 `crc`, adding it if new. Linear probing
+    /// from slot `crc`; the hash and length in the slot reject nearly every other name before the compare.
     #[inline(always)]
     fn id(&self, q: *const u8, n: usize, crc: u32) -> u32 {
         let (want, mut i) = ((crc as u64) << 32 | (n as u64) << 24, crc as usize);
         loop {
             let v = self.slots[i % SLOTS].load(Acquire);
+            // SAFETY: `at` is 12 bits of 64-byte lines, inside `text`; an empty slot (0) points at line 0,
+            // which `same` reads only if the slot matched `want`, and an empty slot never does.
             let t = unsafe { self.text.add((v as usize & 4095) << 6) };
             if v & !0xFF_FFFF == want && same(t, q, n) {
                 return (v >> 12) as u32 & 2047;
@@ -155,6 +207,8 @@ impl Names {
         }
     }
 
+    /// Slow path of `id`: under the lock, probe on from slot i (another thread may have added the name
+    /// meanwhile), else copy the name into `text` and publish it. Returns its id.
     #[cold]
     fn add(&self, q: *const u8, n: usize, want: u64, mut i: usize) -> u32 {
         let mut next = self.next.lock().unwrap();
@@ -163,12 +217,15 @@ impl Names {
             if v == 0 {
                 let (id, at) = (next.0 + 1, next.1);
                 assert!(id < 2048, "more than 2047 endpoints");
+                // SAFETY: we hold the `next` lock, so no one else writes; `at` is a fresh line-aligned offset.
+                // Relies on all names fitting in `text` (2048 x 128 bytes; real names are far shorter).
                 unsafe { std::ptr::copy_nonoverlapping(q, self.text.add(at), n) };
                 self.keys[id].store((at << 8 | n) as u64, Release);
                 *next = (id, at + (n + 63) / 64 * 64);
                 self.slots[i % SLOTS].store(want | (id << 12 | at >> 6) as u64, Release);
                 return id as u32;
             }
+            // SAFETY: as in `id`.
             let t = unsafe { self.text.add((v as usize & 4095) << 6) };
             if v & !0xFF_FFFF == want && same(t, q, n) {
                 return (v >> 12) as u32 & 2047;
@@ -186,17 +243,25 @@ struct Pool {
     used: Vec<AtomicUsize>,
     stats: *mut [[u32; 5]; 2048],
 }
+// SAFETY: `base` and `stats` point into mappings that live for the whole run. Blocks are handed
+// out disjointly by an atomic counter, so each has one writer; an hour's stats table has one
+// writer (its summariser) and is read only after that hour's `bytes` entry is published.
 unsafe impl Sync for Pool {}
 
 impl Pool {
+    /// The next free block of B words in hour h's region.
     fn block(&self, h: usize) -> *mut u32 {
         let k = self.used[h].fetch_add(1, Relaxed);
         assert!((k + 1) * B < self.region); // a spare word: the scatter reads one word ahead
+        // SAFETY: (k + 1) * B < region (asserted above), so the block lies inside hour h's region.
         unsafe { self.base.add(h * self.region + k * B) }
     }
 
+    /// All words of hour h's blocks, including the zeroed (id 0) tails of partly used ones. Call it
+    /// only when no thread is still writing hour h.
     fn words(&self, h: usize) -> &[u32] {
         let n = self.used[h].load(Relaxed) * B;
+        // SAFETY: n words are exactly the blocks handed out, all inside the region (see `block`).
         unsafe { std::slice::from_raw_parts(self.base.add(h * self.region), n) }
     }
 }
@@ -210,6 +275,8 @@ fn parse(b: &[u8], mut p: usize, names: &Names, pool: &Pool, cur: &mut [*mut u32
     while p < b.len() {
         let w = ld8(b, p + 5);
         if w != last {
+// w is "MM-DDTHH" (at offset 5 of the line). Below, h = 24 * DD + HH + 744 * [month is 11] - 738:
+// 738 = 24 * 30 + 18 puts hour 0 at 10-30T18, and 744 = 31 days of hours carries into November.
             // The digit pairs combine in one multiply (byte k + 10 * byte k-1).
             let x = (w >> 24 & 0xF_0F00_0F0F).wrapping_mul(2561);
             (cur[h], last) = (c, w);
@@ -221,8 +288,12 @@ fn parse(b: &[u8], mut p: usize, names: &Names, pool: &Pool, cur: &mut [*mut u32
         // for the bytes 1 KB ahead now: two cache lines per line, as lines average 77 bytes. A
         // prefetch never faults, even past the end of the mapping.
         let ahead = b.as_ptr().wrapping_add(p + 1024) as *const i8;
+        // SAFETY: a prefetch is only a hint and never faults.
         unsafe { _mm_prefetch::<_MM_HINT_T0>(ahead) };
+        // SAFETY: as above.
         unsafe { _mm_prefetch::<_MM_HINT_T0>(ahead.wrapping_add(64)) };
+// A line is "2026-10-30T18:00:00.100676Z GET /path 200 39234": the timestamp is 27 bytes, so p + 31
+// is where the space after the shortest (3-letter) method can sit; later bytes are the endpoint.
         // Separators from the method's third byte on: the method ends at the first, the endpoint
         // at the second.
         let (mut q, mut m) = (p + 31, seps(b, p + 31));
@@ -234,6 +305,8 @@ fn parse(b: &[u8], mut p: usize, names: &Names, pool: &Pool, cur: &mut [*mut u32
         }
         let e = q + m.trailing_zeros() as usize;
         let n = e - s;
+// e is the space after the endpoint: status at e + 1..e + 4, latency from e + 5. XOR 0x30 turns
+// digits into 0..9; adding 0x76 sets bit 7 of a byte exactly when it is 10 or more (not a digit).
         // The latency's digits run to the first byte that is not a digit (the LF).
         let d = ld8(b, e + 5) ^ 0x3030_3030_3030_3030;
         let k = d.wrapping_add(0x7676_7676_7676_7676) & 0x8080_8080_8080_8080;
@@ -244,12 +317,16 @@ fn parse(b: &[u8], mut p: usize, names: &Names, pool: &Pool, cur: &mut [*mut u32
         let a = ld8(b, s) & if n >= 8 { !0 } else { (1 << (8 * n)) - 1 };
         let y = if n >= 16 { ld8(b, s + 8) } else { 0 };
         let z = if n >= 8 { ld8(b, e - 8) } else { 0 };
+// SAFETY: pure arithmetic; SSE4.2 comes from the target features in .cargo/config.toml.
         let crc = unsafe { _mm_crc32_u64(_mm_crc32_u64(_mm_crc32_u64(n as u64, a), y), z) };
         let id = names.id(b.as_ptr().wrapping_add(s), n, crc as u32);
         let err = (ld8(b, e + 1) as u8 == b'5') as u32;
         if c as usize % (4 * B) >= 4 * B - 8 {
             c = pool.block(h);
         }
+// SAFETY: c points into a B-word block with at least two free words (a new block is taken above
+// when fewer than two are left), so both stores and the advance stay inside it; the block has one
+// writer. The second store is the escape word, overwritten by the next record unless `big`.
         unsafe {
             let big = lat >= ESC;
             *c = id | err << 11 | (lat | if big { ESC } else { 0 }) << 12; // << 12 drops bit 20 up
@@ -261,10 +338,12 @@ fn parse(b: &[u8], mut p: usize, names: &Names, pool: &Pool, cur: &mut [*mut u32
     span
 }
 
+/// 5xx rate in parts per million, rounded down. n > 0.
 fn ppm(e: u32, n: u32) -> u32 {
     (e as u64 * 1_000_000 / n as u64) as u32
 }
 
+/// Number of decimal digits of v (1 for 0).
 fn digits(v: u32) -> usize {
     v.checked_ilog10().map_or(1, |l| l as usize + 1)
 }
@@ -280,7 +359,7 @@ const PAIRS: [u16; 100] = {
 };
 
 /// Write " v" at o + i, two digits at a time from the right, and return where it ends.
-/// SAFETY: the caller sized o's range for exactly these lines.
+/// SAFETY: the caller sized o's range for exactly these lines (`summarise` counts the same `digits`).
 #[inline(always)]
 unsafe fn put(o: *mut u8, i: usize, mut v: u32) -> usize {
     let (end, mut j) = (i + 1 + digits(v), i + 1 + digits(v));
@@ -321,6 +400,8 @@ fn ranks<const K: usize>(v: &[u32], r: [usize; 3]) -> [u32; 3] {
     for (x, &a) in x.iter_mut().zip(v) {
         *x = (a ^ 1 << 31) as i32;
     }
+// SAFETY: x holds 32 i32 and the K vectors read from it cover at most 8 * K <= 32 lanes (K is 1,
+// 2 or 4 by the callers). AVX2 comes from the target features in .cargo/config.toml.
     unsafe {
         let (z, y) = (_mm256_setzero_si256(), x.as_ptr() as *const __m256i);
         let y: [__m256i; K] = std::array::from_fn(|q| _mm256_loadu_si256(y.add(q)));
@@ -346,9 +427,13 @@ fn ranks<const K: usize>(v: &[u32], r: [usize; 3]) -> [u32; 3] {
 /// by endpoint, select p50, p95 and p99 per group, and give the records back to the kernel. Returns
 /// the size of the hour's output lines.
 fn summarise(pool: &Pool, names: &Names, h: usize, lat: &mut [u32]) -> usize {
+    // SAFETY: h < HOURS, and each hour is summarised by exactly one thread, which is the only writer
+    // of its stats table.
     let (words, st) = (pool.words(h), unsafe { &mut *pool.stats.add(h) });
     // Per endpoint: count | errors << 32, and the next slot. They sit in front of `lat`, not on the
-    // thread's stack, so they are unmapped with it before the output is charged.
+    // thread's stack, so they are unmapped with it before the output is charged. 6144 words: cnt is
+    // 2048 u64 (4096 words) and at is 2048 u32. SAFETY (the two casts below): cnt covers words
+    // 0..4096 and at 4096..6144, so they do not overlap; the scratch is page-aligned.
     let (tmp, lat) = lat.split_at_mut(6144);
     let cnt = unsafe { &mut *(tmp.as_mut_ptr() as *mut [u64; 2048]) };
     let at = unsafe { &mut *(tmp.as_mut_ptr().add(4096) as *mut [u32; 2048]) };
@@ -363,10 +448,12 @@ fn summarise(pool: &Pool, names: &Names, h: usize, lat: &mut [u32]) -> usize {
     // Words of id 0 (escape words, the unused tails of blocks) land after the groups.
     at[0] = total;
     for (i, &w) in words.iter().enumerate() {
+        // SAFETY: `Pool::block` keeps a spare word after the last block, so word i + 1 exists (it may
+        // be a tail zero or the escape word of the next record).
         let (v, x) = (w >> 12, unsafe { *words.as_ptr().add(i + 1) });
         let c = &mut at[(w & 2047) as usize];
         let v = if v >= ESC { x | v & 2047 } else { v };
-        // c < words.len() <= lat.len(): every word has a slot.
+        // SAFETY: c < words.len() <= lat.len(): each word has its own slot after the prefix sums above.
         unsafe { *lat.get_unchecked_mut(*c as usize) = v };
         *c += 1;
     }
@@ -382,6 +469,7 @@ fn summarise(pool: &Pool, names: &Names, h: usize, lat: &mut [u32]) -> usize {
     zap(words.as_ptr() as *const u8, words.len() * 4 + 4095); // regions are page-aligned
     if pool.used[HOURS].fetch_add(1, AcqRel) == HOURS - 1 {
         // The last summary: the records' page tables go too, before the output is charged.
+        // SAFETY: the counter says all HOURS summaries are done, so nothing reads the records any more.
         unsafe { munmap(pool.base as *const u8, HOURS * pool.region * 4) };
     }
     size
@@ -410,17 +498,20 @@ unsafe fn write_hour(pool: &Pool, names: &Names, order: &[usize], h: usize, p: *
 fn main() {
     // Small thread stacks and one malloc arena: with THP "always" either could cost a 2 MB page.
     std::env::set_var("RUST_MIN_STACK", "262144");
+// SAFETY: runs before any thread starts. -8 = M_ARENA_MAX, set to 1 (one malloc arena).
     unsafe { mallopt(-8, 1) };
     let threads = std::thread::available_parallelism().map_or(1, |p| p.get());
     let threads = std::env::var("FW_THREADS").map_or(threads, |v| v.parse().unwrap());
     let b = map("/data/requests.log");
     let slots = Box::new([const { AtomicU64::new(0) }; SLOTS]);
     let keys = Box::new([const { AtomicU64::new(0) }; 2048]);
+    // `text` holds the name copies: 128 bytes per possible id is ample for the generated names.
     let names = Names { slots, keys, next: Mutex::new((0, 0)), text: anon(2048 * 128) };
     // Any hour may hold every line (two words each at worst) plus a partly filled block per thread.
     let region = (b.len() / 19 + (threads + 1) * B + 1023) & !1023;
     // Line-aligned chunks of 2 MB: threads working on neighbouring chunks then fault in different
     // page-table pages of the input. The last 24 MB go in 512 KB chunks, so threads finish together.
+// 1 << 19 is the 512 KB unit: steps of 4 units (2 MB) until 24 MB remain, then single units.
     let (mut cut, mut p) = (vec![0], 0);
     while b.len() - p > 1 << 19 {
         let step = if b.len() - p > 24 << 20 { 4 } else { 1 };
@@ -437,6 +528,7 @@ fn main() {
     // summarised, the run starts over with wait = HOURS: no hour is complete before the whole parse.
     for wait in [2, HOURS] {
         let used = (0..=HOURS).map(|_| AtomicUsize::new(0)).collect(); // and hours summarised
+        // 40960 = 2048 ids x 5 u32 words x 4 bytes: one stats table per hour.
         let pool = Pool { base: anon(HOURS * region * 4), region, used, stats: anon(HOURS * 40960) };
         // Hours below `fin` are complete; `pre` chunks from the start are parsed. `prog`: for each
         // chunk its first and last hour once parsed; `pre`; one past the last hour in those; whether
@@ -451,6 +543,7 @@ fn main() {
             // Twice an hour's worst case (a line that comes too late may race a summary), after
             // `summarise`'s two tables.
             let n = region * 2 + 6144;
+            // SAFETY: a private zeroed mapping of n u32, used only by this thread.
             let lat = unsafe { std::slice::from_raw_parts_mut(anon(n * 4), n) };
             loop {
                 // A complete hour first, to give its records back; else the next chunk, but not far
@@ -489,12 +582,15 @@ fn main() {
                 // cut to size at the end.
                 let mut ids: Vec<usize> = (1..=names.next.lock().unwrap().0).collect();
                 ids.sort_unstable_by_key(|&id| names.name(id));
+                // SAFETY: every chunk is parsed (we are past the barrier), and nothing touches the input again.
                 unsafe { munmap(b.as_ptr(), b.len() + 4096) };
                 let len: usize = bytes.iter().map(|x| x.load(Relaxed).min(2047 * 213)).sum();
                 let mut f = OpenOptions::new();
                 f.read(true).write(true).create(true).truncate(true);
                 let f = f.open("/out/summary.txt").expect("create summary.txt");
                 f.set_len(len as u64).expect("size summary.txt");
+                // SAFETY: maps the file just sized to len bytes shared and writable (3, 1 = PROT_READ|PROT_WRITE,
+                // MAP_SHARED); it lives until exit, and hours write disjoint ranges of it.
                 let p = unsafe { mmap(std::ptr::null_mut(), len.max(1), 3, 1, f.as_raw_fd(), 0) };
                 assert!(p as isize != -1, "map summary.txt");
                 assert!(out.set((p as usize, ids, f)).is_ok());
@@ -505,6 +601,7 @@ fn main() {
             while let h @ 0..HOURS = next[1].fetch_add(1, Relaxed) {
                 bytes[h].store(summarise(&pool, &names, h, lat), Release);
             }
+            // SAFETY: this thread's scratch (from `anon` above) is not used again.
             unsafe { munmap(lat.as_ptr() as *const u8, n * 4) };
             let (o, order, _) = out.wait();
             // Each hour, in order: once it and every hour before it are summarised, format its
@@ -513,6 +610,8 @@ fn main() {
                 while bytes[..=h].iter().any(|x| x.load(Acquire) == usize::MAX) {}
                 let off: usize = bytes[..h].iter().map(|x| x.load(Relaxed)).sum();
                 let (p, len) = ((o + off) as *mut u8, bytes[h].load(Relaxed));
+                // SAFETY: bytes[h] is hour h's exact output size and the range at offset sum(bytes[..h]) lies
+                // inside the mapping (sized from the bounded estimates, cut to size at the end).
                 unsafe { write_hour(&pool, &names, order, h, p) };
                 zap(pool.stats.wrapping_add(h) as *const u8, 40960);
                 // Drop this hour's whole output pages from our page tables now, in parallel; the
