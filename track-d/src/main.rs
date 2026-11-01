@@ -8,42 +8,8 @@ use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicUsize, Ordering::
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    fn mallopt(param: i32, value: i32) -> i32;
+    fn prctl(option: i32, a2: u64, a3: u64, a4: u64, a5: u64) -> i32;
 }
-
-/// The scoring box backs anonymous memory with 2 MB pages (THP "always"), and memory.peak charges
-/// a whole 2 MB page for its first touched byte. So every allocation of 256 KB or more is marked
-/// MADV_NOHUGEPAGE.
-struct Alloc;
-
-unsafe impl std::alloc::GlobalAlloc for Alloc {
-    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
-        advise(std::alloc::System.alloc(l), l.size(), 15)
-    }
-    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
-        advise(std::alloc::System.alloc_zeroed(l), l.size(), 15)
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
-        std::alloc::System.dealloc(p, l)
-    }
-    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
-        advise(std::alloc::System.realloc(p, l, n), n, 15)
-    }
-}
-
-#[global_allocator]
-static ALLOC: Alloc = Alloc;
-
-/// madvise the whole pages inside [p, p + len) when len >= 256 KB (14 = HUGEPAGE, 15 = NOHUGEPAGE).
-fn advise(p: *mut u8, len: usize, advice: i32) -> *mut u8 {
-    let (lo, hi) = ((p as usize + 4095) & !4095, (p as usize + len) & !4095);
-    if len >= 1 << 18 && hi > lo {
-        unsafe { madvise(lo as *mut u8, hi - lo, advice) };
-    }
-    p
-}
-
 
 /// Read-only private mapping of a whole file; the page cache is not charged to us, a heap copy would be.
 fn map(path: &str) -> &'static [u8] {
@@ -637,10 +603,10 @@ fn plain(g: &Graph, s: usize, t: usize) -> i64 {
 }
 
 fn main() {
-    // The scoring box backs anonymous memory with 2 MB pages. That helps the graph, but would round
-    // every thread's stack and malloc arena up to 2 MB: so small stacks, and one arena (M_ARENA_MAX).
-    std::env::set_var("RUST_MIN_STACK", "262144");
-    unsafe { mallopt(-8, 1) };
+    // The scoring box backs anonymous memory with 2 MB pages (THP "always") and memory.peak
+    // charges a whole 2 MB page for its first touched byte. Nothing here gains from 2 MB pages
+    // (measured on the board), so the process opts out: PR_SET_THP_DISABLE = 41.
+    unsafe { prctl(41, 1, 0, 0, 0) };
     let t0 = std::time::Instant::now();
     let threads = std::env::var("FW_THREADS").ok().and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |p| p.get()));
