@@ -4,7 +4,7 @@
 // size of the graph. See PERF.md for the measurements behind each choice.
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -290,158 +290,98 @@ fn csr<T: Sync>(n: usize, threads: usize, vb: u32, esc: u32, items: &[T], each: 
     Graph { edges, base, rel, sh, vb, esc }
 }
 
-/// Node ids are handed out in chunks of this many.
-const CHUNK: usize = 1024;
-
-/// Breadth-first relabelling that writes the relabelled graph as it goes, in parallel (no second
-/// pass over the old graph). Each thread grows its own region from a seed in its slice of the old
-/// ids and re-seeds from that slice when the region is enclosed. A thread takes provisional ids in
-/// chunks from a shared counter, and the CAS that claims a node stores its id, so every target's id
-/// is known when its edge is written: each thread expands its nodes in claim order and appends
-/// their out-edges to its own stream. Then the chunks are placed thread by thread (so new ids follow
-/// thread 0's visit order, then thread 1's, and so on), copied into one array and their targets
-/// renumbered through a small chunk table. A thread's last chunk may end in unused ids: nodes with
-/// no edges. Returns (graph, old id -> new id), or gives `g` back if some block of 2^sh nodes needs
-/// in-block offsets above 255.
-fn bfs_relabel(g: Graph, threads: usize, sh: u32) -> Result<(Graph, impl Fn(usize) -> usize), Graph> {
+/// Breadth-first relabelling, in parallel: each thread grows its own region from a seed in its
+/// slice of the id range (claiming nodes with a CAS) and re-seeds from that slice when its region
+/// is enclosed. New ids follow thread 0's visit order, then thread 1's, and so on.
+fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
     const FREE: u32 = u32::MAX;
     let n = g.rel.len() - 1;
-    let cap = n + threads * CHUNK; // ids handed out, at most
     let id: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(FREE)).collect();
-    let next = AtomicUsize::new(0);
-    let (mut base, mut rel) = (vec![0u32; (cap >> sh) + 1], vec![0u8; cap + 1]);
-    let (bp, rp) = (Slots(base.as_mut_ptr()), Slots(rel.as_mut_ptr()));
-    let outs: Vec<(bool, Vec<u32>, Vec<(usize, usize)>)> = std::thread::scope(|s| {
+    let claim = |v: usize| id[v].load(Relaxed) == FREE && id[v].compare_exchange(FREE, 0, Relaxed, Relaxed).is_ok();
+    let lists: Vec<Vec<u32>> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..threads)
             .map(|t| {
-                let (g, id, next, bp, rp) = (&g, &id, &next, &bp, &rp);
+                let claim = &claim;
                 s.spawn(move || {
-                    // q: (old id, new id) of claimed nodes; out: this thread's slots; starts:
-                    // (chunk, its first slot in out); [nid, end): the ids left in the current chunk.
-                    let (mut q, mut out, mut starts) = (Vec::<(u32, u32)>::new(), Vec::<u32>::with_capacity(g.edges.len()), Vec::new());
-                    let (mut scan, stop, mut head, mut nid, mut end, mut blk, mut good) = (t * n / threads, (t + 1) * n / threads, 0, 0, 0, 0, true);
-                    // The new id of old node v, claiming and queueing v if it is free.
-                    let claim = |v: usize, q: &mut Vec<(u32, u32)>, nid: &mut usize, end: &mut usize| {
-                        let x = id[v].load(Relaxed);
-                        if x != FREE {
-                            return x;
-                        }
-                        if *nid == *end {
-                            *nid = next.fetch_add(CHUNK, Relaxed);
-                            *end = *nid + CHUNK;
-                        }
-                        match id[v].compare_exchange(FREE, *nid as u32, Relaxed, Relaxed) {
-                            Ok(_) => {
-                                q.push((v as u32, *nid as u32));
-                                *nid += 1;
-                                *nid as u32 - 1
-                            }
-                            Err(x) => x,
-                        }
-                    };
-                    // Node k, the next id in this thread's order, starts at slot `at` of out.
-                    let place = |k: usize, at: usize, starts: &mut Vec<(usize, usize)>, blk: &mut usize| unsafe {
-                        if k % CHUNK == 0 {
-                            starts.push((k / CHUNK, at));
-                        }
-                        if k & ((1 << sh) - 1) == 0 {
-                            *blk = at;
-                            *bp.0.add(k >> sh) = (at - starts.last().unwrap().1) as u32;
-                        }
-                        *rp.0.add(k) = (at - *blk) as u8;
-                        at - *blk < 256
-                    };
+                    let mut list: Vec<u32> = Vec::with_capacity(n); // only touched pages are charged
+                    let (mut scan, end, mut head) = (t * n / threads, (t + 1) * n / threads, 0);
                     loop {
-                        if head == q.len() {
-                            (head, _) = (0, q.clear());
-                            while scan < stop && id[scan].load(Relaxed) != FREE {
+                        if head == list.len() {
+                            while scan < end && !claim(scan) {
                                 scan += 1;
                             }
-                            if scan == stop {
+                            if scan == end {
                                 break;
                             }
-                            claim(scan, &mut q, &mut nid, &mut end);
-                            continue;
-                        }
-                        if head > 4096 && head * 2 > q.len() {
-                            q.drain(..head);
-                            head = 0;
+                            list.push(scan as u32);
                         }
                         // Software pipeline over the queue: offsets 16 nodes ahead, edge lists 8
                         // ahead, so the misses of upcoming nodes overlap with this one's work.
-                        if let Some(&(w, _)) = q.get(head + 16) {
+                        if let Some(&w) = list.get(head + 16) {
                             prefetch(&g.rel[w as usize]);
                             prefetch(&g.base[w as usize >> g.sh]);
                         }
-                        if let Some(x) = q.get(head + 8).and_then(|&(w, _)| g.edges.get(g.off(w as usize))) {
+                        if let Some(x) = list.get(head + 8).and_then(|&w| g.edges.get(g.off(w as usize))) {
                             prefetch(x);
                         }
-                        let (u, k) = q[head];
                         head += 1;
-                        good &= place(k as usize, out.len(), &mut starts, &mut blk);
-                        g.adj(u as usize, |v, w| {
-                            out.push(claim(v as usize, &mut q, &mut nid, &mut end) | w.min(g.esc) << g.vb);
-                            if w >= g.esc {
-                                out.push(w);
+                        g.adj(list[head - 1] as usize, |v, _| {
+                            if claim(v as usize) {
+                                list.push(v);
                             }
                         });
                     }
-                    for k in nid..end {
-                        good &= place(k, out.len(), &mut starts, &mut blk);
-                    }
-                    (good, out, starts)
+                    list
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    if outs.iter().any(|o| !o.0) {
-        return Err(g);
+    let mut start = vec![0u32];
+    for l in &lists {
+        start.push(start.last().unwrap() + l.len() as u32);
     }
-    let (vb, esc, nn) = (g.vb, g.esc, next.into_inner());
-    drop(g);
-    // Chunks in their final order (thread 0's in the order it took them, then thread 1's, ...) as
-    // (chunk, thread, first slot, end) in that thread's stream; new[c]: chunk c's final place.
-    let (mut order, mut new) = (Vec::with_capacity(nn / CHUNK), vec![0; nn / CHUNK]);
-    for (t, (_, out, st)) in outs.iter().enumerate() {
-        for (i, &(c, a)) in st.iter().enumerate() {
-            new[c] = order.len();
-            order.push((c, t, a, st.get(i + 1).map_or(out.len(), |x| x.1)));
-        }
-    }
-    let mut pos = vec![0usize; order.len() + 1];
-    for (i, o) in order.iter().enumerate() {
-        pos[i + 1] = pos[i] + o.3 - o.2;
-    }
-    let (mut edges, mut base2, mut rel2) = (vec![0u32; pos[order.len()]], vec![0u32; (nn >> sh) + 1], vec![0u8; nn + 1]);
-    huge(&mut edges);
-    huge(&mut rel2);
-    let (ep, bp2, rp2) = (Slots(edges.as_mut_ptr()), Slots(base2.as_mut_ptr()), Slots(rel2.as_mut_ptr()));
-    let renum = |p: usize| new[p / CHUNK] * CHUNK + p % CHUNK;
-    let is: Vec<usize> = (0..order.len()).collect();
-    par(threads, &is, |&i| unsafe {
-        let (c, t, a, e) = order[i];
-        let (src, dst) = (&outs[t].1[a..e], std::slice::from_raw_parts_mut((&ep).0.add(pos[i]), e - a));
-        let mut j = 0;
-        while j < src.len() {
-            dst[j] = renum(src[j] as usize & ((1 << vb) - 1)) as u32 | src[j] >> vb << vb;
-            if src[j] >> vb == esc {
-                dst[j + 1] = src[j + 1];
-                j += 1;
-            }
-            j += 1;
-        }
-        std::ptr::copy_nonoverlapping(rel.as_ptr().add(c * CHUNK), (&rp2).0.add(i * CHUNK), CHUNK);
-        for b in 0..CHUNK >> sh {
-            *(&bp2).0.add((i * CHUNK >> sh) + b) = base[(c * CHUNK >> sh) + b] + pos[i] as u32;
+    let jobs: Vec<usize> = (0..lists.len()).collect();
+    par(threads, &jobs, |&j| {
+        for (i, &v) in lists[j].iter().enumerate() {
+            id[v as usize].store(start[j] + i as u32, Relaxed);
         }
     });
-    base2[nn >> sh] = pos[order.len()] as u32;
-    let newid = move |v: usize| {
-        let p = id[v].load(Relaxed) as usize;
-        new[p / CHUNK] * CHUNK + p % CHUNK
-    };
-    Ok((Graph { edges, base: base2, rel: rel2, sh, vb, esc }, newid))
+    id.into_iter().map(|a| a.into_inner()).collect()
+}
+
+/// Copy `g` into the order given by `newid` (old id -> new id), each node's slots by one thread,
+/// with every target rewritten to its new id.
+fn relabel(g: &Graph, newid: &[u32], threads: usize) -> Graph {
+    let n = newid.len();
+    let ranges = spans(n, threads * 4);
+    let deg: Vec<AtomicU16> = (0..n).map(|_| AtomicU16::new(0)).collect();
+    par(threads, &ranges, |&(lo, hi)| {
+        for u in lo..hi {
+            deg[newid[u] as usize].store((g.off(u + 1) - g.off(u)) as u16, Relaxed);
+        }
+    });
+    let (base, rel, sh) = layout(n, threads, |k| deg[k].load(Relaxed) as u32);
+    drop(deg);
+    let mut edges = vec![0u32; *base.last().unwrap() as usize];
+    huge(&mut edges);
+    let out = Slots(edges.as_mut_ptr());
+    par(threads, &ranges, |&(lo, hi)| {
+        let out = &out;
+        for u in lo..hi {
+            if u + 8 < hi {
+                // Prefetch where node u+8 goes and the new ids of its targets.
+                let w = newid[u + 8] as usize;
+                prefetch(&rel[w]);
+                prefetch(&base[w >> sh]);
+                g.adj(u + 8, |v, _| prefetch(&newid[v as usize]));
+            }
+            let k = newid[u] as usize;
+            let mut p = base[k >> sh] as usize + rel[k] as usize;
+            g.adj(u, |v, w| p += store(out, p, newid[v as usize], w, g.vb, g.esc));
+        }
+    });
+    Graph { edges, base, rel, sh, vb: g.vb, esc: g.esc }
 }
 
 /// A queued node: its label's index in the pages, then its first and end edge slot.
@@ -687,27 +627,20 @@ fn main() {
     let n = num(gt, &mut i) as usize;
     num(gt, &mut i); // m: the edge lines are simply read to the end
     let body = &gt[i..];
-    let vb = usize::BITS - (n + threads * CHUNK - 1).leading_zeros(); // new ids go up to that
+    let vb = (usize::BITS - (n.max(2) - 1).leading_zeros()).max(1);
     let esc = (1u32 << (32 - vb)) - 1;
     let g = {
-        let mut g0 = csr(n, threads, vb, esc, &chunks(body, threads * 4), |&(lo, hi), emit| {
+        let g0 = csr(n, threads, vb, esc, &chunks(body, threads * 4), |&(lo, hi), emit| {
             let mut i = lo;
             while i < hi {
                 let (u, v) = (num(body, &mut i) as usize, num(body, &mut i) as u32);
                 emit(u, v, num(body, &mut i) as u32);
             }
         });
-        let mut sh = 4;
-        let (g, newid) = loop {
-            match bfs_relabel(g0, threads, sh) {
-                Ok(x) => break x,
-                Err(back) => (g0, sh) = (back, sh - 1),
-            }
-        };
-        qs.iter_mut().for_each(|q| *q = (newid(q.0), newid(q.1)));
-        g
+        let newid = bfs_order(&g0, threads);
+        qs.iter_mut().for_each(|q| *q = (newid[q.0] as usize, newid[q.1] as usize));
+        relabel(&g0, &newid, threads)
     };
-    let n = g.rel.len() - 1;
     let r = csr(n, threads, vb, esc, &spans(n, threads * 4), |&(lo, hi), emit| {
         for u in lo..hi {
             g.adj(u, |v, w| emit(v as usize, u as u32, w));
