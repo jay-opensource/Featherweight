@@ -407,62 +407,135 @@ fn relabel(g: &Graph, newid: &[u32], threads: usize) -> Graph {
     Graph { edges, base, rel, sh, vb: g.vb, esc: g.esc }
 }
 
-/// Monotone priority queue for Dijkstra on 31-bit distances: bucket i holds entries whose key's
-/// highest bit differing from the last popped key is bit i-1. Pushing is O(1); a pop only
-/// re-sorts the smallest non-empty bucket. An entry is key << 32 | node, 8 bytes.
-struct Radix {
-    b: Vec<Vec<u64>>,
-    occ: u64, // bit i-1 set: bucket i (1..=32) is non-empty
-    last: u32,
+/// Buckets per queue: keys within W - 1 of the smallest one go straight to their bucket.
+const W: usize = 1 << 12;
+const NIL: u32 = u32::MAX;
+
+/// Monotone bucket queue (Dial): one bucket per key modulo W. Every edge relaxed from the node of
+/// key cur lands below cur + W unless its weight is W or more, so a bucket's position gives its
+/// key. Those heavy entries (none on seed 1) wait in a binary heap, checked whenever cur moves.
+/// A bucket is a list through a pool of (node, next) slots that reuses popped slots; a bitmap of
+/// non-empty buckets and a summary word find the next key in two steps.
+struct Dial {
+    head: Vec<u32>,
+    bits: [u64; W / 64],
+    sum: u64, // bit j: bits[j] != 0
+    pool: Vec<[u32; 2]>,
+    free: u32,
+    cur: u32,
     len: usize,
+    over: std::collections::BinaryHeap<std::cmp::Reverse<u64>>, // key << 32 | node
+    omin: u32,
 }
 
-impl Radix {
+impl Dial {
     fn new() -> Self {
-        Radix { b: (0..33).map(|_| Vec::new()).collect(), occ: 0, last: 0, len: 0 }
+        Dial { head: vec![NIL; W], bits: [0; W / 64], sum: 0, pool: Vec::new(), free: NIL, cur: 0, len: 0,
+               over: Default::default(), omin: u32::MAX }
     }
 
+    /// Queue node x with key d >= cur.
     #[inline(always)]
     fn put(&mut self, d: u32, x: u32) {
-        let i = (32 - (d ^ self.last).leading_zeros()) as usize;
-        unsafe { self.b.get_unchecked_mut(i) }.push((d as u64) << 32 | x as u64);
         self.len += 1;
-        if i > 0 {
-            self.occ |= 1 << (i - 1);
+        if (d - self.cur) as usize >= W {
+            self.over.push(std::cmp::Reverse((d as u64) << 32 | x as u64));
+            self.omin = self.omin.min(d);
+        } else {
+            self.link(d as usize % W, x);
         }
     }
 
-    /// Smallest key, after moving it into bucket 0.
+    #[inline(always)]
+    fn link(&mut self, b: usize, x: u32) {
+        let k = match self.free {
+            NIL => {
+                self.pool.push([0, 0]);
+                self.pool.len() - 1
+            }
+            k => {
+                self.free = unsafe { self.pool.get_unchecked(k as usize)[1] };
+                k as usize
+            }
+        };
+        unsafe {
+            let h = self.head.get_unchecked_mut(b);
+            *self.pool.get_unchecked_mut(k) = [x, *h];
+            *h = k as u32;
+            *self.bits.get_unchecked_mut(b / 64) |= 1 << b % 64;
+        }
+        self.sum |= 1 << b / 64;
+    }
+
+    /// Move cur to the smallest key and return it; None if the queue is empty.
     #[inline(always)]
     fn min(&mut self) -> Option<u32> {
-        if self.b[0].is_empty() {
-            if self.occ == 0 {
-                return None;
-            }
-            let i = self.occ.trailing_zeros() as usize + 1;
-            self.occ &= !(1 << (i - 1));
-            let mut v = std::mem::take(&mut self.b[i]);
-            self.last = (v.iter().min().unwrap() >> 32) as u32;
-            for &e in &v {
-                self.put((e >> 32) as u32, e as u32); // every entry lands in a lower bucket
-            }
-            self.len -= v.len();
-            v.clear();
-            self.b[i] = v;
+        let p = self.cur as usize % W;
+        if unsafe { *self.head.get_unchecked(p) } != NIL {
+            return Some(self.cur);
         }
-        Some(self.last)
+        let w = p / 64;
+        let m = unsafe { *self.bits.get_unchecked(w) } & !0 << p % 64;
+        let next = if m != 0 {
+            Some(w * 64 + m.trailing_zeros() as usize)
+        } else {
+            let hi = self.sum & !1 << w; // words after w, else wrap around
+            let j = if hi != 0 { hi.trailing_zeros() } else { self.sum.trailing_zeros() } as usize;
+            (self.sum != 0).then(|| j * 64 + unsafe { *self.bits.get_unchecked(j) }.trailing_zeros() as usize)
+        };
+        let key = next.map_or(u32::MAX, |b| self.cur + ((b + W - p) % W) as u32);
+        if self.omin < key {
+            self.cur = self.omin;
+            while let Some(&std::cmp::Reverse(e)) = self.over.peek() {
+                if ((e >> 32) as u32 - self.cur) as usize >= W {
+                    break;
+                }
+                self.over.pop();
+                self.link((e >> 32) as usize % W, e as u32);
+            }
+            self.omin = self.over.peek().map_or(u32::MAX, |e| (e.0 >> 32) as u32);
+        } else if key == u32::MAX {
+            return None;
+        } else {
+            self.cur = key;
+        }
+        Some(self.cur)
     }
 
+    /// Take a node of key cur; min() must have returned Some since the last pop.
     #[inline(always)]
-    fn pop(&mut self) -> Option<(u32, u32)> {
-        self.min()?;
-        self.len -= 1;
-        self.b[0].pop().map(|e| ((e >> 32) as u32, e as u32))
+    fn pop(&mut self) -> u32 {
+        let b = self.cur as usize % W;
+        unsafe {
+            let k = *self.head.get_unchecked(b) as usize;
+            let [x, next] = *self.pool.get_unchecked(k);
+            *self.head.get_unchecked_mut(b) = next;
+            self.pool.get_unchecked_mut(k)[1] = self.free;
+            self.free = k as u32;
+            if next == NIL {
+                let m = self.bits.get_unchecked_mut(b / 64);
+                *m &= !(1 << b % 64);
+                if *m == 0 {
+                    self.sum &= !(1 << b / 64);
+                }
+            }
+            self.len -= 1;
+            x
+        }
     }
 
     fn clear(&mut self) {
-        self.b.iter_mut().for_each(|b| b.clear());
-        (self.occ, self.last, self.len) = (0, 0, 0);
+        while self.sum != 0 {
+            let j = self.sum.trailing_zeros() as usize;
+            self.sum &= self.sum - 1;
+            while self.bits[j] != 0 {
+                self.head[j * 64 + self.bits[j].trailing_zeros() as usize] = NIL;
+                self.bits[j] &= self.bits[j] - 1;
+            }
+        }
+        (self.free, self.cur, self.len, self.omin) = (NIL, 0, 0, u32::MAX);
+        self.pool.clear();
+        self.over.clear();
     }
 }
 
@@ -533,47 +606,49 @@ impl Pages {
 /// A label that would not fit 31 bits is skipped: every path through it is at least that long,
 /// so the search stays exact for shorter answers. If something was skipped and no shorter answer
 /// was found, return None and the caller runs the one-ended u64 search.
-fn bidir(pg: &mut Pages, hs: &mut [Radix; 2], g: &Graph, r: &Graph, s: usize, t: usize) -> Option<i64> {
+fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: &Graph, r: &Graph, s: usize, t: usize) -> Option<i64> {
     let (mut mu, mut skipped) = (u64::MAX, false);
     for (side, x) in [(0, s), (1, t)] {
         let i = pg.at(x as u32, side);
         pg.pool[i] = 0;
         hs[side].put(0, x as u32);
     }
-    while let (Some(kf), Some(kb)) = (hs[0].min(), hs[1].min()) {
-        if kf as u64 + kb as u64 >= mu {
-            break;
-        }
+    let mut key = [0u32; 2]; // each side's smallest queued key
+    while (key[0] as u64 + key[1] as u64) < mu {
         let side = (hs[0].len > hs[1].len) as usize;
-        let (d, u) = hs[side].pop().unwrap();
+        let (d, u) = (key[side], hs[side].pop());
         let iu = pg.at(u, side);
         let lu = pg.pool[iu];
-        if lu & SETTLED != 0 || lu < d {
-            continue; // stale entry
-        }
-        pg.pool[iu] = lu | SETTLED;
         let (gr, h) = (if side == 0 { g } else { r }, &mut hs[side]);
-        gr.adj(u as usize, |v, w| {
-            let nd = d as u64 + w as u64;
-            if nd >= INF as u64 {
-                skipped = true;
-                return;
-            }
-            let iv = pg.at(v, side);
-            let lv = unsafe { *pg.pool.get_unchecked(iv) };
-            if lv & SETTLED != 0 || lv as u64 <= nd {
-                return;
-            }
-            unsafe { *pg.pool.get_unchecked_mut(iv) = nd as u32 };
-            h.put(nd as u32, v);
-            let o = pg.get(v, 1 - side) & !SETTLED;
-            if o != INF {
-                mu = mu.min(nd + o as u64);
-            }
-        });
+        if lu == d {
+            // not settled, and not a stale entry (the label only drops after a push)
+            pg.pool[iu] = lu | SETTLED;
+            gr.adj(u as usize, |v, w| {
+                let nd = d as u64 + w as u64;
+                if nd >= INF as u64 {
+                    skipped = true;
+                    return;
+                }
+                let iv = pg.at(v, side);
+                let lv = unsafe { *pg.pool.get_unchecked(iv) };
+                if lv & SETTLED != 0 || lv as u64 <= nd {
+                    return;
+                }
+                unsafe { *pg.pool.get_unchecked_mut(iv) = nd as u32 };
+                h.put(nd as u32, v);
+                let o = pg.get(v, 1 - side) & !SETTLED;
+                if o != INF {
+                    mu = mu.min(nd + o as u64);
+                }
+            });
+        }
+        match h.min() {
+            Some(k) => key[side] = k,
+            None => break,
+        }
     }
     pg.clear();
-    hs.iter_mut().for_each(Radix::clear);
+    hs.iter_mut().for_each(Dial::clear);
     match mu {
         _ if skipped && mu >= INF as u64 => None,
         u64::MAX => Some(-1),
@@ -646,7 +721,7 @@ fn main() {
     std::thread::scope(|sc| {
         for _ in 0..threads {
             sc.spawn(|| {
-                let (mut pg, mut hs) = (Pages::new(n), [Radix::new(), Radix::new()]);
+                let (mut pg, mut hs) = (Pages::new(n), [Dial::new(), Dial::new()]);
                 loop {
                     let k = next.fetch_add(1, Relaxed);
                     let Some(&(s, t)) = qs.get(k) else { break };
