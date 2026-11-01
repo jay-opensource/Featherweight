@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicUsize, Ordering::
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn prctl(option: i32, a2: u64, a3: u64, a4: u64, a5: u64) -> i32;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 
 /// Read-only private mapping of a whole file; the page cache is not charged to us, a heap copy would be.
@@ -605,8 +606,9 @@ fn plain(g: &Graph, s: usize, t: usize) -> i64 {
 fn main() {
     // The scoring box backs anonymous memory with 2 MB pages (THP "always") and memory.peak
     // charges a whole 2 MB page for its first touched byte. Nothing here gains from 2 MB pages
-    // (measured on the board), so the process opts out: PR_SET_THP_DISABLE = 41.
-    unsafe { prctl(41, 1, 0, 0, 0) };
+    // (measured on the board), so the process opts out: PR_SET_THP_DISABLE = 41. One malloc arena
+    // (M_ARENA_MAX = 1) instead of one per thread keeps the search's small vectors packed.
+    unsafe { (prctl(41, 1, 0, 0, 0), mallopt(-8, 1)) };
     let t0 = std::time::Instant::now();
     let threads = std::env::var("FW_THREADS").ok().and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |p| p.get()));
