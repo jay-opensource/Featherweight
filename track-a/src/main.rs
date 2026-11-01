@@ -364,8 +364,8 @@ fn main() {
     // Small thread stacks and one malloc arena: with THP "always" either could cost a 2 MB page.
     std::env::set_var("RUST_MIN_STACK", "262144");
     unsafe { mallopt(-8, 1) };
-    let threads = std::env::var("FW_THREADS").ok().and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |p| p.get()));
+    let threads = std::thread::available_parallelism().map_or(1, |p| p.get());
+    let threads = std::env::var("FW_THREADS").map_or(threads, |v| v.parse().unwrap());
     let b = map("/data/requests.log");
     let names = Names { slots: Box::new([const { AtomicU64::new(0) }; SLOTS]), keys: Mutex::new(Vec::new()), text: anon(2048 * 128) };
     // Any hour may hold every line (two words each at worst) plus a partly filled block per thread,
@@ -462,8 +462,7 @@ fn main() {
                 // Each hour: format its groups into its range of the output.
                 while let Some(&h) = hrs.get(next[2].fetch_add(1, Relaxed)) {
                     let o = unsafe { std::slice::from_raw_parts_mut(o.0.add(off[h]), off[h + 1] - off[h]) };
-                    let t = h + 18 + 30 * 24;
-                    let (d, hh) = (t / 24, t % 24);
+                    let (d, hh) = ((h + 18) / 24 + 30, (h + 18) % 24);
                     let (mo, d) = if d > 31 { (11, d - 31) } else { (10, d) };
                     let stamp = format!("2026-{mo}-{d:02}T{hh:02}:00:00Z ");
                     let (mut i, p) = (0, o.as_mut_ptr());

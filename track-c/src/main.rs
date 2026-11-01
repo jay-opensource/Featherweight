@@ -24,7 +24,8 @@ extern "C" {
 /// pages, and memory.peak would charge a whole one for its first touched byte.
 fn zeroed<T>(n: usize) -> &'static [T] {
     let len = n * std::mem::size_of::<T>();
-    let p = unsafe { mmap(std::ptr::null_mut(), len.max(1), 3, 0x22, -1, 0) }; // RW, private, anon
+    let p = unsafe { mmap(std::ptr::null_mut(), len + (2 << 20), 3, 0x22, -1, 0) }; // RW, anon
+    let p = (p as usize + (2 << 20) - 1 & !((2 << 20) - 1)) as *mut u8; // 2 MB aligned
     unsafe { madvise(p, len, 15) };
     unsafe { std::slice::from_raw_parts(p as *const T, n) }
 }
@@ -44,7 +45,6 @@ fn map(path: &str) -> &'static [u8] {
     let p = zeroed::<u8>(len + 8192).as_ptr() as *mut u8;
     let q = unsafe { mmap(p, len, 1, 0x12, f.as_raw_fd(), 0) }; // read-only, private, fixed
     assert!(len == 0 || p == q);
-    unsafe { madvise(p, len, 2) }; // MADV_SEQUENTIAL
     unsafe { std::slice::from_raw_parts(p, len) }
 }
 
@@ -59,10 +59,6 @@ fn at(b: &[u8], i: usize) -> u8 {
 /// Position of the first byte c in b[i..], or b.len().
 fn find(b: &[u8], i: usize, c: u8) -> usize {
     i + b[i..].iter().position(|&x| x == c).unwrap_or(b.len() - i)
-}
-
-fn prefetch<T>(p: *const T) {
-    unsafe { _mm_prefetch(p as *const i8, _MM_HINT_T0) };
 }
 
 /// The 32 bytes of b from i.
@@ -172,7 +168,7 @@ impl Shared<'_> {
         loop {
             let k = &buckets[i];
             let h = [k.0[0].load(Acquire), k.0[1].load(Acquire)];
-            let mut hit = lanes(h, 0x3FFF, tag) & 7;
+            let [mut hit, busy, empty] = lanes(h, tag);
             while hit != 0 {
                 let j = hit.trailing_zeros() as usize;
                 if self.same(b, r, &k.1[j]) {
@@ -180,18 +176,13 @@ impl Shared<'_> {
                 }
                 hit &= hit - 1;
             }
-            let (busy, empty) = (lanes(h, !0, BUSY), lanes(h, !0, 0) & 7);
             if busy != 0 {
                 std::hint::spin_loop(); // another thread is filling a slot here: look again
-                continue;
+            } else if empty == 0 {
+                i = if i + 1 < buckets.len() { i + 1 } else { 0 };
+            } else if let Some(id) = self.insert(b, r, k, empty.trailing_zeros() as usize, ids) {
+                return id;
             }
-            if empty != 0 {
-                match self.insert(b, r, k, empty.trailing_zeros() as usize, ids) {
-                    Some(id) => return id,
-                    None => continue,
-                }
-            }
-            i = if i + 1 < buckets.len() { i + 1 } else { 0 };
         }
     }
 
@@ -213,19 +204,14 @@ impl Shared<'_> {
     fn insert(&self, b: &[u8], r: &Rec, k: &Bucket, j: usize, ids: &mut (u32, u32)) -> Option<u32> {
         let Shared(_, buckets, long, (top, next), ..) = self;
         let (w, shift, n, nw) = (&k.0[j / 2], 32 * (j % 2), r.2, (r.2 + 7) / 8);
-        let old = w.load(Relaxed);
+        let old = w.load(Relaxed) & !(0xFFFF_FFFF << shift); // slot j empty, or the exchange fails
         let busy = old | (BUSY as u64) << shift;
-        let claimed = old >> shift & 0xFFFF_FFFF == 0 && w.compare_exchange(old, busy, Acquire, Relaxed).is_ok();
-        if !claimed {
-            return None;
-        }
+        w.compare_exchange(old, busy, Acquire, Relaxed).ok()?;
         if ids.0 == ids.1 {
-            *ids = (next.fetch_add(64, Relaxed), 0);
-            ids.1 = ids.0 + 64;
-            if ids.0 % 4096 == 0 {
-                let page = self.4.chunks(256 * 64).nth(ids.0 as usize / 4096); // its bits
-                page.map(populate);
-            }
+            let first = next.fetch_add(64, Relaxed);
+            *ids = (first, first + 64);
+            let page = self.4.chunks(1 << 14).nth(first as usize >> 12); // bits of 4096 ids
+            page.filter(|_| first % 4096 == 0).map(populate); // mapped by its first id's owner
         }
         let o = (n > 16).then(|| top.fetch_add(nw, Relaxed)).unwrap_or(0);
         if ids.0 as usize >= buckets.len() * 3 / 8 * 7 || o + nw > long.len() {
@@ -245,15 +231,6 @@ impl Shared<'_> {
         Some(ids.0 - 1)
     }
 
-    fn set(&self, (q, len): &mut Pend, agg: &mut [Agg; 256], g: usize, id: u32) {
-        let r = (id as usize >> 6 ^ g) & 63; // the word's region
-        q[r][len[r]] = (id >> 12) << 20 | (g as u32) << 12 | id & 0xFFF; // word << 6 | bit
-        len[r] += 1;
-        if len[r] == 64 {
-            self.apply(&q[r], &mut len[r], r, agg);
-        }
-    }
-
     /// The queued words are fetched for writing first, so their cache misses overlap.
     fn apply(&self, q: &[u32; 64], len: &mut usize, r: usize, agg: &mut [Agg; 256]) {
         for &x in &q[..*len] {
@@ -271,13 +248,14 @@ impl Shared<'_> {
     }
 }
 
-/// The header lanes of h (three slots and an always-empty fourth) whose bits under `mask` are v.
-fn lanes(h: [u64; 2], mask: u32, v: u32) -> u32 {
+/// The slots of a bucket with headers h whose tag is `tag`, that are BUSY, and that are empty.
+fn lanes(h: [u64; 2], tag: u32) -> [u32; 3] {
     unsafe {
-        let h = _mm_set_epi64x(h[1] as i64, h[0] as i64);
-        let h = _mm_and_si128(h, _mm_set1_epi32(mask as i32));
-        let e = _mm_cmpeq_epi32(h, _mm_set1_epi32(v as i32));
-        _mm_movemask_ps(_mm_castsi128_ps(e)) as u32
+        let h = _mm_set_epi64x(h[1] as i64, h[0] as i64); // the fourth header is always 0
+        let is = |x, v: u32| _mm_cmpeq_epi32(x, _mm_set1_epi32(v as i32));
+        let mask = |m| _mm_movemask_ps(_mm_castsi128_ps(m)) as u32 & 7;
+        let tags = _mm_and_si128(h, _mm_set1_epi32(0x3FFF));
+        [mask(is(tags, tag)), mask(is(h, BUSY)), mask(is(h, 0))]
     }
 }
 
@@ -299,9 +277,8 @@ fn record(b: &[u8], rs: usize, lf: usize, quotes: u32, sh: &Shared) -> Rec {
     let (c1, nq) = text(b, c0 + 1);
     let e = lf - (at(b, lf - 1) == b'\r') as usize;
     let m = eq(load(b, e - 32), b',') as u32;
-    let t3 = 31 - m.leading_zeros();
-    let t2 = 31 - unsafe { _bzhi_u32(m, t3) }.leading_zeros();
-    let (c2, c3) = (e - 32 + t2 as usize, e - 32 + t3 as usize);
+    let c3 = e - 1 - m.leading_zeros() as usize;
+    let c2 = e - 1 - unsafe { _bzhi_u32(m, (c3 + 32 - e) as u32) }.leading_zeros() as usize;
     // The amount `-?d+.dd` is read as cents, with its dot squeezed out.
     let (neg, x) = ((at(b, c3 + 1) == b'-') as usize, word(b, e - 8));
     let x = (x & 0xFF_FFFF_FFFF) << 8 | x & 0xFFFF << 48;
@@ -320,9 +297,10 @@ fn record(b: &[u8], rs: usize, lf: usize, quotes: u32, sh: &Shared) -> Rec {
         let h = _mm_cvtsi128_si64(_mm_aesenc_si128(h, r)) as u64;
         (std::mem::transmute(k), h)
     };
-    prefetch(&sh.1[((h >> 32) * sh.1.len() as u64 >> 32) as usize]); // the name's bucket
+    let k = &sh.1[((h >> 32) * sh.1.len() as u64 >> 32) as usize];
     let region = region as usize;
-    prefetch(sh.0.as_ptr().wrapping_add(region)); // a prefetch never faults
+    unsafe { _mm_prefetch(k as *const Bucket as *const i8, _MM_HINT_T0) }; // the name's bucket
+    unsafe { _mm_prefetch(sh.0.as_ptr().wrapping_add(region) as *const i8, _MM_HINT_T0) };
     let nb = (n + quoted - nq as usize / 2) as i64;
     let tb = (c2 - c1 - 1 - tq / 2 - (tq > 0) as usize) as i64;
     let cents = if neg > 0 { -v } else { v };
@@ -336,69 +314,67 @@ const PIECE: usize = 1 << 16;
 
 /// Parse the records of f (len bytes) that start in [from, to), one piece at a time through the
 /// thread's buffer: 64 bytes in front (a record looks back up to 32), the piece, then zero bytes.
-/// A record cut by the end of a piece is read again at the start of the next. Parsing starts at the
-/// first line start at or after `from` (`from` itself for the first record of the file). Returns
-/// where parsing started and where it stopped: the first record start at or after `to`, or `len`.
+/// Parsing starts at the first line start at or after `from` (`from` itself for the first record
+/// of the file) and stops at the first record start at or after `to`, or at `len`; both are
+/// returned. In a piece, each 64-byte block gives bit masks of quotes and LFs, and the LFs outside
+/// quotes end the records. A record cut by the end of a piece is read again at the start of the
+/// next, and the batch is looked up before the buffer is reused.
 fn read(f: &File, len: usize, from: usize, to: usize, sh: &Shared, me: &mut Local) -> [usize; 2] {
     let (mut pos, mut start, buf) = (from - 1, None, me.3);
+    let (mut batch, mut nb) = ([Rec::default(); 32], 0);
     loop {
         let n = PIECE.min(len - pos);
         let piece = unsafe { std::slice::from_raw_parts_mut(buf.add(64), n + 64) };
         f.read_exact_at(&mut piece[..n], pos as u64).unwrap();
         piece[n..].fill(0); // no stale LF after the data
         let b = unsafe { std::slice::from_raw_parts(buf, PIECE + 192) };
-        let find = || (65..64 + n).find(|&i| line_start(b, i)).unwrap_or(64 + n) - 64;
-        let skip = if start.is_none() { find() } else { 0 };
-        start = start.or(Some(pos + skip));
-        let stop = chunk(b, 64 + skip, to + 64 - pos, 64 + n, sh, me);
-        pos += stop - 64;
+        let find = || (65..64 + n).find(|&i| line_start(b, i)).unwrap_or(64 + n);
+        let first = if start.is_none() { find() } else { 64 };
+        start = start.or(Some(pos + first - 64));
+        let (end, mut base, mut rs) = (to + 64 - pos, first, first);
+        let (mut carry, mut quotes, mut qrs) = (0, 0, 0);
+        while rs < end && base < 64 + n {
+            let (lo, hi) = (load(b, base), load(b, base + 32));
+            let q = eq(lo, b'"') | eq(hi, b'"') << 32;
+            let x = inside(q) ^ carry;
+            carry = ((x as i64) >> 63) as u64;
+            let mut lfs = (eq(lo, b'\n') | eq(hi, b'\n') << 32) & !x;
+            while lfs != 0 && rs < end {
+                let lf = base + lfs.trailing_zeros() as usize;
+                let qlf = quotes + unsafe { _bzhi_u64(q, (lf - base) as u32) }.count_ones();
+                batch[nb] = record(b, rs, lf, qlf - qrs, sh);
+                (nb, qrs, rs, lfs) = (nb + 1, qlf, lf + 1, lfs & (lfs - 1));
+                if nb == batch.len() {
+                    flush(b, &batch, sh, me);
+                    nb = 0;
+                }
+            }
+            (quotes, base) = (quotes + q.count_ones(), base + 64);
+        }
+        flush(b, &batch[..nb], sh, me);
+        (nb, pos) = (0, pos + rs - 64);
         if pos >= to || n < PIECE {
             return [start.unwrap(), pos];
         }
-        assert!(stop > 64 + skip, "a record longer than a piece");
+        assert!(rs > first, "a record longer than a piece");
     }
-}
-
-/// Parse the records that start in b[start..end) and end in b[..valid) (start is a record start).
-/// Returns where parsing stopped: at `end` or later if `end` is passed, else at the first record
-/// that is not complete (or `valid`).
-fn chunk(b: &[u8], start: usize, end: usize, valid: usize, sh: &Shared, me: &mut Local) -> usize {
-    let (mut base, mut carry, mut quotes, mut qrs, mut rs) = (start, 0u64, 0u32, 0u32, start);
-    let (mut batch, mut nb) = ([Rec::default(); 32], 0);
-    'blocks: while rs < end && base < valid {
-        let (lo, hi) = (load(b, base), load(b, base + 32));
-        let q = eq(lo, b'"') | eq(hi, b'"') << 32;
-        let x = inside(q) ^ carry;
-        carry = ((x as i64) >> 63) as u64;
-        let mut lfs = (eq(lo, b'\n') | eq(hi, b'\n') << 32) & !x;
-        while lfs != 0 {
-            let lf = base + lfs.trailing_zeros() as usize;
-            let qlf = quotes + unsafe { _bzhi_u64(q, (lf - base) as u32) }.count_ones();
-            batch[nb] = record(b, rs, lf, qlf - qrs, sh);
-            (nb, qrs, rs, lfs) = (nb + 1, qlf, lf + 1, lfs & (lfs - 1));
-            if nb == batch.len() {
-                flush(b, &batch, sh, me);
-                nb = 0;
-            }
-            if rs >= end {
-                break 'blocks;
-            }
-        }
-        (quotes, base) = (quotes + q.count_ones(), base + 64);
-    }
-    flush(b, &batch[..nb], sh, me);
-    rs
 }
 
 /// Lookups for a batch: its region bytes and dictionary buckets were prefetched while it was parsed.
-fn flush(b: &[u8], batch: &[Rec], sh: &Shared, (agg, ids, pend, _): &mut Local) {
+/// The name's bit is queued for its region of the bitset, which is applied when its queue is full.
+fn flush(b: &[u8], batch: &[Rec], sh: &Shared, (agg, ids, (q, len), _): &mut Local) {
     for r @ &Rec(.., region, id, cents, nb, tb) in batch {
         let g = sh.0.get(region).map_or(0, |g| g.load(Relaxed)) as usize;
         let name = sh.id(b, r, ids);
         let a = &mut agg[g];
         (a[0], a[1], a[2], a[3]) = (a[0] + 1, a[1] + id, a[2] + cents, a[3].min(cents));
         (a[4], a[5], a[6]) = (a[4].max(cents), a[5] + nb, a[6] + tb);
-        sh.set(pend, agg, g, name);
+        let r = (name as usize >> 6 ^ g) & 63; // the region of the name's word
+        q[r][len[r]] = (name >> 12) << 20 | (g as u32) << 12 | name & 0xFFF; // word << 6 | bit
+        len[r] += 1;
+        if len[r] == 64 {
+            sh.apply(&q[r], &mut len[r], r, agg);
+        }
     }
 }
 
@@ -428,21 +404,22 @@ fn jobs(next: &AtomicUsize, n: usize) -> impl Iterator<Item = usize> + '_ {
 ///
 /// Why a start is proved: job 0 starts right after the header (the first line start after it), a
 /// true record start in the outside-quotes state, so its parse is exact and stops at the first
-/// record boundary at or after cut(1). If that equals where job 1 started (by the shape of the data), job 1 started at a true
-/// record start too, and so on by induction. A start inside a quoted field shows up as a job whose
-/// predecessor stopped elsewhere. The starts are found by the jobs themselves, in parallel.
+/// record boundary at or after cut(1). If that equals where job 1 started (by the shape of the
+/// data), job 1 started at a true record start too, and so on by induction. A start inside a quoted
+/// field shows up as a job whose predecessor stopped elsewhere. Jobs find their starts in parallel.
 fn run(f: &File, from: usize, tab: &[AtomicU8], attempt: u32, threads: usize) -> Option<Vec<Agg>> {
     let threads = if attempt > 0 { 1 } else { threads };
     let cap = 3 << (14 + 2 * attempt);
-    if attempt > 0 {
-        eprintln!("warning: parallel run rejected; attempt {attempt} on one thread, {cap} buckets");
-    }
+    (attempt > 0).then(|| eprintln!("warning: parallel run rejected; attempt {attempt} on 1 thread"));
     let k = if threads > 1 { threads * 48 } else { 1 };
     let len = f.metadata().unwrap().len() as usize;
     let cut = |j: usize| from + (len - from) * j / k; // job j's records start at or after cut(j)
     let bits = zeroed((cap * 3 / 8 * 7 / 4096 + 1) * 256 * 64);
     let locks = (0..64).map(|_| Mutex::new(())).collect();
     let dict = (zeroed(cap), zeroed(1 << 23), (0.into(), 0.into()));
+    // The first 2 MB of each (2 MB aligned by `zeroed`, and fully used) on one 2 MB page.
+    unsafe { madvise(dict.0.as_ptr() as *mut u8, 2 << 20, 14) }; // MADV_HUGEPAGE
+    unsafe { madvise(bits.as_ptr() as *mut u8, 2 << 20, 14) };
     let sh = Shared(tab, dict.0, dict.1, dict.2, bits, locks);
     let ends: Vec<[AtomicUsize; 2]> = (0..k).map(|_| Default::default()).collect();
     let bufs = zeroed::<u8>(threads * (PIECE + 192)); // one buffer per thread (see `read`)
