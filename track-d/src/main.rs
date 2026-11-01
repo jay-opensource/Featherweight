@@ -3,7 +3,7 @@
 // runs as a two-ended Dijkstra whose labels live in small per-thread pages, not in arrays the
 // size of the graph. See PERF.md for the measurements behind each choice.
 use std::{fs::File, os::unix::io::AsRawFd};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering::*};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -93,6 +93,7 @@ fn store(out: &Slots<u32>, p: usize, v: u32, w: u32, vb: u32, esc: u32) -> usize
 }
 
 /// Compact CSR. Node k's slots start at base[k >> sh] + rel[k] (see `store` for a slot).
+#[derive(Default)]
 struct Graph {
     edges: Vec<u32>,
     base: Vec<u32>,
@@ -168,69 +169,98 @@ impl Edges for ((&Graph, &[u32]), usize, usize) {
     }
 }
 
-/// Build a CSR over n nodes from the edges of `items`, read twice. Every random access stays
-/// inside a small region:
+/// Build a CSR over n nodes from the edges of `items`. Every random access stays inside a small
+/// region:
 /// 1. count each item's slots per bucket of 8192 nodes (213 counters per item, no atomics);
 /// 2. append each slot to its bucket's region through the item's own cursor, with the node's
 ///    place inside the bucket in a parallel u16 array (213 sequential streams per thread; both
 ///    slots of an escaped edge get it, so the slots can be counted and moved one by one);
-/// 3. per bucket, count each node's slots from the u16s alone, lay its offsets out from the
-///    bucket's first slot, and reorder the bucket's ~94 KB of slots by node through a scratch
+/// 3. (`finish`) per bucket, count each node's slots from the u16s alone, lay its offsets out from
+///    the bucket's first slot, and reorder the bucket's ~94 KB of slots by node through a scratch
 ///    copy. Offsets come in blocks of 16 nodes (a u32 base each, u8 offsets inside); if an
 ///    in-block offset does not fit, they are laid out again with smaller blocks (the slots stay).
-/// Nothing is locked, and no store lands outside the bucket being worked on. `buf`, if given, is
-/// the edge array of a graph dropped by the caller with exactly as many slots: its pages are
-/// already mapped, so they are neither unmapped nor faulted in again (every slot is written).
-/// Steps 1-2 here; `finish` does step 3, after the caller has dropped what the items read.
-fn csr(n: usize, threads: usize, vb: u32, items: &[impl Edges], buf: Option<Vec<u32>>) -> Staged {
+/// Nothing is locked, and no store lands outside the bucket being worked on. `buf` is Ok(the edge
+/// array of a graph dropped by the caller with exactly as many slots: its pages are already
+/// mapped, every slot is written), or Err(est). If est > 0 (the expected slot count), step 1 is
+/// skipped: each item gets room for its share of est in each bucket plus 6 standard deviations
+/// (the text is parsed once), the unused room is holes (place 0), and the
+/// finish packs the slots (see there). A segment that would overflow starts it all again, counted.
+fn csr(n: usize, t: usize, vb: u32, items: &[impl Edges], buf: Result<Vec<u32>, usize>) -> Staged {
     let esc = u32::MAX >> vb; // the escape value: all ones in the weight bits
     let (nb, ni) = ((n >> BS) + 1, items.len());
-    let mut cur = vec![0u32; ni * nb];
+    let est = *buf.as_ref().err().unwrap_or(&0);
+    // the room of item j / nb in bucket j % nb (8192 of the n + 1 nodes); 0 if counted
+    let mu = |j: usize| (est * (n + 1 - j % nb * 8192).min(8192) / (n + 1) / ni) as f64;
+    let mut cur = Vec::from_iter((0..ni * nb).map(|j| (mu(j) + 6.0 * mu(j).sqrt()) as u32));
     let cp = Slots(cur.as_mut_ptr());
-    par(threads, &(0..ni).collect::<Vec<_>>(), |&i| {
-        let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
-        items[i].each(false, |u, _, w| c[u >> BS] += 1 + (w >= esc) as u32);
-    });
-    let (mut start, mut acc) = (vec![0usize; nb + 1], 0u32);
+    if est == 0 {
+        par(t, &(0..ni).collect::<Vec<_>>(), |&i| {
+            let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
+            items[i].each(false, |u, _, w| c[u >> BS] += 1 + (w >= esc) as u32);
+        });
+    }
+    let (mut st, mut acc, mut end) = (vec![[0, 0]; nb + 1], 0u32, vec![0; ni * nb]);
     for b in 0..nb {
         for i in 0..ni {
             (cur[i * nb + b], acc) = (acc, acc + cur[i * nb + b]);
+            end[i * nb + b] = acc as usize; // where the segment ends
         }
-        start[b + 1] = acc as usize;
+        st[b + 1][0] = acc as usize; // each bucket's first slot: staged, packed (no holes)
     }
-    let mut edges = buf.unwrap_or_else(|| vec![0; acc as usize]); // every slot is written below
+    let seg = cur.clone(); // where each segment starts
+    let mut edges = buf.unwrap_or_else(|_| vec![0; acc as usize]); // every slot is written below
     let mut loc = vec![0u16; acc as usize];
     let (ep, lp) = (Slots(edges.as_mut_ptr()), Slots(loc.as_mut_ptr()));
-    par(threads, &(0..ni).collect::<Vec<_>>(), |&i| {
+    let ok = AtomicBool::new(true);
+    par(t, &(0..ni).collect::<Vec<_>>(), |&i| {
         let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
         items[i].each(true, |u, v, w| {
-            let (p, l) = (c[u >> BS] as usize, (u & ((1 << BS) - 1)) as u16);
-            let k = store(&ep, p, v, w, vb, esc);
-            c[u >> BS] += k as u32;
+            let (b, l) = (u >> BS, (u & ((1 << BS) - 1)) as u16 + 1);
+            if est > 0 && c[b] as usize + 1 + (w >= esc) as usize > end[i * nb + b] {
+                return ok.store(false, Relaxed);
+            }
+            let (p, k) = (c[b] as usize, store(&ep, c[b] as usize, v, w, vb, esc));
+            c[b] += k as u32;
             unsafe { (*(&lp).0.add(p), *(&lp).0.add(p + k - 1)) = (l, l) };
         });
     });
-    (edges, loc, start)
+    if !ok.into_inner() {
+        return csr(n, t, vb, items, Err(0));
+    }
+    for b in 0..nb {
+        let used: u32 = (0..ni).map(|i| cur[i * nb + b] - seg[i * nb + b]).sum();
+        st[b + 1][1] = st[b][1] + used as usize;
+    }
+    (edges, loc, st, n, t, vb)
 }
 
 /// Bits of a bucket's node range in `csr`.
 const BS: u32 = 13;
 
-/// The slots of a graph grouped by bucket, the node's place in its bucket for each slot, and the
-/// first slot of each bucket.
-type Staged = (Vec<u32>, Vec<u16>, Vec<usize>);
+/// The slots of a graph grouped by bucket, 1 + the node's place in its bucket for each slot (0:
+/// a hole), the first slot of each bucket with and without holes, and n, threads, vb.
+type Staged = (Vec<u32>, Vec<u16>, Vec<[usize; 2]>, usize, usize, u32);
 
-/// Step 3 of `csr`.
-fn finish(n: usize, threads: usize, vb: u32, (mut edges, loc, start): Staged) -> Graph {
-    let (nb, esc, ep) = ((n >> BS) + 1, u32::MAX >> vb, Slots(edges.as_mut_ptr()));
+/// Step 3 of `csr`. With holes, a bucket's packed slots start at or before its staged ones, over
+/// the staged slots of earlier buckets: it writes them only once those buckets have copied theirs
+/// (buckets are taken in order, so it waits only for ones being worked on).
+fn finish((edges, loc, st, n, threads, vb): Staged) -> Graph {
+    let (nb, mut g) = ((n >> BS) + 1, Graph::default());
+    (g.edges, g.vb, g.esc) = (edges, vb, u32::MAX >> vb);
+    let ep = Slots(g.edges.as_mut_ptr());
+    let copied = Vec::from_iter((0..nb).map(|_| AtomicBool::new(false)));
     for sh in (0..=4).rev() {
-        let (mut rel, mut base) = (vec![0u8; n + 1], vec![0u32; (n >> sh) + 1]);
-        let (rp, bp) = (Slots(rel.as_mut_ptr()), Slots(base.as_mut_ptr()));
+        (g.sh, g.rel, g.base) = (sh, vec![0; n + 1], vec![0; (n >> sh) + 1]);
+        let (rp, bp) = (Slots(g.rel.as_mut_ptr()), Slots(g.base.as_mut_ptr()));
         let ok = AtomicBool::new(true);
         par(threads, &(0..nb).collect::<Vec<_>>(), |&b| {
-            let (lo, hi, k0) = (start[b], start[b + 1], b << BS);
+            let ([s0, lo], [s1, _], k0) = (st[b], st[b + 1], b << BS);
+            let e = unsafe { std::slice::from_raw_parts((&ep).0.add(s0), s1 - s0) }.to_vec();
+            copied[b].store(true, Release);
             let mut at = vec![0u32; (n + 1 - k0).min(1 << BS)];
-            loc[lo..hi].iter().for_each(|&l| at[l as usize] += 1);
+            for &l in &loc[s0..s1] {
+                at.get_mut(l as usize - 1).map(|a| *a += 1); // not a hole
+            }
             let (mut p, mut p0) = (lo as u32, 0);
             for (k, a) in (k0..).zip(&mut at) {
                 if k & ((1 << sh) - 1) == 0 {
@@ -240,16 +270,20 @@ fn finish(n: usize, threads: usize, vb: u32, (mut edges, loc, start): Staged) ->
                 (*a, p) = (p, p + *a);
                 unsafe { *(&rp).0.add(k) = (*a - p0) as u8 };
             }
-            if sh == 4 {
-                let e = unsafe { std::slice::from_raw_parts((&ep).0.add(lo), hi - lo) }.to_vec();
-                for (&x, &l) in e.iter().zip(&loc[lo..hi]) {
-                    unsafe { *(&ep).0.add(at[l as usize] as usize) = x };
-                    at[l as usize] += 1;
+            let mut w = b; // wait for the earlier buckets whose staged slots end after lo
+            while w > 0 && st[w][0] > lo {
+                w -= copied[w - 1].load(Acquire) as usize;
+            }
+            for (&x, &l) in e.iter().zip(&loc[s0..s1]).filter(|_| sh == 4) {
+                if let Some(a) = at.get_mut(l as usize - 1) {
+                    unsafe { *(&ep).0.add(*a as usize) = x };
+                    *a += 1;
                 }
             }
         });
         if ok.into_inner() || sh == 0 {
-            return Graph { edges, base, rel, sh, vb, esc };
+            (g.edges.truncate(st[nb][1]), g.edges.shrink_to_fit()); // the tail goes back
+            return g;
         }
     }
     unreachable!()
@@ -259,26 +293,23 @@ fn finish(n: usize, threads: usize, vb: u32, (mut edges, loc, start): Staged) ->
 /// slice of the id range (claiming nodes with a CAS) and re-seeds from that slice when its region
 /// is enclosed. New ids follow one region's visit order, then the next region's, and so on.
 fn bfs_order(g: &Graph, n: usize, threads: usize) -> Vec<u32> {
-    // Zeroed by the kernel on first touch (in parallel); 0 is free, 1 claimed, until the ids.
-    let mut id = vec![0u32; n];
-    let ip = Slots(id.as_mut_ptr());
-    let at = |v: usize| unsafe { AtomicU32::from_ptr((&ip).0.add(v)) };
-    let claim = |v| at(v).load(Relaxed) == 0 && at(v).compare_exchange(0, 1, Relaxed, Relaxed).is_ok();
-    let lists = std::sync::Mutex::new(Vec::new());
-    par(threads, &spans((), n, threads), |&(_, mut scan, end)| {
+    // One claim bit per node (218 KB, cache-resident); the ids are written once, at the end.
+    // id: allocated below the lists (freed first, so the heap gives their pages back), written last.
+    let (mut id, lists) = (vec![0u32; n], std::sync::Mutex::new(Vec::new()));
+    let bits = Vec::from_iter((0..=n / 64).map(|_| AtomicU64::new(0)));
+    let claim = |&v: &usize| {
+        let (b, m) = (&bits[v / 64], 1 << v % 64);
+        b.load(Relaxed) & m == 0 && b.fetch_or(m, Relaxed) & m == 0
+    };
+    par(threads, &spans((), n, threads), |&(_, mut sc, e)| {
         let (mut list, mut head) = (Vec::with_capacity(n), 0); // only touched pages are charged
         loop {
             if head == list.len() {
-                while scan < end && !claim(scan) {
-                    scan += 1;
-                }
-                if scan == end {
-                    break;
-                }
-                list.push(scan as u32);
+                let Some(s) = (sc..e).find(claim) else { break };
+                (sc, _) = (s + 1, list.push(s as u32));
             }
-            // Software pipeline over the queue: offsets 16 nodes ahead, edge lists 8 ahead, the
-            // claim words of the targets 4 ahead, so the misses of upcoming nodes overlap.
+            // Software pipeline over the queue: offsets 16 nodes ahead, edge lists 8 ahead, so
+            // the misses of upcoming nodes overlap (the claim bits stay in cache).
             if let Some(&w) = list.get(head + 16) {
                 prefetch(&g.rel[w as usize]);
                 prefetch(&g.base[w as usize >> g.sh]);
@@ -286,20 +317,17 @@ fn bfs_order(g: &Graph, n: usize, threads: usize) -> Vec<u32> {
             if let Some(&w) = list.get(head + 8) {
                 prefetch(g.edges.as_ptr().wrapping_add(g.off(w as usize)));
             }
-            if let Some(&w) = list.get(head + 4) {
-                g.adj(w as usize, |v, _| prefetch(at(v as usize)));
-            }
             let u = list[head] as usize;
             head += 1;
-            g.adj(u, |v, _| _ = claim(v as usize).then(|| list.push(v)));
+            g.adj(u, |v, _| _ = claim(&(v as usize)).then(|| list.push(v)));
         }
         lists.lock().unwrap().push(list);
     });
-    let lists = lists.into_inner().unwrap();
+    let (lists, ip) = (lists.into_inner().unwrap(), Slots(id.as_mut_ptr()));
     par(threads, &(0..lists.len()).collect::<Vec<_>>(), |&j| {
         let start = lists[..j].iter().map(|l| l.len()).sum::<usize>();
         for (i, &v) in lists[j].iter().enumerate() {
-            at(v as usize).store((start + i) as u32, Relaxed);
+            unsafe { *(&ip).0.add(v as usize) = (start + i) as u32 };
         }
     });
     id
@@ -422,9 +450,9 @@ impl Pages {
 
 /// Two-ended Dijkstra: forward from s on g[0], backward from t on the reverse graph g[1], always
 /// expanding the side with fewer queued entries. mu is the best s-t length seen through any node
-/// labelled by both sides; stop when the two queue minimums together reach mu. A source with no
-/// way out or a target with no way in empties its queue at once, so those answer -1 immediately;
-/// s = t starts with mu = 0 and answers 0.
+/// labelled by both sides, starting at the cap c; stop when the two queue minimums together reach mu,
+/// which is then min(d(s, t), c) (u64::MAX: no path). A source with no way out or a target with
+/// no way in empties its queue at once, so those end immediately; s = t starts with mu = 0.
 /// Two kinds of relaxation are skipped, and the smallest length they would have given is kept in
 /// `skip`: a label that would not fit 31 bits, and an edge of weight W or more (none is reached on
 /// seed 1). The search is then exact on the graph without the heavy edges for every distance below
@@ -432,10 +460,10 @@ impl Pages {
 /// search settled, or the last one ends at a node the backward search settled (else the path
 /// would be at least the two queue minimums, hence mu), so skip is below mu. So mu is the answer
 /// unless skip < mu, or something was skipped and mu does not fit 31 bits: then return None and
-/// the caller runs the one-ended u64 search.
-fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: [&Graph; 2], s: usize, t: usize) -> Option<i64> {
+/// the caller runs via().
+fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: [&Graph; 2], [s, t, c]: [usize; 3]) -> Option<u64> {
     pg.clear();
-    let mut m = [if s == t { 0 } else { u64::MAX }, u64::MAX]; // mu, skip
+    let mut m = [if s == t { 0 } else { c as u64 }, u64::MAX]; // mu, skip
     for (side, x, gr) in [(0, s, g[0]), (1, t, g[1])] {
         let i = pg.at(x as u32, side);
         pg.pool[i] = 0;
@@ -449,8 +477,8 @@ fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: [&Graph; 2], s: usize, t: usize)
             false => step::<0>(pg, &mut hs[0], g[0], &mut m),
         }
     {}
-    let [mu, skip] = m; // mu = u64::MAX (no path) casts to -1
-    (skip >= mu && (skip == u64::MAX || mu < INF as u64)).then_some(mu as i64)
+    let [mu, skip] = m;
+    (skip >= mu && (skip == u64::MAX || mu < INF as u64)).then_some(mu)
 }
 
 /// One step of side S (0: forward, 1: backward, so the side is a constant in the code): pop its
@@ -484,12 +512,31 @@ fn step<const S: usize>(pg: &mut Pages, h: &mut Dial, gr: &Graph, m: &mut [u64; 
     h.min()
 }
 
-/// One-ended Dijkstra with u64 distances, for the few queries whose distances need more than
-/// 31 bits (edges of weight near 2^32 at the special nodes). A stale heap entry is simply expanded
-/// again (it cannot improve anything). Slow per node, but the long ones (from a source without
-/// in-edges) run first, beside the other queries (see main); answering them through the source's
-/// out-neighbours with two two-ended searches was 3-4x faster for those but gained nothing more.
-fn plain(g: &Graph, s: usize, t: usize) -> i64 {
+/// d(s, t) for a query that bidir gave up on: the minimum over the out-edges (s, v, w) of
+/// w + d(v, t). A source without in-edges leaves through edges near 2^32 into the main body, where a
+/// one-ended search settles every node closer than t (15 ms for one query on holdout seed 11). Each
+/// round bounds the answer by b = lo + 2^12, 2^14, ... (lo: the lightest edge) and caps each
+/// bidir(v, t) at min(b, best) - w, so no search grows past what the bound allows; a result below b
+/// is exact. plain() takes the searches that give up again (heavy edges inside an island).
+fn via(pg: &mut Pages, hs: &mut [Dial; 2], g: [&Graph; 2], s: usize, t: usize) -> u64 {
+    let mut out = vec![];
+    g[0].adj(s, |v, w| out.push((w as u64, v as usize)));
+    let (lo, mut best, mut k) = (out.iter().map(|e| e.0).min().unwrap_or(0), u64::MAX, 54);
+    while k > 0 && best >= lo.saturating_add(u64::MAX >> k) {
+        k -= 2; // the last round (k = 0) has no bound
+        let b = lo.saturating_add(u64::MAX >> k);
+        best = out.iter().fold(u64::MAX, |best, &(w, v)| {
+            let d = bidir(pg, hs, g, [v, t, b.min(best).saturating_sub(w) as usize]);
+            best.min(w.saturating_add(d.unwrap_or_else(|| plain(g[0], v, t))))
+        });
+    }
+    best
+}
+
+/// One-ended Dijkstra with u64 distances, for the few paths that need edges of weight W or more
+/// (inside the islands, see via). A stale heap entry is simply expanded again (it cannot
+/// improve anything). u64::MAX if t is unreachable.
+fn plain(g: &Graph, s: usize, t: usize) -> u64 {
     use std::collections::{BTreeSet, HashMap};
     let (mut dist, mut q) = (HashMap::from([(s, 0)]), BTreeSet::from([(0, s)]));
     while let Some((d, u)) = q.pop_first().filter(|&(_, u)| u != t) {
@@ -501,7 +548,7 @@ fn plain(g: &Graph, s: usize, t: usize) -> i64 {
             }
         });
     }
-    dist.get(&t).map_or(-1, |&d| d as i64) // t is popped at its distance, or never labelled
+    *dist.get(&t).unwrap_or(&u64::MAX) // t is popped at its distance, or never labelled
 }
 
 fn main() {
@@ -519,35 +566,35 @@ fn main() {
 
     let (gt, mut i) = (map("/data/graph.txt"), 0);
     // n, m (the edge lines are simply read to the end) and the text after the header line
-    let (n, _m, body) = (num(gt, &mut i) as usize, num(gt, &mut i), &gt[i..]);
+    let (n, m, body) = (num(gt, &mut i) as usize, num(gt, &mut i) as usize, &gt[i..]);
     let vb = (usize::BITS - (n.max(2) - 1).leading_zeros()).max(1);
     let k = threads * 4; // work items per pass
-    let g0 = csr(n, threads, vb, &spans(body, body.len(), k), None);
-    let g0 = finish(n, threads, vb, g0);
+    let est = Err(m.min(body.len() / 6)); // a line has at least 6 bytes
+    let g0 = finish(csr(n, threads, vb, &spans(body, body.len(), k), est));
     let newid = bfs_order(&g0, n, threads);
     qs.iter_mut().for_each(|q| *q = (newid[q.0] as usize, newid[q.1] as usize));
-    let g = csr(n, threads, vb, &spans((&g0, &newid[..]), n, k), None);
+    let g = csr(n, threads, vb, &spans((&g0, &newid[..]), n, k), Err(0));
     // Free the ids and g0's offsets first: the finish takes its memory from them. The reverse
     // graph has exactly g0's slot count: it takes over g0's mapped edge pages.
     let (buf, _) = ({ g0 }.edges, drop(newid));
-    let g = finish(n, threads, vb, g);
-    let r = csr(n, threads, vb, &spans((&g, &[][..]), n, k), Some(buf));
-    let r = finish(n, threads, vb, r);
+    let g = finish(g);
+    let r = finish(csr(n, threads, vb, &spans((&g, &[][..]), n, k), Ok(buf)));
 
     let ans: Vec<AtomicI64> = qs.iter().map(|_| AtomicI64::new(-1)).collect();
     let next = AtomicUsize::new(0);
-    // Queries from sources without in-edges first: those sources leave through edges near 2^32,
-    // so their queries take the slow one-ended search (up to 25-90 ms on holdout seed 11), which
-    // must not be the last thing running. The rest keep the file order.
+    // Far pairs in BFS order first: |s - t| tracks the size of a search (correlation 0.48 in logs),
+    // so the long searches start early and short ones fill the end. Query phase on 12 threads, 40
+    // in-process pairs against the file order: 0.981, 0.989, 0.978 on seeds 1, 11 and 12.
     let mut o = Vec::from_iter(qs.iter().enumerate());
-    o.sort_by_key(|&(_, &(s, _))| r.off(s) < r.off(s + 1));
+    o.sort_by_key(|&(_, &(s, t))| std::cmp::Reverse(s.abs_diff(t)));
     par(threads, &vec![(); threads], |_| {
         let (mut pg, mut hs) = (Pages::new(n), <[Dial; 2]>::default());
         loop {
             let k = next.fetch_add(1, Relaxed);
             let Some(&(k, &(s, t))) = o.get(k) else { break };
-            let a = bidir(&mut pg, &mut hs, [&g, &r], s, t);
-            ans[k].store(a.unwrap_or_else(|| plain(&g, s, t)), Relaxed);
+            let a = bidir(&mut pg, &mut hs, [&g, &r], [s, t, usize::MAX]);
+            let a = a.unwrap_or_else(|| via(&mut pg, &mut hs, [&g, &r], s, t));
+            ans[k].store(a as i64, Relaxed); // u64::MAX (no path) is -1
         }
     });
     let out: String = ans.iter().map(|a| format!("{a:?}\n")).collect(); // Debug: the value
