@@ -108,7 +108,7 @@ fn mt<T>(s: &mut [T], i: usize) -> &mut T {
 }
 
 /// Split `b` into `k` byte ranges that start and end on line boundaries.
-fn chunks(b: &[u8], k: usize) -> Vec<(usize, usize)> {
+fn chunks(b: &[u8], k: usize) -> Vec<(&[u8], usize, usize)> {
     let mut cut = vec![0];
     for j in 1..k {
         let mut p = (b.len() * j / k).max(*cut.last().unwrap());
@@ -118,7 +118,7 @@ fn chunks(b: &[u8], k: usize) -> Vec<(usize, usize)> {
         cut.push(p);
     }
     cut.push(b.len());
-    cut.windows(2).map(|w| (w[0], w[1])).collect()
+    cut.windows(2).map(|w| (b, w[0], w[1])).collect()
 }
 
 /// `0..n` in `k` ranges.
@@ -235,8 +235,34 @@ fn layout(n: usize, threads: usize, slots: impl Fn(usize) -> u32 + Sync) -> (Vec
     }
 }
 
-/// Build a CSR over n nodes from an edge stream: `each(item, emit)` calls emit(u, v, w) for the
-/// edges of one work item, and runs twice. Every random access stays inside a small region:
+/// A work item of an edge stream: `each(emit)` calls emit(u, v, w) for each of its edges. A trait
+/// (not a closure taking a `dyn` emitter) so that the emitter is inlined into the parsing loop.
+trait Edges: Sync {
+    fn each(&self, emit: impl FnMut(usize, u32, u32));
+}
+
+/// Lines lo..hi of the graph text.
+impl Edges for (&[u8], usize, usize) {
+    fn each(&self, mut emit: impl FnMut(usize, u32, u32)) {
+        let (b, mut i) = (self.0, self.1);
+        while i < self.2 {
+            let (u, v) = (num(b, &mut i) as usize, num(b, &mut i) as u32);
+            emit(u, v, num(b, &mut i) as u32);
+        }
+    }
+}
+
+/// The edges u -> v of nodes lo..hi of a graph, as v -> u.
+impl Edges for (&Graph, usize, usize) {
+    fn each(&self, mut emit: impl FnMut(usize, u32, u32)) {
+        for u in self.1..self.2 {
+            self.0.adj(u, |v, w| emit(v as usize, u as u32, w));
+        }
+    }
+}
+
+/// Build a CSR over n nodes from the edges of `items`, read twice. Every random access stays
+/// inside a small region:
 /// 1. count each item's slots per bucket of 8192 nodes (213 counters per item, no atomics);
 /// 2. append each slot to its bucket's region through the item's own cursor, with the node's
 ///    place inside the bucket in a parallel u16 array (213 sequential streams per thread; both
@@ -244,7 +270,7 @@ fn layout(n: usize, threads: usize, slots: impl Fn(usize) -> u32 + Sync) -> (Vec
 /// 3. per bucket, count each node's slots from the u16s alone; once the layout is known, reorder
 ///    the bucket's ~94 KB of slots by node through a scratch copy.
 /// Nothing is locked, and no store lands outside the bucket being worked on.
-fn csr<T: Sync>(n: usize, threads: usize, vb: u32, esc: u32, items: &[T], each: impl Fn(&T, &mut dyn FnMut(usize, u32, u32)) + Sync) -> Graph {
+fn csr(n: usize, threads: usize, vb: u32, esc: u32, items: &[impl Edges]) -> Graph {
     const BS: u32 = 13;
     let (nb, ni) = ((n >> BS) + 1, items.len());
     let idx: Vec<usize> = (0..ni).collect();
@@ -252,7 +278,7 @@ fn csr<T: Sync>(n: usize, threads: usize, vb: u32, esc: u32, items: &[T], each: 
     let cp = Slots(cur.as_mut_ptr());
     par(threads, &idx, |&i| {
         let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
-        each(&items[i], &mut |u, _, w| c[u >> BS] += 1 + (w >= esc) as u32);
+        items[i].each(|u, _, w| c[u >> BS] += 1 + (w >= esc) as u32);
     });
     let (mut start, mut acc) = (vec![0usize; nb + 1], 0u32);
     for b in 0..nb {
@@ -268,7 +294,7 @@ fn csr<T: Sync>(n: usize, threads: usize, vb: u32, esc: u32, items: &[T], each: 
     par(threads, &idx, |&i| {
         let (ep, lp) = (&ep, &lp);
         let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
-        each(&items[i], &mut |u, v, w| {
+        items[i].each(|u, v, w| {
             let (p, l) = (c[u >> BS] as usize, (u & ((1 << BS) - 1)) as u16);
             let k = store(ep, p, v, w, vb, esc);
             c[u >> BS] += k as u32;
@@ -638,24 +664,13 @@ fn main() {
     let vb = (usize::BITS - (n.max(2) - 1).leading_zeros()).max(1);
     let esc = (1u32 << (32 - vb)) - 1;
     let g = {
-        let parts = chunks(body, threads * 4);
-        let g0 = csr(n, threads, vb, esc, &parts, |&(lo, hi), emit| {
-            let mut i = lo;
-            while i < hi {
-                let (u, v) = (num(body, &mut i) as usize, num(body, &mut i) as u32);
-                emit(u, v, num(body, &mut i) as u32);
-            }
-        });
+        let g0 = csr(n, threads, vb, esc, &chunks(body, threads * 4));
         let newid = bfs_order(&g0, threads);
         qs.iter_mut().for_each(|q| *q = (newid[q.0] as usize, newid[q.1] as usize));
         relabel(&g0, &newid, threads)
     };
-    let parts = spans(n, threads * 4);
-    let r = csr(n, threads, vb, esc, &parts, |&(lo, hi), emit| {
-        for u in lo..hi {
-            g.adj(u, |v, w| emit(v as usize, u as u32, w));
-        }
-    });
+    let parts: Vec<_> = spans(n, threads * 4).into_iter().map(|(lo, hi)| (&g, lo, hi)).collect();
+    let r = csr(n, threads, vb, esc, &parts);
     let t1 = t0.elapsed();
 
     let answers: Vec<AtomicI64> = qs.iter().map(|_| AtomicI64::new(-1)).collect();
