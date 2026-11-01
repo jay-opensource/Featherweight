@@ -40,6 +40,8 @@ Local box: i5-11400H laptop (6 cores, 12 MB L3) running Docker; the scoring box 
 | 26 | cdf5158 | Branch-free label check (one signed compare); query side -40 lines; BFS prefetches claim words 4 ahead; calloc'd id/degree arrays | run-f73ce8bfc7b4 | 0.134 | 64.1 | 562 | 71.4 |
 | 27 | 64d75ea | Build side in 47 fewer lines (layout returns an edge-less Graph, bfs_order through par(), branch-free store) | run-fb48d5373f7f | 0.136 | 64.3 | 515 | 71.5 |
 | 28 | b4be5d5 | 33 more lines off both sides (tagged spans(), checked_shl in num, Pages literal, shorter pop) | run-0ca006a8a756 | 0.145 | 63.8 | 482 | 71.1 |
+| 29 | bb33a01 | Same D code as step 28 (documentation change): a second sample of the board's noise | run-9e4cb2237b67 | 0.140 | 64.1 | 482 | 71.4 |
+| 30 | 8c1f26b | plain() on a BTreeSet that stops at t; exact empty output; bidir verdict in one line | run-adf13f996262 | 0.136 | 64.8 | 477 | 71.7 |
 
 ## How it works now
 
@@ -126,6 +128,31 @@ out-edges of u's neighbours (97% of edge pairs are two-way), with no atomics and
 array: exact, and 5 MB lighter, but the reverse phase took 128 ms instead of 33 ms on 12 threads,
 because every pulled edge reads a neighbour's adjacency (88% of edges span 64 or more ids).
 
+**Board noise.** Steps 28 and 29 ran identical D code: 0.1447 s and 0.1405 s. A single run cannot
+resolve changes under ~3-4%, so query-side changes were decided on hardware counters (perf
+user-space cycles/instructions/branch misses in docker, interleaved A/B), which reproduce within a
+few percent on a loaded machine, and then confirmed on the board.
+
+**Where the query phase went (interleaved counters, 1 thread, each against the previous commit).**
+The radix heap made 32.5M redistributions per pass (3.76 per push); the Dial queue: CPU 0.846.
+Prefetching a node's edges when it is queued: CPU 0.844 (1 thread), 0.923 (12 threads); after
+it a warm rerun of the same query costs 89% of a cold one, so the loop is compute-bound. 16-byte
+queue entries [label index, first slot, end slot] let a pop read the label and the edges without
+any lookup: ~0.96. The step generic over the side: instructions 0.866, cycles 0.955 (the runtime
+side index cost cmov selection and register spills). BMI2: instructions 0.900, cycles 0.910. One
+signed compare for "settled or no better": branch misses 0.875, cycles 0.937. Overall since step
+15: single-thread query 553.6 -> 308.1 ms, 12-thread query 104.1 -> 56.0 ms, with 642 -> 469 lines.
+What remains per settled node: ~260 instructions, 2.3 branch misses, IPC ~1; the misses come from
+the relaxation outcome and the edge-loop exit.
+
+**Exactness of the 31-bit labels and the W = 8192 Dial window.** Edges of weight >= W are skipped;
+the smallest skipped length is kept, and the query falls back to the u64 search only if that
+length is below the answer found (proof in the comment on `bidir`). A randomized self-test (300
+graphs of 50-4,050 nodes, 120,000 queries, 8% zero weights, weights around W, in [W, 2^31) and
+>= 2^31, no-in-edge sources, s = t) compared bidir + fallback with an independent BinaryHeap
+Dijkstra: no mismatch (33,400 fallbacks exercised). On the full set 10 queries fall back, ~1.3 ms
+in total on one thread.
+
 **Locality does not depend on the number of BFS regions.** Label pages touched over all queries,
 counted deterministically: 1 region 362,199; 4 regions 362,355; 12 regions 363,088; 24 regions
 370,259; 48 regions 366,506. The parallel BFS costs no locality.
@@ -154,6 +181,13 @@ with fewer queued entries instead of the smaller key, 7.15M.
 | 256-node buckets with a u8 side array in the CSR builder | -2.7 MB | M 63.4 -> 60.7 MB, but text fill 15.5 -> 31.4 ms, reverse fill 8.6 -> 17.6 ms | ~6,800 append streams per work item thrash the write path |
 | Serial layout() | -5 lines | ~5-6 ms per call x 3 calls on one thread | the parallel version is 1-2 ms per call |
 | Fixed M_MMAP_THRESHOLD of 1 MB | freed blocks return to the OS | M 67.1 -> 64.1 MB locally, reverse phase min 25 -> 32 ms | fresh mappings fault on every reuse |
+| Split a fallback at s (min over out-edges of w + bidir(v, t)) | avoid the u64 search | +9.6% instructions, +12% CPU; the two real cases took 41 and 53 ms vs 0.8 + 0.5 ms | bidir from the heads of 2^32-weight edges explores large balls |
+| Branch-free free-list allocation in the Dial queue | fewer mispredicts | branch misses -2.6%, instructions +4.5% | |
+| Side-choice hysteresis (switch only when queue sizes differ by H) | fewer mispredicts | unchanged at H = 1 and 8; every alternative side rule settled more nodes (7.138-7.351M vs 7.123M) | |
+| Drop `#[inline(always)]` on the queue and step functions | -6 lines | +38% instructions, +12% cycles | LLVM does not inline them by itself |
+| Page allocation out of line (`#[cold]`) | smaller hot loop | +3.5% cycles | |
+| Dial window W = 4096 | smaller bucket array | cycles -1.2% (noise) | kept 8192 as margin for unseen weights 4096-8191 |
+| PGO (profile from generator seeds 21 and 22, atomic counters) | -3..7% | instructions +0.1%, branch misses +6%, cycles -0.2..+2.4% | the hot loops are memory-bound and already inlined |
 | Reverse graph through atomic countdown cursors (step 16) | 5 MB less than the bucketed builder's u16 side array | board 0.208 s vs 0.178 s, 72.2 vs 77.0 MB | on the scoring box the locked updates cost far more than the memory saved |
 
 ## Correctness
