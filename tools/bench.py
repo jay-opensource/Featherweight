@@ -71,7 +71,7 @@ def run_once(track, tag, data, rel, threads):
         sys.exit(f"solution exited {code}; stderr={r.stderr[-1500:]!r}")
     if files.strip("/") != OUTPUT[track]:
         sys.exit(f"/out must hold exactly {OUTPUT[track]}, found {files!r}")
-    h = [l.split()[0] for l in r.stdout.splitlines() if l.endswith(OUTPUT[track])][0]
+    h = [l.split()[0] for l in r.stdout.splitlines() if l.endswith("/out/" + OUTPUT[track])][0]
     return int(ns) / 1e6, int(peak) / 1e6, h, r.stderr.strip()
 
 
