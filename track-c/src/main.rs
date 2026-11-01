@@ -29,6 +29,13 @@ fn zeroed<T>(n: usize) -> &'static [T] {
     unsafe { std::slice::from_raw_parts(p as *const T, n) }
 }
 
+/// Map the pages under s writable now (MADV_POPULATE_WRITE). Threads that touch a shared table
+/// first would each fault on its pages, twice when a read comes first (the zero page, then a copy),
+/// and queue on the same page-table lock.
+fn populate<T>(s: &[T]) {
+    unsafe { madvise(s.as_ptr() as *mut u8, std::mem::size_of_val(s), 23) };
+}
+
 /// A file mapped read-only over zeroed memory, so loads may run up to 4 KB past its end. The page
 /// cache is not charged to us; a copy would be.
 fn map(path: &str) -> &'static [u8] {
@@ -215,8 +222,12 @@ impl Shared<'_> {
         if ids.0 == ids.1 {
             *ids = (next.fetch_add(64, Relaxed), 0);
             ids.1 = ids.0 + 64;
+            if ids.0 % 4096 == 0 {
+                let page = self.4.chunks(256 * 64).nth(ids.0 as usize / 4096); // its bits
+                page.map(populate);
+            }
         }
-        let o = top.fetch_add(nw * (n > 16) as usize, Relaxed);
+        let o = (n > 16).then(|| top.fetch_add(nw, Relaxed)).unwrap_or(0);
         if ids.0 as usize >= buckets.len() * 3 / 8 * 7 || o + nw > long.len() {
             next.store(u32::MAX / 2, Relaxed);
             w.fetch_xor((BUSY as u64) << shift, Release);
@@ -318,12 +329,13 @@ fn record(b: &[u8], rs: usize, lf: usize, quotes: u32, sh: &Shared) -> Rec {
     Rec(key, s, n, h, region, id, cents, nb, tb)
 }
 
-/// Parse the records that start in b[start..end) (start is a record start). Returns where parsing
-/// stopped: exactly `end` when `end` is a record boundary.
-fn chunk(b: &[u8], start: usize, end: usize, sh: &Shared, me: &mut Local) -> usize {
+/// Parse the records that start in b[start..end) and end in b[..valid) (start is a record start).
+/// Returns where parsing stopped: at `end` or later if `end` is passed, else at the first record
+/// that is not complete (or `valid`).
+fn chunk(b: &[u8], start: usize, end: usize, valid: usize, sh: &Shared, me: &mut Local) -> usize {
     let (mut base, mut carry, mut quotes, mut qrs, mut rs) = (start, 0u64, 0u32, 0u32, start);
     let (mut batch, mut nb) = ([Rec::default(); 32], 0);
-    'blocks: while rs < end && base < b.len() {
+    'blocks: while rs < end && base < valid {
         let (lo, hi) = (load(b, base), load(b, base + 32));
         let q = eq(lo, b'"') | eq(hi, b'"') << 32;
         let x = inside(q) ^ carry;
@@ -360,15 +372,11 @@ fn flush(b: &[u8], batch: &[Rec], sh: &Shared, (agg, ids, pend): &mut Local) {
     }
 }
 
-/// k + 1 cut points from `from` to b.len(): the first line start at or after each k-th of the way,
-/// found by the shape of the data, a LF followed by a digit or a byte order mark. Inside quotes a
-/// LF is always followed by a letter or a quote (spec 2.2), and `run` still proves every cut.
-fn cuts(b: &[u8], from: usize, k: usize) -> Vec<usize> {
-    let start = |i: usize| at(b, i - 1) == b'\n' && (at(b, i).is_ascii_digit() || at(b, i) == 0xEF);
-    let line = |j: usize| ((from + (b.len() - from) * j / k).max(1)..b.len()).find(|&i| start(i));
-    let mut v: Vec<usize> = (1..=k).map(|j| line(j).unwrap_or(b.len())).collect();
-    v.insert(0, from);
-    v
+/// Whether a line starts at b[i], by the shape of the data: a LF followed by a digit or a byte
+/// order mark. Inside quotes a LF is always followed by a letter or a quote (spec 2.2), and `run`
+/// still proves every record start found this way.
+fn line_start(b: &[u8], i: usize) -> bool {
+    at(b, i - 1) == b'\n' && (at(b, i).is_ascii_digit() || at(b, i) == 0xEF)
 }
 
 /// Run `f` on `threads` threads and collect the results.
@@ -388,33 +396,40 @@ fn jobs(next: &AtomicUsize, n: usize) -> impl Iterator<Item = usize> + '_ {
 /// (never needed on generated data) uses one thread and a dictionary 4 times larger. None if a cut
 /// was not a record boundary or the dictionary filled up.
 ///
-/// Why a cut is proved: the first range starts right after the header, a true record start in
-/// the outside-quotes state, so its parse is exact and stops at the first record boundary at or
-/// after its end. If that equals the next cut, the next cut is a true record start too, and so on
-/// by induction. A cut inside a quoted field shows up as a range that ends elsewhere.
-fn run(b: &[u8], tab: &[AtomicU8], attempt: u32, threads: usize) -> Option<Vec<Agg>> {
+/// Why a start is proved: job 0 starts right after the header (the first line start after it), a
+/// true record start in the outside-quotes state, so its parse is exact and stops at the first
+/// record boundary at or after cut(1). If that equals where job 1 started (by the shape of the data), job 1 started at a true
+/// record start too, and so on by induction. A start inside a quoted field shows up as a job whose
+/// predecessor stopped elsewhere. The starts are found by the jobs themselves, in parallel.
+fn run(b: &[u8], from: usize, tab: &[AtomicU8], attempt: u32, threads: usize) -> Option<Vec<Agg>> {
     let threads = if attempt > 0 { 1 } else { threads };
     let cap = 3 << (14 + 2 * attempt);
     if attempt > 0 {
         eprintln!("warning: parallel run rejected; attempt {attempt} on one thread, {cap} buckets");
     }
-    let k = if threads > 1 { threads * 48 } else { 1 };
-    let cut = cuts(b, find(b, 0, b'\n') + 1, k);
+    let (k, len) = (if threads > 1 { threads * 48 } else { 1 }, b.len());
+    let cut = |j: usize| from + (len - from) * j / k; // job j's records start at or after cut(j)
     let bits = zeroed((cap * 3 / 8 * 7 / 4096 + 1) * 256 * 64);
     let locks = (0..64).map(|_| Mutex::new(())).collect();
     let dict = (zeroed(cap), zeroed(1 << 23), (0.into(), 0.into()));
     let sh = Shared(tab, dict.0, dict.1, dict.2, bits, locks);
-    let (ends, next): (Vec<AtomicUsize>, _) = (cut.iter().map(|_| 0.into()).collect(), 0.into());
+    let ends: Vec<[AtomicUsize; 2]> = (0..k).map(|_| Default::default()).collect();
+    let (next, me) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let aggs = par(threads, || {
+        let t = me.fetch_add(1, Relaxed); // this thread's share of the dictionary to map
+        dict.0.chunks(cap / threads + 64 & !63).nth(t).map(populate);
         let mut me: Local = ([NEW; 256], (0, 0), ([[0; 64]; 64], [0; 64]));
-        for j in jobs(&next, cut.len() - 1) {
-            ends[j].store(chunk(b, cut[j], cut[j + 1], &sh, &mut me), Relaxed);
+        for j in jobs(&next, k) {
+            let start = (cut(j)..len).find(|&i| line_start(b, i)).unwrap_or(len);
+            let stop = chunk(b, start, cut(j + 1), len, &sh, &mut me);
+            ends[j][0].store(start, Relaxed);
+            ends[j][1].store(stop, Relaxed);
         }
         (0..64).for_each(|r| sh.apply(&me.2 .0[r], &mut me.2 .1[r], r, &mut me.0));
         me.0
     });
     let overfull = sh.3 .1.load(Relaxed) as usize >= cap * 3 / 8 * 7;
-    if overfull || (1..cut.len() - 1).any(|j| ends[j - 1].load(Relaxed) != cut[j]) {
+    if overfull || (1..k).any(|j| ends[j - 1][1].load(Relaxed) != ends[j][0].load(Relaxed)) {
         return None;
     }
     let mut total = vec![NEW; 256];
@@ -441,12 +456,14 @@ fn main() {
     let rg = map("/data/regions.csv");
     let tab: &[AtomicU8] = zeroed(1 << 24); // region ids are below 10^7; only touched pages count
     let (codes, seen) = (Mutex::new(vec![[255u8; 3]]), zeroed::<AtomicU8>(1 << 15));
-    let cut = cuts(rg, find(rg, 0, b'\n') + 1, threads * 4);
-    let next = AtomicUsize::new(0);
+    let last = AtomicUsize::new(0); // the largest region id
+    let (from, k, next) = (find(rg, 0, b'\n') + 1, threads * 4, AtomicUsize::new(0));
+    let cut = |j: usize| from + (rg.len() - from) * j / k; // job j's lines start at or after cut(j)
     par(threads, || {
-        for j in jobs(&next, cut.len() - 1) {
-            let mut p = cut[j];
-            while p < cut[j + 1] {
+        for j in jobs(&next, k) {
+            let line = (cut(j)..rg.len()).find(|&i| line_start(rg, i));
+            let (mut p, mut region) = (line.unwrap_or(rg.len()), 0);
+            while p < cut(j + 1) {
                 let c = find(rg, p, b',');
                 let code = unsafe { _pext_u64(word(rg, c + 1), 0x1F1F1F) } as usize;
                 if seen[code].load(Acquire) == 0 {
@@ -457,16 +474,19 @@ fn main() {
                         seen[code].store(list.len() as u8 - 1, Release);
                     }
                 }
-                let region = numbers([word(rg, c - 8), 0, 0], [c - p, 0, 0])[0] as usize;
+                region = numbers([word(rg, c - 8), 0, 0], [c - p, 0, 0])[0] as usize;
                 tab[region].store(seen[code].load(Acquire), Relaxed);
                 p = c + 5;
             }
+            last.fetch_max(region, Relaxed); // ids ascend
         }
     });
     let codes = codes.into_inner().unwrap();
+    let tab = &tab[..=last.into_inner()]; // ids above it are unknown without a lookup
 
     let rc = map("/data/records.csv");
-    let total = (0..).find_map(|k| run(rc, tab, k, threads)).unwrap();
+    let from = find(rc, 0, b'\n') + 1; // the first record
+    let total = (0..).find_map(|k| run(rc, from, tab, k, threads)).unwrap();
     let mut order: Vec<usize> = (0..codes.len()).filter(|&g| total[g][0] > 0).collect();
     order.sort_by_key(|&g| codes[g]); // _UNMATCHED is [255; 3]: last
     let mut text = String::new();
