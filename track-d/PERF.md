@@ -14,8 +14,8 @@ Local box: i5-11400H laptop (6 cores, 12 MB L3) running Docker; the scoring box 
 | Reference (Python) | | | 72.69 s | 893 MB | 43 | 0 |
 | First correct entry | run-811fef4b3870 | 941a1e3 | 1.340 s | 230.6 MB | 141 | 45.37 |
 | Before the final rounds (b1046aa) | run-3e0a39c47769 | b1046aa | 0.1337 s | 64.07 MB | 454 | 72.15 |
-| **Best** | **run-b28ea11afb16** | **96c67ed** | **0.1253 s** | **62.50 MB** | **458** | **72.93** |
-| **The shipped code** | **run-14368b934a65** | **d9663e9** | **0.1270 s** | **62.40 MB** | **440** | **72.92** |
+| **Best, and the shipped code** | **run-ad2a7cbc4bf1** | **b7db2f2** | **0.1223 s** | **62.39 MB** | **454** | **73.23** |
+| Earlier best (before D6) | run-b28ea11afb16 | 96c67ed | 0.1253 s | 62.50 MB | 458 | 72.93 |
 | The same build code, other runs | run-665c3b98b9ee, run-1a26c84a5351, run-29a3a688b9e1 | 48198af, b5f8df8, a8fb336 | 0.1331, 0.1361, 0.1402 s | 63.28, 62.68, 62.52 MB | 430 | 72.43, 72.23, 71.92 |
 
 The best run is 580 times faster than the reference with 14.3 times less memory; the shipped code, 572 times and 14.3 times. Points are the
@@ -80,6 +80,7 @@ operating point 1% of T is worth about 0.11 points, 1% of M about 0.04, and 10 l
 | 47 | a8fb336 | Same D code as step 44, on a slow stretch of the box (unchanged C code ran 31.8 ms instead of 29-30 ms in the same push) | run-29a3a688b9e1 | 0.1402 | 62.5 | 430 | 71.92 |
 | 48 | 96c67ed | Text parsed once with overflow restart; BFS claims in a bitset; helper inlining (7f21d9f) + far pairs first and the capped `via` fallback (D4) | run-b28ea11afb16 | 0.1253 | 62.5 | 458 | 72.93 |
 | 49 | d9663e9 | 18 fewer lines (b764d34): `store`, `Dial::min`/`clear`, `Pages::clear` inlined into their one caller, the query loop a while-let; behaviour unchanged | run-14368b934a65 | 0.1270 | 62.4 | 440 | 72.92 |
+| 50 | b7db2f2 | D6 (a604076): the relabelled build counts slots per node from g0's offsets; the reverse graph's counts are collected per 8192-node bucket in the relabel finish (nb x nb table, 181 KB), so the reverse count pass is gone. Local: instructions 0.964, user cycles 0.969 | run-ad2a7cbc4bf1 | 0.1223 | 62.4 | 454 | 73.23 |
 
 ## How it works now
 
