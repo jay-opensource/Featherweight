@@ -1,4 +1,4 @@
-# The scoring box is an i5-13500 (Raptor Lake: AVX2, BMI2, PCLMULQDQ). A static binary skips the
-# dynamic loader's work at exec, which is inside the timed window.
+# The scoring box is an i5-13500 (AVX2, BMI2, PCLMULQDQ, AES-NI). Experiment: the 02:56 settings
+# (x86-64-v3, dynamically linked), which ran 43.7 ms on the board where alderlake + crt-static runs 48.
 [build]
-rustflags = ["-C", "target-cpu=alderlake", "-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+pclmulqdq,+aes"]
