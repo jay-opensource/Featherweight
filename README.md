@@ -1,3 +1,23 @@
+# Featherweight: Speed Demon 2026
+
+Team Featherweight's entry for Tracks A, C and D of [Speed Demon 2026](https://speeddemon.dev). Each
+track is one Rust file with no dependencies. Our thesis for all three: **little memory per unit of
+speed**. Inputs are mapped or read in small pieces, never copied whole; every table is sized to the
+data and charged only where touched; and the scoring box's own costs (2 MB pages charged whole,
+page-table locks, exit teardown on one core) are measured and designed around.
+
+| Track | What it does | Best board run | T | M | Points | Docs |
+|---|---|---|---|---|---|---|
+| A: Ingest | per-hour, per-endpoint latency percentiles from a 239 MB log | run-ac86c3ef1a30 | 18.92 ms | 20.45 MB | 84.48 | [README](track-a/README.md), [PERF](track-a/PERF.md) |
+| C: Join | a hostile 193 MB CSV joined to a region table, aggregated per country | run-be0296de8c66 | 30.44 ms | 12.04 MB | 77.67 | [README](track-c/README.md), [PERF](track-c/PERF.md) |
+| D: Traverse | 2,000 shortest paths on a 1.7M-node road graph | run-3e0a39c47769 | 133.7 ms | 64.07 MB | 72.15 | [README](track-d/README.md), [PERF](track-d/PERF.md) |
+
+Each `PERF.md` lists every board run with its ID, the measurements behind each design choice,
+what we found about the scoring box, and the experiments that lost. `tools/bench.py` builds a
+track and runs it with the board's container flags; `check.py` is the organisers' checker.
+
+The rest of this file is the organisers' starter README.
+
 # Speed Demon 2026 starter
 
 A working entry for all four tracks of [Speed Demon 2026](https://speeddemon.dev). Each `track-*` folder holds the organisers' naive Python reference, packaged the way the live board builds and runs it. Use it to check your setup end to end, then replace the reference with your own code.

@@ -7,7 +7,24 @@ one change, measured on the live board (run ID) and, for its mechanism, locally 
 Local box: i5-11400H laptop (6 cores, 12 MB L3) running Docker; the scoring box is an i5-13500
 (24 MB L3, 2.5 GHz fixed). Local times are for A/B decisions only; the run IDs are the record.
 
+## Result
+
+| | Run ID | Commit | T | M | S | Points |
+|---|---|---|---|---|---|---|
+| Reference (Python) | | | 72.69 s | 893 MB | 43 | 0 |
+| First correct entry | run-811fef4b3870 | 941a1e3 | 1.340 s | 230.6 MB | 141 | 45.37 |
+| **Best, and the shipped code** | **run-3e0a39c47769** | **b1046aa** | **0.1337 s** | **64.07 MB** | **454** | **72.15** |
+| The same code, later runs | run-2e5b37934e90, run-74ad01ee4c63 | 477f874, bbee872 | 0.1337 s, 0.1432 s | 64.66, 64.91 MB | 454 | 72.11, 71.35 |
+
+The best run is 544 times faster than the reference with 13.9 times less memory. Points are the
+board's: `50·log10(K)` with K = (T_ref/T)^0.5 × min(50, M_ref/M)^0.2 × min(1, S_ref/S)^0.15. At this
+operating point 1% of T is worth about 0.11 points, 1% of M about 0.04, and 10 lines about 0.07.
+
 ## Board runs
+
+"Same D code" rows re-ran unchanged D code (another track had changed); they sample the noise.
+
+<!-- New runs: append a row with the next step number, and update the Result table above. -->
 
 | Step | Commit | Change | Run ID | T (s) | M (MB) | S | Points |
 |---|---|---|---|---|---|---|---|
@@ -42,18 +59,39 @@ Local box: i5-11400H laptop (6 cores, 12 MB L3) running Docker; the scoring box 
 | 28 | b4be5d5 | 33 more lines off both sides (tagged spans(), checked_shl in num, Pages literal, shorter pop) | run-0ca006a8a756 | 0.145 | 63.8 | 482 | 71.1 |
 | 29 | bb33a01 | Same D code as step 28 (documentation change): a second sample of the board's noise | run-9e4cb2237b67 | 0.140 | 64.1 | 482 | 71.4 |
 | 30 | 8c1f26b | plain() on a BTreeSet that stops at t; exact empty output; bidir verdict in one line | run-adf13f996262 | 0.136 | 64.8 | 477 | 71.7 |
+| 31 | c8c57cd | Same D code as step 30 | run-e8593678e368 | 0.138 | 63.4 | 477 | 71.7 |
+| 32 | 5b3321f | 00480a6: pick the side with a match on the length test (one line fewer, instructions 1.000) | run-0a78b7adb065 | 0.137 | 64.2 | 476 | 71.7 |
+| 33 | b1f2ed7 | Same D code as step 32 | run-2b9a8fa8b15f | 0.138 | 64.5 | 476 | 71.6 |
+| 34 | 1803e34 | 19 fewer lines (c198d4e: BFS instructions 0.966, the rest 1.000); text work items are plain byte ranges, no `chunks()` | run-be28cd019adf | 0.139 | 64.2 | 450 | 71.7 |
+| 35 | 79c2804 | Same D code as step 34 | run-0bcb81b96186 | 0.144 | 63.4 | 450 | 71.4 |
+| 36 | 65ff880 | Experiment: parse graph.txt once (estimated room per segment, exact retry); reverted | run-8ae511632bee | 0.149 | 64.2 | 457 | 70.9 |
+| 37 | b1478c2 | Experiment: each thread faults in its own slice of the random-write arrays first; reverted | run-1a45246e7ac5 | 0.140 | 64.8 | 464 | 71.6 |
+| 38 | a50cee9 | Both experiments reverted (the step-34 code) | run-924782b8b087 | 0.140 | 64.1 | 450 | 71.7 |
+| 39 | d163280 | Same D code as step 34 | run-a0fc8314797f | 0.141 | 63.4 | 450 | 71.7 |
+| 40 | b1046aa | Text and both graphs released on all threads before exit; queries from sources without in-edges first; one label directory per side; the reverse graph reuses g0's edge array; the search loop steps inside its condition | run-3e0a39c47769 | 0.1337 | 64.1 | 454 | 72.15 |
+| 41 | 477f874 | Same D code as step 40 | run-2e5b37934e90 | 0.1337 | 64.7 | 454 | 72.11 |
+| 42 | bbee872 | Same D code as step 40 (the shipped commit) | run-74ad01ee4c63 | 0.1432 | 64.9 | 454 | 71.35 |
 
 ## How it works now
 
-1. **Parse** `graph.txt` from an `mmap` (page cache, not charged to us) in two parallel passes:
-   count each node's slots, then fill them through per-node countdown cursors.
+1. **Parse** `graph.txt` from a read-only `mmap` (the page cache is not charged to us). The text is
+   split into 48 byte ranges; each work item parses the lines that start inside its range, numbers
+   8 bytes at a time (SWAR). The CSR is built in buckets of 8,192 nodes in two passes over the
+   items: count slots per bucket, then append each slot to its bucket's region with the node's
+   place in the bucket in a u16 side array. Each bucket is then reordered by node through a 94 KB
+   scratch copy. No atomics, and no store outside the bucket being worked on.
 2. **Relabel** nodes in breadth-first order: each thread grows its own region from a seed and
-   claims nodes with a CAS; then the graph is copied into the new order. Neighbours in the road
-   network become neighbours in memory.
-3. **Reverse graph** built from the relabelled one, for the backward search.
-4. **Queries**, 12 threads pulling from an atomic counter: two-ended Dijkstra, forward from s and
-   backward from t, expanding the side with fewer queued entries, stopping when the two queue
-   minimums together reach the best meeting length mu.
+   claims nodes with a CAS. The BFS prefetches offsets 16 nodes ahead, edge lists 8 ahead and the
+   claim words of the targets 4 ahead. The graph is then copied into the new order, prefetching
+   where node u + 8 goes. Neighbours in the road network become neighbours in memory.
+3. **Reverse graph**, built from the relabelled one with the same bucketed builder, written into
+   the first graph's already-mapped edge array (it has exactly as many slots).
+4. **Queries**, 12 threads pulling from an atomic counter, those from sources without in-edges
+   first: two-ended Dijkstra, forward from s and backward from t, expanding the side with fewer
+   queued entries, stopping when the two queue minimums together reach the best meeting length mu.
+   The 10 queries whose answer could need more than 31 bits fall back to a one-ended u64 Dijkstra.
+5. **Exit.** The answers are written, then every thread drops its share of the text mapping and of
+   both edge arrays (`MADV_DONTNEED`), and the process exits without freeing anything else.
 
 ### Memory layout (n = 1,740,512, m = 5,000,000)
 
@@ -62,8 +100,24 @@ Local box: i5-11400H laptop (6 cores, 12 MB L3) running Docker; the scoring box 
 | Edge slot | 4 B: `target:21 \| weight:11` | 99.93% of weights fit 11 bits; a larger weight puts the escape value 2047 in the slot and the full u32 in the next slot (3,496 such edges) |
 | Node offset | 1 B + 1/16 of a u32 | u32 base per block of 16 nodes + u8 offset inside the block (max in-block offset measured: 61) |
 | Forward + reverse graph | 2 x 22.2 MB | |
-| Labels, per thread | pages of 64 node ids, per side, from a pool | BFS order keeps a search inside few pages; measured pool over 12 threads: about 9 MB |
-| Queue, per thread | radix heap, 8-byte entries | about 3.5 MB over 12 threads |
+| Labels, per thread | pages of 64 node ids per side from a pool, found through a u16 page number per 64 ids (one directory per side) | BFS order keeps a search inside few pages; measured pool over 12 threads: about 9 MB |
+| Queue, per thread and side | Dial queue: 8,192 bucket heads (32 KB) and a pool of 16-byte entries [label index, first edge slot, end slot, next] that reuses popped entries | a pop starts on the label and the edges without a lookup |
+| Build only | a u16 bucket position per slot (about 10 MB), u16 degrees, the 7 MB id array | freed before the queries |
+
+### Where the time goes
+
+Local, 12 threads, on the loaded laptop, from the commits that measured each phase:
+
+| Phase | Time | Measured at |
+|---|---|---|
+| Text parse + CSR | 22.1 ms (min of 30 in-process rounds) | 1803e34 |
+| Relabel copy | 22.5 ms (median) | a68518e |
+| Reverse CSR | 10.8 ms (min of 30) | 1803e34 |
+| Whole build: parse, BFS, copy, reverse | 97.2 ms (median) | a68518e |
+| Queries | 56.0 ms (308.1 ms on one thread) | after step 30 |
+| From the write to process end | 3.6 ms (median; 8.5 ms before step 40) | f29f0fa |
+
+The board's T for the shipped code is 0.134-0.143 s.
 
 ## The steps, with what each one taught
 
@@ -109,10 +163,10 @@ then sorted by node through a 94 KB scratch copy. Local build 133-152 -> 108-114
 0.200 -> 0.178 s. The u16 side array costs about 5 MB while building.
 
 **Steps 17-23: the queue and the last microseconds.** A Dial queue (one bucket per distance
-modulo W = 4096, weights in the main body are below ~8,100) beat the radix heap by 3.5% on the
-board but added 82 lines, which cost exactly what it gained; the compact version (16-byte entries,
-heavy edges skipped with a recorded lower bound, see the proof in `bidir`) kept the speed at 626
-lines. Making one search step generic over the side (forward/backward are compile-time constants)
+modulo W = 4096, with a heap for heavier keys) beat the radix heap by 3.5% on the board but added
+82 lines, which cost exactly what it gained. The compact version of step 20 kept the speed at 626
+lines: W = 8192, above the largest main-body weight (about 8,100), 16-byte entries, no heap, and
+edges of weight W or more skipped with a recorded lower bound (see the proof in `bidir`). Making one search step generic over the side (forward/backward are compile-time constants)
 cut instructions per query by 13%. Process exit was 13 ms of the local wall time: the kernel unmaps
 everything on one core after the last write, and freeing the big arrays one by one came before
 that; `std::process::exit(0)` right after writing the answers removed about 5 ms of it.
@@ -128,10 +182,43 @@ out-edges of u's neighbours (97% of edge pairs are two-way), with no atomics and
 array: exact, and 5 MB lighter, but the reverse phase took 128 ms instead of 33 ms on 12 threads,
 because every pulled edge reads a neighbour's adjacency (88% of edges span 64 or more ids).
 
-**Board noise.** Steps 28 and 29 ran identical D code: 0.1447 s and 0.1405 s. A single run cannot
-resolve changes under ~3-4%, so query-side changes were decided on hardware counters (perf
-user-space cycles/instructions/branch misses in docker, interleaved A/B), which reproduce within a
-few percent on a loaded machine, and then confirmed on the board.
+**Step 34: fewer lines, same instructions.** c198d4e cut 19 formatted lines with the same code
+paths (perf counters against 00480a6: BFS instructions 0.966, every other phase 1.000). 1803e34
+made the text work items plain byte ranges: an item parses the lines that start inside its range,
+so the separate `chunks()` pass is gone (text-phase instructions 0.996). 469 → 443 lines.
+
+**Step 40: the last milliseconds were at the edges of the run.** Five changes, each measured
+locally as a whole-process A/B (12 threads, ABBA rounds in one container), shipped together:
+- **Exit on all threads.** The kernel's exit unmaps every page of the process on one core. A
+  timed serial `madvise` took 10.7 ms for the 92 MB text mapping and 3.2 + 2.6 ms for the two edge
+  arrays. Now every thread drops its share of those three regions (`MADV_DONTNEED`) right after the
+  answers are written: from the write to process end 8.45 → 3.62 ms (median of 16 rounds, paired
+  ratio 0.44), process 147.3 → 140.3 ms (paired 0.977), every earlier phase unchanged.
+- **Slow queries first.** A source without in-edges leaves through edges near 2^32, so its query
+  takes the one-ended u64 search: 1.2 and 0.6 ms on seed 1, but 25-90 ms and 10-23 ms on holdout
+  seed 11. If such a query comes late in the file, it runs alone at the end of the query phase. The
+  queries are now pulled with those sources first (the answers stay in file order). On seed 11
+  with those two queries moved to the end of the file: query phase 74.8 → 67.0 ms (median, paired
+  0.83); seed 1 neutral (paired 0.97, instructions 1.000).
+- **One label directory per side.** With both sides in one array, every backward lookup
+  recomputed the half offset from the array's length. Query side: instructions 0.986, cycles
+  0.980, thread CPU time 0.912.
+- **The reverse graph takes over g0's edge array.** It has exactly as many slots, so the 20 MB
+  already mapped are reused instead of unmapped on the main thread (1.6 ms) and faulted in again.
+  Copy phase 24.70 → 22.52 ms (paired 0.892), build 100.3 → 97.2 ms (paired 0.964), memory.peak
+  unchanged (64.0-65.2 MB both).
+- **The search loop steps inside its condition** (no `go` flag): query instructions 0.981,
+  cycles 0.982.
+
+Board: 0.1337 s (run-3e0a39c47769), against 0.139-0.144 s for the step-34 code in four runs
+(steps 34, 35, 38, 39); the same code ran 0.1337 s again at step 41.
+
+**Board noise.** Identical D code gave 0.1447 / 0.1405 s (steps 28-29), 0.1364 / 0.1381 s
+(30-31), 0.1368 / 0.1378 s (32-33), 0.1394 / 0.1441 / 0.1402 / 0.1409 s (34, 35, 38, 39) and
+0.1337 / 0.1337 / 0.1432 s (40-42). A single run cannot resolve changes under about 4%, and one in
+three runs is off by 7%. So query-side changes were decided on hardware counters (perf user-space
+cycles, instructions and branch misses in docker, interleaved A/B), which reproduce within a few
+percent on a loaded machine, and then confirmed on the board.
 
 **Where the query phase went (interleaved counters, 1 thread, each against the previous commit).**
 The radix heap made 32.5M redistributions per pass (3.76 per push); the Dial queue: CPU 0.846.
@@ -159,6 +246,28 @@ counted deterministically: 1 region 362,199; 4 regions 362,355; 12 regions 363,0
 
 **Settled nodes over all 2,000 queries:** one-ended 23.2M; two-ended 7.38M; expanding the side
 with fewer queued entries instead of the smaller key, 7.15M.
+
+## Findings specific to the scoring box
+
+- **THP "always" and memory.peak** (steps 4-6, 24-25). The box backs anonymous memory with 2 MB
+  pages on first touch, and `memory.peak` charges a whole 2 MB page for its first touched byte;
+  the laptop runs THP "madvise". That was the board's 77 MB against the laptop's 59 MB. While the
+  searches jumped across 22 MB of randomly numbered nodes, the graph needed its 2 MB pages (THP off
+  cost 17% of time). After BFS relabelling it no longer did, and one `prctl(PR_SET_THP_DISABLE)`
+  gave 0.145 → 0.142 s and 76.5 → 64.3 MB.
+- **Page cache is charged to whoever faults it in.** `/data` is in the page cache before the run
+  starts, so `graph.txt` is mapped read-only rather than copied: a heap copy of the 88 MB file
+  would cost more than our whole M. `MAP_POPULATE` was equal or worse: it runs on one thread before
+  the parallel passes.
+- **Locked instructions cost more on the box.** Building the reverse graph through atomic
+  countdown cursors saved 5 MB but ran 0.208 s against 0.178 s (step 16). Every builder since is
+  lock-free.
+- **Exit teardown runs on one core.** Exit was 13 ms of the local wall time. Exiting right after
+  the write without freeing anything (step 22) removed about 5 ms of it; releasing the big regions
+  on all threads first (step 40) took the rest from 8.45 to 3.62 ms.
+- **Page-table lock on first touch.** Track C lost 11.7% of its cycles there. For D, faulting in
+  each random-write array one slice per thread first (step 37) was neutral on the board, so D does
+  not do it.
 
 ## Failure museum (measured, then rejected)
 
@@ -189,13 +298,41 @@ with fewer queued entries instead of the smaller key, 7.15M.
 | Dial window W = 4096 | smaller bucket array | cycles -1.2% (noise) | kept 8192 as margin for unseen weights 4096-8191 |
 | PGO (profile from generator seeds 21 and 22, atomic counters) | -3..7% | instructions +0.1%, branch misses +6%, cycles -0.2..+2.4% | the hot loops are memory-bound and already inlined |
 | Reverse graph through atomic countdown cursors (step 16) | 5 MB less than the bucketed builder's u16 side array | board 0.208 s vs 0.178 s, 72.2 vs 77.0 MB | on the scoring box the locked updates cost far more than the memory saved |
+| Parse graph.txt once (step 36): each (item, bucket) segment gets room for its expected share plus 6 standard deviations, with an exact retry on overflow | skip the counting pass | in-process text build min 22.1 -> 15.9 ms but reverse 10.8 -> 11.7 ms; whole runs: build min 111.9 -> 98.0 ms, median 129.9 -> 130.2 ms; board 0.149 s vs 0.139-0.144 s for the same code without it | best guess: the 27% larger staging area, the hole filters, the waits and the slower reverse count ate the saving on a quiet box |
+| Fault in each random-write array one slice per thread first (step 37) | no page-table lock contention on random first touches | board 0.140 s vs 0.139-0.144 s, +14 lines | neutral |
+| Release g0's pages on all threads before relabel drops it | parallel unmap | copy phase x1.024 | |
+| Release the text mapping at the start of the query phase | earlier unmap | queries slower | |
+| Split a fallback through s's out-neighbours, on top of the slow-queries-first order | faster fallbacks | seed 11's worst query 3-4x faster, but no gain on top of the order; +8 lines | the order already hides the slow queries |
+| Relabel copy prefetch distance 16 or 12 instead of 8 | | in-process min 25.2 / 25.3 / 25.7 ms; perf cycles equal | no signal |
+| Relabel copy in new-id order (sequential writes through the inverse permutation, three prefetch stages) | sequential stores | 12 threads min 23.4 -> 22.6 ms but q1 27.1 -> 27.2 ms; 1 thread +20% cycles, +9% instructions | each node now costs three random line reads instead of two reads and one random write |
 
 ## Correctness
 
 - Before every push: the worked example, the four tiny seeds, the four sample seeds and full
-  seed 1 all match the published sha256.
-- Concurrency: full seed 1 with 1, 2, 7 and 12 threads (`FW_THREADS`).
+  seed 1 all match the published sha256, at 1, 2, 7 and 12 threads (`FW_THREADS`). Since step 34
+  every D commit also passes the unseen generator seeds 11 and 12 and the randomized self-test
+  below.
+- Randomized self-test: 300 graphs of 50-4,050 nodes and 120,000 queries against an independent
+  BinaryHeap Dijkstra (details under "Exactness" above), with 3 work items per graph so that the
+  text cuts fall mid-line.
 - Distances above 31 bits (from a no-in-edge node, the max-weight and over-uint32 island queries)
   go through a one-ended u64 Dijkstra.
 - Nothing depends on the seed: the bit split comes from the header n, the offset block size
   shrinks if a block ever needs more than 255 slots, and degrees above 65k stop with a message.
+
+## How to reproduce
+
+```
+# build exactly as the board does and check the full set against its expected hash
+python3 check.py d --data data/d --expected <sha256>
+
+# our bench: builds the image, runs it with the board's container flags (read-only root,
+# /out on tmpfs, user 65534), prints wall time inside the container and memory.peak
+python -I tools/bench.py d --gate G1                         # worked example + 4 tiny seeds
+python -I tools/bench.py d --gate G2 --no-build              # 4 sample seeds
+python -I tools/bench.py d --gate G3 --runs 5 --no-build     # full seed 1, 5 runs after a warm-up
+python -I tools/bench.py d --gate G3 --threads 7 --no-build  # the same with FW_THREADS=7
+```
+
+The data comes from the public generator (`d_traverse.py --seed 1 --scale full`). `FW_THREADS`
+sets the thread count; the default is the available parallelism.
