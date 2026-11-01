@@ -63,12 +63,6 @@ fn mt<T>(s: &mut [T], i: usize) -> &mut T {
     unsafe { s.get_unchecked_mut(i) }
 }
 
-/// Split `b` into `k` byte ranges that start and end on line boundaries.
-fn chunks(b: &[u8], k: usize) -> Vec<(&[u8], usize, usize)> {
-    let cut = |j: usize| (b.len() * j / k..b.len()).find(|&p| p == 0 || b[p - 1] == b'\n').unwrap_or(b.len());
-    (0..k).map(|j| (b, cut(j), cut(j + 1))).collect()
-}
-
 /// `0..n` in `k` ranges, each with the tag `x`.
 fn spans<T: Copy>(x: T, n: usize, k: usize) -> Vec<(T, usize, usize)> {
     (0..k).map(|j| (x, j * n / k, (j + 1) * n / k)).collect()
@@ -168,11 +162,13 @@ trait Edges: Sync {
     fn each(&self, emit: impl FnMut(usize, u32, u32));
 }
 
-/// Lines lo..hi of the graph text.
+/// The lines of the graph text that start at a byte in lo..hi (a line that starts before lo and
+/// ends inside it belongs to the item before).
 impl Edges for (&[u8], usize, usize) {
     fn each(&self, mut emit: impl FnMut(usize, u32, u32)) {
-        let (b, mut i) = (self.0, self.1);
-        while i < self.2 {
+        let (b, lo, hi) = *self;
+        let mut i = (lo..hi).find(|&p| p == 0 || b[p - 1] == 10).unwrap_or(hi); // 10: LF
+        while i < hi {
             let (u, v) = (num(b, &mut i) as usize, num(b, &mut i) as u32);
             emit(u, v, num(b, &mut i) as u32);
         }
@@ -543,7 +539,7 @@ fn main() {
     let vb = (usize::BITS - (n.max(2) - 1).leading_zeros()).max(1);
     let esc = (1u32 << (32 - vb)) - 1;
     let g = {
-        let g0 = csr(n, threads, vb, esc, &chunks(body, threads * 4));
+        let g0 = csr(n, threads, vb, esc, &spans(body, body.len(), threads * 4));
         let newid = bfs_order(&g0, threads);
         qs.iter_mut().for_each(|q| *q = (newid[q.0] as usize, newid[q.1] as usize));
         relabel(&g0, &newid, threads)
