@@ -211,12 +211,18 @@ impl Pool {
 /// Parse the lines in b[lo..hi] into records. cur[h] is where hour h's next record goes; it sits
 /// in a B-word block, and a new block is taken when fewer than two words are left.
 fn parse(b: &[u8], lo: usize, hi: usize, names: &Names, pool: &Pool, cur: &mut [*mut u32; HOURS]) {
-    let mut p = lo;
+    // Lines come in long runs of one hour: keep that hour's cursor in `c` while "MM-DDTHH" repeats.
+    let (mut p, mut last, mut h) = (lo, 0, 0);
+    let mut c = cur[0];
     while p < hi {
-        // "MM-DDTHH": the digit pairs combine in one multiply (byte k + 10 * byte k-1).
         let w = ld8(b, p + 5);
-        let x = (w >> 24 & 0xF_0F00_0F0F).wrapping_mul(2561);
-        let h = (24 * (x >> 8 & 0xFF) + (x >> 32 & 0xFF) + 744 * (w >> 8 & 1) - 738) as usize;
+        if w != last {
+            // The digit pairs combine in one multiply (byte k + 10 * byte k-1).
+            let x = (w >> 24 & 0xF_0F00_0F0F).wrapping_mul(2561);
+            (cur[h], last) = (c, w);
+            h = (24 * (x >> 8 & 0xFF) + (x >> 32 & 0xFF) + 744 * (w >> 8 & 1) - 738) as usize;
+            c = cur[h];
+        }
         // Separators from the method's third byte on: the method ends at the first, the endpoint
         // at the second.
         let (mut q, mut m) = (p + 31, seps(b, p + 31));
@@ -235,23 +241,23 @@ fn parse(b: &[u8], lo: usize, hi: usize, names: &Names, pool: &Pool, cur: &mut [
         p = e + 6 + k;
         // Hash the first 16 and last 8 bytes of the endpoint (all of it when shorter).
         let (a, z) = if n >= 8 { (ld8(b, s), ld8(b, e - 8)) } else { (ld8(b, s) & ((1 << (8 * n)) - 1), 0) };
-        let c = if n >= 16 { ld8(b, s + 8) } else { 0 };
-        let crc = unsafe { _mm_crc32_u64(_mm_crc32_u64(_mm_crc32_u64(n as u64, a), c), z) };
+        let y = if n >= 16 { ld8(b, s + 8) } else { 0 };
+        let crc = unsafe { _mm_crc32_u64(_mm_crc32_u64(_mm_crc32_u64(n as u64, a), y), z) };
         let id = names.id(b.as_ptr().wrapping_add(s), n, crc as u32);
         let err = (ld8(b, e + 1) as u8 == b'5') as u32;
-        let c = &mut cur[h];
-        if *c as usize % (4 * B) >= 4 * B - 8 {
-            *c = pool.block(h);
+        if c as usize % (4 * B) >= 4 * B - 8 {
+            c = pool.block(h);
         }
         unsafe {
-            **c = id | err << 11 | lat.min(ESC) << 12;
-            *c = c.add(1);
+            *c = id | err << 11 | lat.min(ESC) << 12;
+            c = c.add(1);
             if lat >= ESC {
-                **c = lat;
-                *c = c.add(1);
+                *c = lat;
+                c = c.add(1);
             }
         }
     }
+    cur[h] = c;
 }
 
 fn ppm(e: u32, n: u32) -> u32 {

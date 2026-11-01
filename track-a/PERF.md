@@ -25,7 +25,8 @@ Every step from the reference to the final version. Each row has the live-board 
 | 4 | **r5, parse rewrite.** AVX2 separator mask from byte 31; latency length by a SWAR non-digit test; CRC32 hash; names compared against a 64-byte-padded arena; one thread pool with barriers instead of three spawns; 2-digit LUT itoa; instrumentation removed | | 22.3 | 20.8 | 451 | v2 46.6 → r5 35.4 | 18.1 (v2 17.2) | 796 |
 | 5 | **r6.** Count and 5xx count packed in one u64 per endpoint; unconditional scatter (padding words go to a dummy id); sort groups of ≤ 32 instead of three selects | | | | 437 | r5 35.4 → r6 30.2 | 18.1 | 757 |
 | 6 | **r7, exit work moved into the parallel phase.** Each thread `MADV_DONTNEED`s the input pages it has parsed, with `MADV_SEQUENTIAL` on the input. Also B = 128, largest hours first, `+crt-static` | | | | 444 | r6 59.9 → +B128/LPT 57.6 → +zap 48.1 → +static 46.8 | 18.0 | 761 |
-| 7 | **r8.** Each hour's output pages are dropped from our page table after formatting (the data stays in the file); `process::exit(0)` once the output is complete; rustfmt-friendly trims | | | | 426 | pending (laptop saturated) | 18.0 | 758 |
+| 7 | **r8.** Each hour's output pages are dropped from our page table after formatting (the data stays in the file); `process::exit(0)` once the output is complete; rustfmt-friendly trims | | | | 426 | r7 30.6 → r8 28.3 (medians 38.6 / 38.0) | 18.0 | 758 |
+| 8 | **r9.** The parser keeps the current hour and its record cursor in registers while the timestamp's "MM-DDTHH" repeats. Lines come in long single-hour runs, so both are recomputed only when it changes | | | | 431 | r7 30.7, r8 28.9, r9 26.3 (medians 39.3 / 37.7 / 32.3) | 17.8 | 715 |
 
 ### Inside step 4: parse instructions
 
@@ -60,6 +61,8 @@ Seed-1 full, local `memory.current`:
 | After the stats phase | Six words per group in place of the records | 7-8.7 |
 | End | The 10.1 MB output on tmpfs, statistics released hour by hour | 13.6-15.4 |
 
+Below this, only smaller records would help. Streaming hours during the parse would save at most about 2 MB, because the 10.1 MB output still accumulates to the end.
+
 ## Failure museum
 
 These are rejected or reverted experiments, with the numbers that decided them.
@@ -84,7 +87,16 @@ These are rejected or reverted experiments, with the numbers that decided them.
    - the in-place variant needs three partition passes, about the cost of quickselect.
 10. **The custom `GlobalAlloc` that advised `MADV_NOHUGEPAGE`.** Removed: every big buffer is now our own `mmap` with that advice, and no heap allocation reaches 2 MB. That saved 23 lines.
 11. **Three `thread::scope`s (36 thread spawns).** Replaced with one pool and barriers.
-12. **`MADV_POPULATE_READ` per input chunk.** Inconclusive and not shipped. Its A/B ran while the laptop was under memory pressure: the evicted page cache was re-charged to us and gave M up to 105 MB.
+12. **Populating pages ahead in batches (x13).** `MADV_POPULATE_READ` per input chunk, plus `MADV_POPULATE_WRITE` on the scatter scratch and on each hour's output range.
+    - It is meant to replace fault exceptions with one syscall per range.
+    - Measured on r9, 10 alternations: wall median 36.1 vs 33.8 ms, sys CPU median 90 vs 75 ms. Worse; rejected.
+    - (A first A/B ran under memory pressure and was discarded: evicted page cache was re-charged to us, M up to 105 MB.)
+13. **A 16 KB interner table of 32-bit slots (x9), so the table stays in L1.**
+    - Simulated D1 misses fell 5.6% (8.34M → 7.87M), but instructions rose 6M from longer probes.
+    - The wall A/B flipped sign when the order was swapped. Rejected.
+14. **Escaped latencies in one shared side list (x11)**, so the count and scatter loops have a fixed stride.
+    - The loops saved 17M instructions, but each hour scanning the list cost 10M back: −1% net, for +145 KB and +4 lines. Rejected.
+15. **Without the per-hour output zap (x12).** r9 minus that one call: wall median 38.4 vs 32.3 ms. The zap stays.
 
 ## Correctness notes
 
