@@ -25,6 +25,9 @@ Local box: i5-11400H laptop (6 cores, 12 MB L3) running Docker; the scoring box 
 | 11 | 5d9967b | One CSR builder and one edge iterator (-120 lines); SWAR number parsing | run-125edba6abfe | 0.200 | 72.0 | 619 | 66.3 |
 | 12 | 064a61b | Experiment: every malloc block >= 4 KB in its own mapping | run-e10a2dc56bee | 0.200 | 72.1 | 636 | 66.1 |
 | 13 | 2babdea | Bucketed CSR builder: no locked ops, no store outside the current bucket | run-6e37653c1567 | 0.178 | 77.0 | 644 | 67.1 |
+| 14 | c697a6e | Experiment: prefetch the offsets of the next node a side will settle | run-1266ccbcec18 | 0.180 | 78.5 | | 66.9 |
+| 15 | fe25faa | Prefetch reverted; u16 page numbers in the label directory | run-07372c236cf8 | 0.185 | 72.1 | 649 | 67.0 |
+| 16 | e3964b4 | Experiment: reverse graph through atomic countdown cursors instead of the bucketed builder | run-cc347453b71c | 0.208 | 72.2 | 677 | 65.5 |
 
 ## How it works now
 
@@ -110,6 +113,8 @@ with fewer queued entries instead of the smaller key, 7.15M.
 | Queries sorted by source id | the 12 threads search nearby parts of the map, warm L3 | no gain (228-282 vs 254-286 ms) | |
 | Both sides' directory entries interleaved in one cache line | one line for both lookups | single-thread queries 512-567 vs 493-610 ms | each side now gets half as many pages per line |
 | 6 or 8 threads instead of 12 | more L2 per search | 12 threads fastest | the search waits on memory, and hyper-threads hide that |
+| Prefetch the next node a side will settle (step 14) | overlap its offset miss with the current edge loop | board 0.180 s vs 0.178 s | the next pop is already likely in cache; the extra loads cost as much |
+| Reverse graph through atomic countdown cursors (step 16) | 5 MB less than the bucketed builder's u16 side array | board 0.208 s vs 0.178 s, 72.2 vs 77.0 MB | on the scoring box the locked updates cost far more than the memory saved |
 
 ## Correctness
 
