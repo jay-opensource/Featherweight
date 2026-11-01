@@ -34,6 +34,14 @@ fn anon<T>(len: usize) -> *mut T {
     p as *mut T
 }
 
+/// MADV_DONTNEED the whole pages inside [p, p + len): unmapped now by this thread, not at exit.
+fn zap(p: *const u8, len: usize) {
+    let (x, y) = ((p as usize + 4095) & !4095, (p as usize + len) & !4095);
+    if y > x {
+        unsafe { madvise(x as *mut u8, y - x, 4) };
+    }
+}
+
 /// The input, mapped read-only (the page cache is not charged to us), followed by at least 4 KB of
 /// zero pages, so the parser may read past the last byte.
 fn map(path: &str) -> &'static [u8] {
@@ -328,10 +336,7 @@ fn main() {
                 while let Some(&(lo, hi)) = parts.get(next[0].fetch_add(1, Relaxed)) {
                     parse(b, lo, hi, &names, &pool, &mut cur);
                     // Unmap the chunk's whole pages now, on this thread, not all at exit on one.
-                    let (x, y) = ((lo + 4095) & !4095, hi & !4095);
-                    if y > x {
-                        unsafe { madvise(b.as_ptr().add(x) as *mut u8, y - x, 4) };
-                    }
+                    zap(b[lo..].as_ptr(), hi - lo);
                 }
                 if bar.wait().is_leader() {
                     // Endpoint ids in byte order of their names.
@@ -347,7 +352,7 @@ fn main() {
                 let (order, keys, hrs) = order.get().unwrap();
 
                 // Each hour: count per endpoint, scatter the latencies in name order, select.
-                let most = (0..HOURS).map(|h| pool.used[h].load(Relaxed)).max().unwrap_or(0) * B;
+                let most = B * pool.used.iter().fold(0, |m, u| m.max(u.load(Relaxed)));
                 let lat = unsafe { std::slice::from_raw_parts_mut(anon::<u32>(most * 4), most) };
                 let (mut cnt, mut at) = ([0u64; 2048], [0u32; 2048]); // count | errors << 32, next slot
                 while let Some(&h) = hrs.get(next[1].fetch_add(1, Relaxed)) {
@@ -382,7 +387,8 @@ fn main() {
                         let [p50, p95, p99] = pct(&mut lat[lo..lo + n as usize]);
                         lo += n as usize;
                         st[g] = [id as u32, n, e, p50, p95, p99];
-                        size += 28 + keys[id - 1].1 + [n, p50, p95, p99, e, ppm(e, n)].map(digits).iter().sum::<usize>();
+                        let line = [n, p50, p95, p99, e, ppm(e, n)].map(digits);
+                        size += 28 + keys[id - 1].1 + line.iter().sum::<usize>();
                         g += 1;
                     }
                     pool.free(h, g * 24, nw * 4);
@@ -397,14 +403,18 @@ fn main() {
                     for x in &bytes {
                         off.push(off.last().unwrap() + x.load(Relaxed));
                     }
-                    let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open("/out/summary.txt").expect("create summary.txt");
-                    f.set_len(off[HOURS] as u64).expect("size summary.txt");
-                    let p = unsafe { mmap(std::ptr::null_mut(), off[HOURS].max(1), 3, 1, f.as_raw_fd(), 0) };
+                    let mut f = OpenOptions::new();
+                    f.read(true).write(true).create(true).truncate(true);
+                    let f = f.open("/out/summary.txt").expect("create summary.txt");
+                    let len = off[HOURS];
+                    f.set_len(len as u64).expect("size summary.txt");
+                    let p = unsafe { mmap(std::ptr::null_mut(), len.max(1), 3, 1, f.as_raw_fd(), 0) };
                     let shared = p as isize != -1;
-                    assert!(out.set((Ptr(if shared { p } else { anon(off[HOURS]) }), off, f, shared)).is_ok());
+                    let o = Ptr(if shared { p } else { anon(len) });
+                    assert!(out.set((o, off, f, shared)).is_ok());
                 }
                 bar.wait();
-                let (o, off, _, _) = out.get().unwrap();
+                let (o, off, _, shared) = out.get().unwrap();
 
                 // Each hour: format its groups into its range of the output.
                 while let Some(&h) = hrs.get(next[2].fetch_add(1, Relaxed)) {
@@ -426,6 +436,11 @@ fn main() {
                         i += 1;
                     }
                     pool.free(h, 0, groups[h].load(Relaxed) * 24);
+                    // Drop this hour's whole output pages from our page tables now, in parallel; the
+                    // data stays in the file. Exit would otherwise unmap them all on one core.
+                    if *shared {
+                        zap(o.as_ptr(), o.len());
+                    }
                 }
             });
         }
@@ -434,4 +449,6 @@ fn main() {
     if !shared {
         f.write_all(unsafe { std::slice::from_raw_parts(o.0, off[HOURS]) }).expect("write summary.txt");
     }
+    // The output is complete; the kernel releases everything else at exit.
+    std::process::exit(0);
 }

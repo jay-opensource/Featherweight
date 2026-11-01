@@ -121,19 +121,25 @@ impl Shared<'_> {
     /// sets the id counter past every limit, and the run is redone.
     fn id(&self, b: &[u8], s: usize, n: usize, h: u64, ids: &mut (u32, u32)) -> (u32, usize) {
         let Shared(_, slots, long, top, next, ..) = self;
-        let (w, nw) = (|j: usize| kw(b, s, n, j), (n + 7) / 8);
-        let cap = slots.len() / 3;
-        let mut i = (h >> cap.leading_zeros() + 1) as usize;
+        let (w, nw, cap) = (|j: usize| kw(b, s, n, j), (n + 7) / 8, slots.len() / 3);
+        let (k0, k1, mut i) = (w(0), w(1), (h >> cap.leading_zeros() + 1) as usize);
         loop {
-            let slot = &slots[3 * i..3 * i + 3];
+            let slot = unsafe { slots.get_unchecked(3 * i..3 * i + 3) }; // i < cap
             let hdr = slot[0].load(Acquire);
-            if hdr == 0 && slot[0].compare_exchange(0, BUSY, Acquire, Relaxed).is_ok() {
+            if hdr as usize & 0xF_FFFF == n && hdr >> 40 != 0 {
+                // A filled slot with a name of this length (BUSY has length 2^20 - 1, never n).
+                let (o, k) = (slot[1].load(Relaxed), slot[2].load(Relaxed));
+                let at_o = |j: usize| long.get(o as usize + j).map(|x| x.load(Relaxed));
+                if if n > 16 { (0..nw).all(|j| at_o(j) == Some(w(j))) } else { o == k0 && k == k1 } {
+                    return ((hdr >> 40) as u32 - 1, (hdr >> 20) as usize & 0xF_FFFF);
+                }
+            } else if hdr == 0 && slot[0].compare_exchange(0, BUSY, Acquire, Relaxed).is_ok() {
                 if ids.0 == ids.1 {
                     *ids = (next.fetch_add(64, Relaxed), 0);
                     ids.1 = ids.0 + 64;
                 }
                 let o = if n > 16 { top.fetch_add(nw, Relaxed) } else { 0 };
-                if ids.0 as usize >= cap / 8 * 7 || o + nw > long.len() || n >= 1 << 20 {
+                if ids.0 as usize >= cap / 8 * 7 || o + nw > long.len() || n >= (1 << 20) - 1 {
                     next.store(u32::MAX / 2, Relaxed);
                     slot[0].store(0, Release);
                     return (0, 0);
@@ -148,17 +154,9 @@ impl Shared<'_> {
                 slot[0].store((n | pairs << 20) as u64 | (ids.0 as u64 + 1) << 40, Release);
                 ids.0 += 1;
                 return (ids.0 - 1, pairs);
-            }
-            if hdr == BUSY || hdr == 0 {
+            } else if hdr == 0 || hdr == BUSY {
                 std::hint::spin_loop(); // another thread is filling this slot: look again
                 continue;
-            }
-            let o = slot[1].load(Relaxed);
-            let short = (o ^ w(0)) | (slot[2].load(Relaxed) ^ w(1));
-            let at_o = |j: usize| long.get(o as usize + j).map(|x| x.load(Relaxed));
-            let same = || if n > 16 { (0..nw).all(|j| at_o(j) == Some(w(j))) } else { short == 0 };
-            if hdr as usize & 0xF_FFFF == n && same() {
-                return ((hdr >> 40) as u32 - 1, (hdr >> 20) as usize & 0xF_FFFF);
             }
             i = (i + 1) & (cap - 1);
         }
@@ -198,8 +196,8 @@ fn chunk(b: &[u8], start: usize, end: usize, sh: &Shared, me: &mut Local) -> usi
     // Ring of field-end positions (n written, i consumed); quotes before the record start.
     let (mut pos, mut n, mut i, mut qrs) = ([0usize; 128], 0usize, 0usize, 0usize);
     let (mut batch, mut nb, shift) = ([Rec::default(); 32], 0, (sh.1.len() / 3).leading_zeros() + 1);
-    'blocks: while rs < end && base < b.len() {
-        let (q, c, l) = unsafe {
+    'blocks: while rs < end && base <= b.len() {
+        let (q, c, mut l) = unsafe {
             let p = b.as_ptr().add(base) as *const __m256i;
             let (lo, hi) = (_mm256_loadu_si256(p), _mm256_loadu_si256(p.add(1)));
             let m = |c| {
@@ -209,6 +207,9 @@ fn chunk(b: &[u8], start: usize, end: usize, sh: &Shared, me: &mut Local) -> usi
             };
             (m(b'"'), m(b','), m(b'\n'))
         };
+        if base + 64 > b.len() && at(b, b.len() - 1) != b'\n' {
+            l |= 1 << (b.len() - base); // a last record without a terminator (2.1) ends at EOF
+        }
         // Prefix XOR of the quote bits: set inside quoted fields (and on their opening quote).
         let (qv, ones) = unsafe { (_mm_set_epi64x(0, q as i64), _mm_set1_epi8(-1)) };
         let x = unsafe { _mm_cvtsi128_si64(_mm_clmulepi64_si128(qv, ones, 0)) } as u64 ^ carry;
@@ -257,7 +258,7 @@ fn chunk(b: &[u8], start: usize, end: usize, sh: &Shared, me: &mut Local) -> usi
         (quotes, base) = (quotes + q.count_ones() as usize, base + 64);
     }
     flush(b, &batch[..nb], sh, me);
-    rs
+    rs.min(b.len()) // past a virtual LF at the end of the file: the end
 }
 
 /// Lookups for a batch: its region bytes and dictionary slots were prefetched while it was parsed.
