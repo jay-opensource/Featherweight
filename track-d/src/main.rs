@@ -613,6 +613,12 @@ impl Pages {
         (unsafe { *self.dir.get_unchecked(d) } as usize) << self.pb | (v & ((1 << self.pb) - 1)) as usize
     }
 
+    /// Index of v's label on `side`, whose page exists.
+    #[inline(always)]
+    fn slot(&self, v: u32, side: usize) -> usize {
+        (unsafe { *self.dir.get_unchecked(side * self.half + (v >> self.pb) as usize) } as usize) << self.pb | (v & ((1 << self.pb) - 1)) as usize
+    }
+
     /// v's label on `side` (tentative or settled), INF if none.
     #[inline(always)]
     fn get(&self, v: u32, side: usize) -> u32 {
@@ -649,12 +655,12 @@ fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: &Graph, r: &Graph, s: usize, t: 
     while (key[0] as u64 + key[1] as u64) < mu {
         let side = (hs[0].len > hs[1].len) as usize;
         let (d, u) = (key[side], hs[side].pop());
-        let iu = pg.at(u, side);
-        let lu = pg.pool[iu];
+        let iu = pg.slot(u, side);
+        let lu = unsafe { *pg.pool.get_unchecked(iu) };
         let (gr, h) = (if side == 0 { g } else { r }, &mut hs[side]);
         if lu == d {
             // not settled, and not a stale entry (the label only drops after a push)
-            pg.pool[iu] = lu | SETTLED;
+            unsafe { *pg.pool.get_unchecked_mut(iu) = lu | SETTLED };
             gr.adj(u as usize, |v, w| {
                 let nd = d as u64 + w as u64;
                 if nd >= INF as u64 {
