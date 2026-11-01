@@ -192,6 +192,18 @@ impl Edges for (&Graph, usize, usize) {
 ///    slots of an escaped edge get it, so the slots can be counted and moved one by one);
 /// 3. per bucket, count each node's slots from the u16s alone; once the layout is known, reorder
 ///    the bucket's ~94 KB of slots by node through a scratch copy.
+
+/// Fault in a fresh zeroed array one contiguous slice per thread before random writers use it:
+/// first touches at random addresses from many threads queue on the same page-table locks.
+fn touch<T>(mut v: Vec<T>, threads: usize) -> Vec<T> {
+    let (p, pages) = (Slots(v.as_mut_ptr() as *mut u8), v.len() * std::mem::size_of::<T>() >> 12);
+    par(threads, &spans((), pages, threads * 4), |&(_, lo, hi)| {
+        let p = &p;
+        (lo..hi).for_each(|k| unsafe { p.0.add(k << 12).write_volatile(0) });
+    });
+    v
+}
+
 /// Nothing is locked, and no store lands outside the bucket being worked on.
 fn csr(n: usize, threads: usize, vb: u32, esc: u32, items: &[impl Edges]) -> Graph {
     const BS: u32 = 13;
@@ -209,7 +221,7 @@ fn csr(n: usize, threads: usize, vb: u32, esc: u32, items: &[impl Edges]) -> Gra
         }
         start[b + 1] = acc as usize;
     }
-    let (mut edges, mut loc) = (vec![0u32; acc as usize], vec![0u16; acc as usize]);
+    let (mut edges, mut loc) = (touch(vec![0u32; acc as usize], threads), touch(vec![0u16; acc as usize], threads));
     let (ep, lp) = (Slots(edges.as_mut_ptr()), Slots(loc.as_mut_ptr()));
     par(threads, &(0..ni).collect::<Vec<_>>(), |&i| {
         let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
@@ -248,7 +260,7 @@ fn csr(n: usize, threads: usize, vb: u32, esc: u32, items: &[impl Edges]) -> Gra
 fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
     let n = g.rel.len() - 1;
     // Zeroed by the kernel on first touch (in parallel); 0 is free, 1 claimed, until the ids.
-    let mut id = vec![0u32; n];
+    let mut id = touch(vec![0u32; n], threads);
     let ip = Slots(id.as_mut_ptr());
     let at = |v: usize| unsafe { AtomicU32::from_ptr((&ip).0.add(v)) };
     let claim = |v| at(v).load(Relaxed) == 0 && at(v).compare_exchange(0, 1, Relaxed, Relaxed).is_ok();
@@ -306,7 +318,7 @@ fn relabel(g: &Graph, id: &[u32], threads: usize) -> Graph {
     });
     let lay = layout(n, threads, g.vb, g.esc, |k| deg[k] as u32);
     drop(deg);
-    let mut edges = vec![0u32; g.edges.len()];
+    let mut edges = touch(vec![0u32; g.edges.len()], threads);
     let ep = Slots(edges.as_mut_ptr());
     par(threads, &ranges, |&(_, lo, hi)| {
         for u in lo..hi {
