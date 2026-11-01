@@ -53,10 +53,7 @@ fn num(b: &[u8], i: &mut usize) -> u64 {
 /// Hint the cache to fetch the line holding `x`.
 #[inline(always)]
 fn prefetch<T>(x: *const T) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        std::arch::x86_64::_mm_prefetch(x as *const i8, std::arch::x86_64::_MM_HINT_T0)
-    };
+    unsafe { std::arch::x86_64::_mm_prefetch(x as *const i8, std::arch::x86_64::_MM_HINT_T0) };
 }
 
 /// s[i] without a bounds check, for the hot lookups (their indices come from the graph).
@@ -386,14 +383,14 @@ const W: usize = 1 << 13;
 
 /// Monotone bucket queue (Dial): one bucket per key modulo W. Each key pushed is the popped key
 /// cur plus an edge lighter than W, so every queued key lies in [cur, cur + W) and a bucket's
-/// position gives its key; a bitmap of non-empty buckets finds the next one. A bucket is a list
-/// through a pool of entries (an Item and the next entry's index) that reuses popped entries. The
-/// Item holds all that settling the node needs, so a pop starts on the label and the edges at once.
-/// Entry 0 is a sentinel, so index 0 means "none" in `head`, in a next field and in `free`.
+/// position gives its key; the next key is found by stepping cur over empty buckets (the frontier
+/// is dense: a few steps). A bucket is a list through a pool of entries (an Item and the next
+/// entry's index) that reuses popped entries. The Item holds all that settling the node needs, so
+/// a pop starts on the label and the edges at once. Entry 0 is a sentinel: index 0 means "none" in
+/// `head`, in a next field and in `free`.
 #[derive(Default)]
 struct Dial {
     head: Vec<u32>,
-    bits: Vec<u64>,
     pool: Vec<[u32; 4]>,
     free: u32,
     cur: u32,
@@ -404,58 +401,42 @@ impl Dial {
     /// Queue x with key d in [cur, cur + W).
     #[inline(always)]
     fn put(&mut self, d: u32, [i, a, e]: Item) {
-        let b = d as usize % W;
         if self.free == 0 {
             self.free = self.pool.len() as u32;
             self.pool.push([0; 4]);
         }
-        let k = self.free as usize;
+        let (k, b) = (self.free as usize, d as usize % W);
         self.free = ld(&self.pool, k)[3];
         *mt(&mut self.pool, k) = [i, a, e, ld(&self.head, b)];
         *mt(&mut self.head, b) = k as u32;
-        *mt(&mut self.bits, b / 64) |= 1 << b % 64;
         self.len += 1;
     }
 
     /// Move cur to the smallest key; false if the queue is empty.
     #[inline(always)]
     fn min(&mut self) -> bool {
-        let p = self.cur as usize % W;
-        let (mut j, mut m) = (p / 64, ld(&self.bits, p / 64) >> p % 64 << p % 64);
-        while m == 0 && self.len > 0 {
-            j = (j + 1) % (W / 64);
-            m = ld(&self.bits, j);
+        while self.len > 0 && ld(&self.head, self.cur as usize % W) == 0 {
+            self.cur += 1;
         }
-        self.cur += ((j * 64 + m.trailing_zeros() as usize + W - p) % W) as u32;
         self.len > 0
     }
 
-    /// Take an item of key cur; min() must have returned Some since the last pop.
+    /// Take an item of key cur; min() must have returned true since the last pop.
     #[inline(always)]
     fn pop(&mut self) -> Item {
-        let b = self.cur as usize % W;
-        let k = ld(&self.head, b) as usize;
-        let [i, a, e, next] = ld(&self.pool, k);
-        (*mt(&mut self.head, b), mt(&mut self.pool, k)[3]) = (next, self.free);
-        self.free = k as u32;
-        if next == 0 {
-            *mt(&mut self.bits, b / 64) &= !(1 << b % 64);
-        }
+        let (b, f) = (self.cur as usize % W, self.free);
+        self.free = ld(&self.head, b);
+        let [i, a, e, next] = ld(&self.pool, self.free as usize);
+        (*mt(&mut self.head, b), mt(&mut self.pool, self.free as usize)[3]) = (next, f);
         self.len -= 1;
         [i, a, e]
     }
 
     /// Empty the queue (the first time, size it).
     fn clear(&mut self) {
-        for j in 0..self.bits.len() {
-            while self.bits[j] != 0 {
-                self.head[j * 64 + self.bits[j].trailing_zeros() as usize] = 0;
-                self.bits[j] &= self.bits[j] - 1;
-            }
-        }
         (self.free, self.cur, self.len) = (0, 0, 0);
+        self.head.clear();
         self.head.resize(W, 0);
-        self.bits.resize(W / 64, 0);
         self.pool.resize(1, [0; 4]);
     }
 }
@@ -464,14 +445,14 @@ impl Dial {
 const SETTLED: u32 = 1 << 31;
 const INF: u32 = SETTLED - 1;
 
-/// Labels of the two-ended search, per side, in pages of 64 consecutive node ids (neighbours in
-/// BFS order) allocated on first touch from a per-thread pool. The two balls grow around s and
-/// around t, so each side gets its own pages. dir holds a page's number in the pool as a u16 (half
-/// the cache footprint of an offset), side 0 then side 1; pages grow if n ever needs more numbers.
-/// Page 0 is all INF and stands for every page not allocated yet, so reading a label never branches.
+/// Labels of the two-ended search, per side, in pages of 2^pb (64 on these graphs) consecutive
+/// node ids (neighbours in BFS order) allocated on first touch from a per-thread pool. The two
+/// balls grow around s and around t, so each side gets its own pages. dir holds a page's number
+/// in the pool as a u16 (half the cache footprint of an offset), side 0 then side 1; pb grows if
+/// n ever needs more numbers. Page 0 is all INF and stands for every page not allocated yet, so
+/// reading a label never branches.
 struct Pages {
     dir: Vec<u16>,
-    half: usize,
     pb: u32,
     pool: Vec<u32>,
     used: Vec<u32>,
@@ -479,15 +460,15 @@ struct Pages {
 
 impl Pages {
     fn new(n: usize) -> Self {
-        let pb = (6..).find(|&b| 2 * ((n >> b) + 1) < u16::MAX as usize).unwrap();
-        let (half, pool, used) = ((n >> pb) + 1, vec![INF; 1 << pb], Vec::new());
-        Pages { dir: vec![0; 2 * half], half, pb, pool, used }
+        let pb = 6.max(usize::BITS - (n / 32766).leading_zeros());
+        let (dir, pool) = (vec![0; 2 * ((n >> pb) + 1)], vec![INF; 1 << pb]);
+        Pages { dir, pb, pool, used: Vec::new() }
     }
 
     /// Index of v's label on `side`, allocating its page.
     #[inline(always)]
     fn at(&mut self, v: u32, side: usize) -> usize {
-        let d = side * self.half + (v >> self.pb) as usize;
+        let d = side * self.dir.len() / 2 + (v >> self.pb) as usize;
         if ld(&self.dir, d) == 0 {
             self.dir[d] = (self.pool.len() >> self.pb) as u16;
             self.pool.resize(self.pool.len() + (1 << self.pb), INF);
@@ -499,20 +480,17 @@ impl Pages {
     /// Index of v's label on `side`, in page 0 if v has none.
     #[inline(always)]
     fn ix(&self, v: u32, side: usize) -> usize {
-        let p = ld(&self.dir, side * self.half + (v >> self.pb) as usize) as usize;
+        let p = ld(&self.dir, side * self.dir.len() / 2 + (v >> self.pb) as usize) as usize;
         p << self.pb | v as usize & ((1 << self.pb) - 1)
     }
 
     fn clear(&mut self) {
-        for &d in &self.used {
-            self.dir[d as usize] = 0;
-        }
-        self.used.clear();
+        self.used.drain(..).for_each(|d| self.dir[d as usize] = 0);
         self.pool.truncate(1 << self.pb);
     }
 }
 
-/// Two-ended Dijkstra: forward from s on `g`, backward from t on the reverse graph `r`, always
+/// Two-ended Dijkstra: forward from s on g[0], backward from t on the reverse graph g[1], always
 /// expanding the side with fewer queued entries. mu is the best s-t length seen through any node
 /// labelled by both sides; stop when the two queue minimums together reach mu. A source with no
 /// way out or a target with no way in empties its queue at once, so those answer -1 immediately;
@@ -525,29 +503,32 @@ impl Pages {
 /// would be at least the two queue minimums, hence mu), so skip is below mu. So mu is the answer
 /// unless skip < mu, or something was skipped and mu does not fit 31 bits: then return None and
 /// the caller runs the one-ended u64 search.
-fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: &Graph, r: &Graph, s: usize, t: usize) -> Option<i64> {
+fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: [&Graph; 2], s: usize, t: usize) -> Option<i64> {
     pg.clear();
     let mut m = [if s == t { 0 } else { u64::MAX }, u64::MAX]; // mu, skip
-    for (side, x, gr) in [(0, s, g), (1, t, r)] {
+    for (side, x) in [(0, s), (1, t)] {
         let i = pg.at(x as u32, side);
         pg.pool[i] = 0;
         hs[side].clear();
-        hs[side].put(0, [i as u32, gr.off(x) as u32, gr.off(x + 1) as u32]);
+        hs[side].put(0, [i as u32, g[side].off(x) as u32, g[side].off(x + 1) as u32]);
     }
     let mut go = true;
     while go && (hs[0].cur as u64 + hs[1].cur as u64) < m[0] {
-        go = if hs[0].len > hs[1].len { step::<1>(pg, &mut hs[1], r, &mut m) } else { step::<0>(pg, &mut hs[0], g, &mut m) };
+        go = if hs[0].len > hs[1].len {
+            step::<1>(pg, &mut hs[1], g[1], &mut m)
+        } else {
+            step::<0>(pg, &mut hs[0], g[0], &mut m)
+        };
     }
     match m {
         [mu, skip] if skip < mu || skip < u64::MAX && mu >= INF as u64 => None,
-        [u64::MAX, _] => Some(-1),
-        [mu, _] => Some(mu as i64),
+        [mu, _] => Some(mu as i64), // u64::MAX, no path, casts to -1
     }
 }
 
-/// One step of side S (0: forward on g, 1: backward on r, so the side is a constant in the code):
-/// pop its smallest entry, settle the node unless the entry is stale, and move to the next key.
-/// m is [mu, skip]. False once the side's queue is empty.
+/// One step of side S (0: forward, 1: backward, so the side is a constant in the code): pop its
+/// smallest entry, settle the node unless the entry is stale, and move to the next key. m is
+/// [mu, skip]. False once the side's queue is empty.
 #[inline(always)]
 fn step<const S: usize>(pg: &mut Pages, h: &mut Dial, gr: &Graph, m: &mut [u64; 2]) -> bool {
     let (d, [iu, e, end]) = (h.cur, h.pop());
@@ -579,23 +560,20 @@ fn step<const S: usize>(pg: &mut Pages, h: &mut Dial, gr: &Graph, m: &mut [u64; 
 }
 
 /// One-ended Dijkstra with u64 distances, for the few queries whose distances need more than
-/// 31 bits (edges of weight near 2^32 at the special nodes). Speed does not matter here.
+/// 31 bits (edges of weight near 2^32 at the special nodes). Speed does not matter here: a stale
+/// heap entry is simply expanded again (it cannot improve anything).
 fn plain(g: &Graph, s: usize, t: usize) -> i64 {
-    use std::cmp::Reverse;
-    let mut dist = std::collections::HashMap::from([(s, 0u64)]);
-    let mut heap = std::collections::BinaryHeap::from([Reverse((0u64, s))]);
-    while let Some(Reverse((d, u))) = heap.pop() {
+    let mut dist = std::collections::HashMap::from([(s, 0)]);
+    let mut heap = std::collections::BinaryHeap::from([std::cmp::Reverse((0, s))]);
+    while let Some(std::cmp::Reverse((d, u))) = heap.pop() {
         if u == t {
             return d as i64;
         }
-        if dist[&u] < d {
-            continue; // stale entry
-        }
         g.adj(u, |v, w| {
-            let (v, nd) = (v as usize, d + w as u64);
-            if dist.get(&v).map_or(true, |&o| nd < o) {
-                dist.insert(v, nd);
-                heap.push(Reverse((nd, v)));
+            let (e, nd) = (dist.entry(v as usize).or_insert(u64::MAX), d + w as u64);
+            if nd < *e {
+                *e = nd;
+                heap.push(std::cmp::Reverse((nd, v as usize)));
             }
         });
     }
@@ -609,8 +587,8 @@ fn main() {
     // (M_ARENA_MAX = 1) instead of one per thread keeps the search's small vectors packed.
     unsafe { (prctl(41, 1, 0, 0, 0), mallopt(-8, 1)) };
     let t0 = std::time::Instant::now();
-    let threads = std::env::var("FW_THREADS").ok().and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |p| p.get()));
+    let par0 = std::thread::available_parallelism().map_or(1, |p| p.get());
+    let threads = std::env::var("FW_THREADS").map_or(par0, |v| v.parse().unwrap());
     let q = map("/data/queries.txt");
     let (mut qs, mut j) = (Vec::new(), 0);
     while j < q.len() {
@@ -634,28 +612,19 @@ fn main() {
     let r = csr(n, threads, vb, esc, &parts);
     let t1 = t0.elapsed();
 
-    let answers: Vec<AtomicI64> = qs.iter().map(|_| AtomicI64::new(-1)).collect();
+    let ans: Vec<AtomicI64> = qs.iter().map(|_| AtomicI64::new(-1)).collect();
     let next = AtomicUsize::new(0);
-    std::thread::scope(|sc| {
-        for _ in 0..threads {
-            sc.spawn(|| {
-                let (mut pg, mut hs) = (Pages::new(n), <[Dial; 2]>::default());
-                loop {
-                    let k = next.fetch_add(1, Relaxed);
-                    let Some(&(s, t)) = qs.get(k) else { break };
-                    let ans = bidir(&mut pg, &mut hs, &g, &r, s, t);
-                    answers[k].store(ans.unwrap_or_else(|| plain(&g, s, t)), Relaxed);
-                }
-            });
+    par(threads, &vec![(); threads], |_| {
+        let (mut pg, mut hs) = (Pages::new(n), <[Dial; 2]>::default());
+        loop {
+            let k = next.fetch_add(1, Relaxed);
+            let Some(&(s, t)) = qs.get(k) else { break };
+            let a = bidir(&mut pg, &mut hs, [&g, &r], s, t);
+            ans[k].store(a.unwrap_or_else(|| plain(&g, s, t)), Relaxed);
         }
     });
-
-    let mut out = Vec::with_capacity(qs.len() * 12);
-    for a in &answers {
-        out.extend_from_slice(a.load(Relaxed).to_string().as_bytes());
-        out.push(b'\n');
-    }
-    std::fs::write("/out/distances.txt", out).expect("write distances.txt");
+    let out: Vec<String> = ans.iter().map(|a| a.load(Relaxed).to_string()).collect();
+    std::fs::write("/out/distances.txt", out.join("\n") + "\n").unwrap();
     eprintln!("build {t1:?} total {:?}", t0.elapsed());
     std::process::exit(0); // the kernel reclaims everything; do not free the big arrays one by one
 }
