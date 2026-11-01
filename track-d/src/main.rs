@@ -441,16 +441,16 @@ impl Radix {
 /// Distances in the two-ended search are 31 bits; the top bit marks "settled".
 const SETTLED: u32 = 1 << 31;
 const INF: u32 = SETTLED - 1;
-const NOPAGE: u32 = u32::MAX;
+const NOPAGE: u16 = u16::MAX;
 
 /// Labels of the two-ended search, per side, in pages of 64 consecutive node ids (neighbours in
 /// BFS order) allocated on first touch from a per-thread pool. The two balls grow around s and
-/// around t, so each side gets its own pages. dir holds a page's pool offset, side 0 then side 1.
-const PB: u32 = 6;
-
+/// around t, so each side gets its own pages. dir holds a page's number in the pool as a u16 (half
+/// the cache footprint of an offset), side 0 then side 1; pages grow if n ever needs more numbers.
 struct Pages {
-    dir: Vec<u32>,
+    dir: Vec<u16>,
     half: usize,
+    pb: u32,
     pool: Vec<u32>,
     top: usize,
     used: Vec<u32>,
@@ -458,33 +458,34 @@ struct Pages {
 
 impl Pages {
     fn new(n: usize) -> Self {
-        let half = (n >> PB) + 1;
-        Pages { dir: vec![NOPAGE; 2 * half], half, pool: Vec::new(), top: 0, used: Vec::new() }
+        let pb = (6..).find(|&b| 2 * ((n >> b) + 1) < NOPAGE as usize).unwrap();
+        let half = (n >> pb) + 1;
+        Pages { dir: vec![NOPAGE; 2 * half], half, pb, pool: Vec::new(), top: 0, used: Vec::new() }
     }
 
     /// Index of v's label on `side`, allocating its page.
     #[inline(always)]
     fn at(&mut self, v: u32, side: usize) -> usize {
-        let d = side * self.half + (v >> PB) as usize;
+        let d = side * self.half + (v >> self.pb) as usize;
         if unsafe { *self.dir.get_unchecked(d) } == NOPAGE {
-            self.dir[d] = self.top as u32;
-            self.top += 1 << PB;
+            self.dir[d] = (self.top >> self.pb) as u16;
+            self.top += 1 << self.pb;
             if self.pool.len() < self.top {
                 self.pool.resize(self.top, INF);
             } else {
-                self.pool[self.top - (1 << PB)..self.top].fill(INF);
+                self.pool[self.top - (1 << self.pb)..self.top].fill(INF);
             }
             self.used.push(d as u32);
         }
-        unsafe { *self.dir.get_unchecked(d) as usize + (v & ((1 << PB) - 1)) as usize }
+        (unsafe { *self.dir.get_unchecked(d) } as usize) << self.pb | (v & ((1 << self.pb) - 1)) as usize
     }
 
     /// v's label on `side` (tentative or settled), INF if none.
     #[inline(always)]
     fn get(&self, v: u32, side: usize) -> u32 {
-        match unsafe { *self.dir.get_unchecked(side * self.half + (v >> PB) as usize) } {
+        match unsafe { *self.dir.get_unchecked(side * self.half + (v >> self.pb) as usize) } {
             NOPAGE => INF,
-            p => unsafe { *self.pool.get_unchecked(p as usize + (v & ((1 << PB) - 1)) as usize) },
+            p => unsafe { *self.pool.get_unchecked((p as usize) << self.pb | (v & ((1 << self.pb) - 1)) as usize) },
         }
     }
 
