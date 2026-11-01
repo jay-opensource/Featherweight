@@ -52,12 +52,8 @@ fn map(path: &str) -> &'static [u8] {
     let len = f.metadata().unwrap().len() as usize;
     assert!(len < 1 << 32);
     unsafe {
-        // At a 2 MB-aligned address, so page-cache folios of 2 MB can be mapped by one PMD entry
-        // (fault-around and unmapping then work per 2 MB, not per 4 KB page).
-        let p = mmap(std::ptr::null_mut(), len + 4096 + (2 << 20), 1, 0x22, -1, 0) as usize;
-        let p = (p + (2 << 20) - 1 & !((2 << 20) - 1)) as *mut u8;
+        let p = mmap(std::ptr::null_mut(), len + 4096, 1, 0x22, -1, 0);
         assert!(p as isize != -1 && (len == 0 || mmap(p, len, 1, 0x12, f.as_raw_fd(), 0) == p));
-        madvise(p, len, 14); // MADV_HUGEPAGE, for boxes with THP "madvise"
         madvise(p, len, 2); // MADV_SEQUENTIAL: unmapping skips the per-page accessed marking
         std::slice::from_raw_parts(p, len)
     }
