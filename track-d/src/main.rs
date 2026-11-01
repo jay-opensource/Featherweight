@@ -524,6 +524,12 @@ fn bidir(pg: &mut Pages, hs: &mut [Radix; 2], g: &Graph, r: &Graph, s: usize, t:
         }
         pg.pool[iu] = lu | SETTLED;
         let (gr, h) = (if side == 0 { g } else { r }, &mut hs[side]);
+        if let Some(&e) = h.b[0].last() {
+            // The next node this side settles is usually the next one in bucket 0: start its miss.
+            let x = e as u32 as usize;
+            prefetch(&gr.rel[x]);
+            prefetch(&gr.base[x >> gr.sh]);
+        }
         gr.adj(u as usize, |v, w| {
             let nd = d as u64 + w as u64;
             if nd >= INF as u64 {
