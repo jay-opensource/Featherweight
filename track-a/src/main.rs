@@ -10,7 +10,6 @@
 use std::arch::x86_64::*;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{Barrier, Mutex, OnceLock};
@@ -23,9 +22,11 @@ extern "C" {
 
 const HOURS: usize = 72; // 2026-10-30T18 to 2026-11-02T17, the same for every seed (spec)
 const SLOTS: usize = 8192; // interner slots, a power of two well above 1,842 endpoints
-const ESC: u32 = (1 << 20) - 1; // latency field of a record whose latency is in the next word
+// Latency fields from ESC up are escapes: they keep the latency's low 11 bits, and the next word
+// (an escape word, endpoint id 0) holds the rest. Every word then stands alone: the stats loops
+// step one word at a time, with no load-dependent stride.
+const ESC: u32 = (1 << 20) - 2048;
 const B: usize = 128; // words per record block
-const RD: usize = 1 << 16; // bytes per read of the input
 
 /// `len` bytes of fresh anonymous memory without huge pages (the box has THP "always", and a 2 MB
 /// page is charged whole): only the 4 KB pages that get touched are charged.
@@ -191,7 +192,7 @@ unsafe impl Sync for Pool {}
 impl Pool {
     fn block(&self, h: usize) -> *mut u32 {
         let k = self.used[h].fetch_add(1, Relaxed);
-        assert!((k + 1) * B <= self.region);
+        assert!((k + 1) * B < self.region); // a spare word: the scatter reads one word ahead
         unsafe { self.base.add(h * self.region + k * B) }
     }
 
@@ -228,6 +229,9 @@ fn parse(b: &[u8], lo: usize, hi: usize, names: &Names, pool: &Pool, cur: &mut [
             h = (24 * (x >> 8 & 0xFF) + (x >> 32 & 0xFF) + 744 * (w >> 8 & 1) - 738) as usize;
             c = cur[h];
         }
+        // The hardware prefetcher stops at every 4 KB page (page cache pages are scattered), so ask
+        // for the bytes 1 KB ahead now. A prefetch never faults, even past the end of the mapping.
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(b.as_ptr().wrapping_add(p + 1024) as *const i8) };
         // Separators from the method's third byte on: the method ends at the first, the endpoint
         // at the second.
         let (mut q, mut m) = (p + 31, seps(b, p + 31));
@@ -254,12 +258,10 @@ fn parse(b: &[u8], lo: usize, hi: usize, names: &Names, pool: &Pool, cur: &mut [
             c = pool.block(h);
         }
         unsafe {
-            *c = id | err << 11 | lat.min(ESC) << 12;
-            c = c.add(1);
-            if lat >= ESC {
-                *c = lat;
-                c = c.add(1);
-            }
+            let big = lat >= ESC;
+            *c = id | err << 11 | (lat | if big { ESC } else { 0 }) << 12; // << 12 drops bit 20 up
+            *c.add(1) = lat & !2047; // the escape word, kept only if needed
+            c = c.add(1 + big as usize);
         }
     }
     cur[h] = c;
@@ -331,7 +333,6 @@ fn main() {
     let threads = std::env::var("FW_THREADS").ok().and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |p| p.get()));
     let b = map("/data/requests.log");
-    let file = File::open("/data/requests.log").unwrap();
     let names = Names { slots: Box::new([const { AtomicU64::new(0) }; SLOTS]), keys: Mutex::new(Vec::new()), text: anon(2048 * 128) };
     // Any hour may hold every line (two words each at worst) plus a partly filled block per thread,
     // and later 2,048 groups of six words.
@@ -345,19 +346,10 @@ fn main() {
         for _ in 0..threads {
             s.spawn(|| {
                 let mut cur = [(4 * B - 4) as *mut u32; HOURS];
-                // The input is read into a small buffer of our own (the parser may read 4 KB past
-                // the data): no page tables to fill and tear down for 239 MB of mapped page cache.
-                let buf = unsafe { std::slice::from_raw_parts_mut(anon::<u8>(RD + 4096), RD + 4096) };
                 while let Some(&(lo, hi)) = parts.get(next[0].fetch_add(1, Relaxed)) {
-                    let mut at = lo;
-                    while at < hi {
-                        let n = file.read_at(&mut buf[..(hi - at).min(RD)], at as u64).expect("read");
-                        assert!(n > 0);
-                        // Whole lines only: up to the last LF (the chunk itself ends with one).
-                        let end = if at + n == hi { n } else { buf[..n].iter().rposition(|&c| c == b'\n').unwrap() + 1 };
-                        parse(buf, 0, end, &names, &pool, &mut cur);
-                        at += end;
-                    }
+                    parse(b, lo, hi, &names, &pool, &mut cur);
+                    // Unmap the chunk's whole pages now, on this thread, not all at exit on one.
+                    zap(b[lo..].as_ptr(), hi - lo);
                 }
                 if bar.wait().is_leader() {
                     // Endpoint ids in byte order of their names.
@@ -379,10 +371,7 @@ fn main() {
                 while let Some(&h) = hrs.get(next[1].fetch_add(1, Relaxed)) {
                     let words = pool.words(h);
                     cnt.fill(0);
-                    let mut i = 0;
-                    while i < words.len() {
-                        let w = words[i];
-                        i += 1 + (w >> 12 == ESC) as usize;
+                    for &w in words {
                         cnt[(w & 2047) as usize] += 1 + ((w as u64 & 0x800) << 21);
                     }
                     let mut total = 0;
@@ -390,15 +379,13 @@ fn main() {
                         at[id] = total;
                         total += cnt[id] as u32;
                     }
-                    // Zero words (the unused tails of blocks) are id 0: they land after the groups.
+                    // Words of id 0 (escape words, the unused tails of blocks) land after the groups.
                     at[0] = total;
-                    let mut i = 0;
-                    while i < words.len() {
-                        let (w, big) = (words[i], words[i] >> 12 == ESC);
+                    for (i, &w) in words.iter().enumerate() {
+                        let (v, x) = (w >> 12, unsafe { *words.as_ptr().add(i + 1) });
                         let c = &mut at[(w & 2047) as usize];
-                        lat[*c as usize] = if big { words[i + 1] } else { w >> 12 };
+                        lat[*c as usize] = if v >= ESC { x | v & 2047 } else { v };
                         *c += 1;
-                        i += 1 + big as usize;
                     }
                     let nw = words.len();
                     let st = pool.stats(h);
