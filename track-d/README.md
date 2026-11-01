@@ -26,14 +26,18 @@ through memory, so the program spends its effort on making that memory small and
    reach the best meeting length. Over the 2,000 queries this settles 7.15M nodes instead of
    23.2M for a one-ended search. Labels are 31-bit distances (top bit = settled) in per-thread
    pages of 64 node ids, one set of pages per side, allocated on first touch; BFS order keeps a
-   search inside few pages. Queues are radix heaps of 8-byte entries.
-5. **Exact for every weight.** A label that would need more than 31 bits is skipped (every path
-   through it is at least that long), and the rare query whose answer could be that long is
-   answered by a one-ended u64 Dijkstra.
+   search inside few pages. Each side's queue is a Dial bucket queue (one bucket per distance modulo
+   W = 8192, above the largest main-body weight); an entry carries the label index and the node's
+   edge range, so a pop needs no lookup, and the edges are prefetched when the node is queued. One
+   search step is generic over the side, so forward/backward choices are compile-time constants.
+5. **Exact for every weight.** Edges of weight >= W and labels that would need more than 31 bits
+   are skipped; the smallest skipped length is kept, and only a query whose answer could be that
+   long falls back to a one-ended u64 Dijkstra (10 queries on the full set).
 6. **Memory accounting.** The scoring box runs transparent huge pages "always", which charges a
-   whole 2 MB page for the first touched byte of a sparse allocation. A small global allocator
-   marks every allocation of 256 KB or more MADV_NOHUGEPAGE and lets only the dense graph arrays
-   opt back in.
+   whole 2 MB page for the first touched byte of a sparse allocation. Once the searches were local,
+   nothing gained from 2 MB pages (measured on the board), so the process opts out with one
+   `prctl(PR_SET_THP_DISABLE)`; one malloc arena keeps the per-thread search vectors packed. The
+   answers are written and the process exits at once, without freeing the big arrays.
 
 The measurements behind each step, the board run IDs and the experiments that lost are in
 [PERF.md](PERF.md).
@@ -45,6 +49,5 @@ None (Rust standard library only).
 ## With another 24 hours
 
 - Build the forward and reverse graphs in one pass over the relabelled order instead of two.
-- A Dial-style bucket queue for the search (edge weights in the main body are below ~8,100).
 - Better locality orderings than BFS regions (e.g. recursive bisection), if they can be computed
   inside the time budget.
