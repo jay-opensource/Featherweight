@@ -9,6 +9,7 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn prctl(option: i32, a2: u64, a3: u64, a4: u64, a5: u64) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 /// Read-only private mapping of a whole file; the page cache is not charged to us, a heap copy would be.
@@ -561,5 +562,14 @@ fn main() {
     let out: String = ans.iter().map(|a| format!("{a:?}\n")).collect(); // Debug: the value
     std::fs::write("/out/distances.txt", out).unwrap();
     eprintln!("build {t1:?} total {:?}", t0.elapsed());
-    std::process::exit(0); // the kernel reclaims everything; do not free the big arrays one by one
+    // The kernel's exit unmaps every page on one core (~0.1-0.4 us per 4 KB page; 5 ms locally
+    // for the text and the two graphs). Drop those pages on all threads first: MADV_DONTNEED on the
+    // whole pages inside each thread's share (nothing reads them again).
+    let big = unsafe { [gt, g.edges.align_to().1, r.edges.align_to().1] };
+    let parts = Vec::from_iter(big.iter().flat_map(|&b| spans(b, b.len(), threads)));
+    par(threads, &parts, |&(b, lo, hi)| {
+        let [a, e] = [lo + 4095, hi].map(|x| b.as_ptr() as usize + x & !4095);
+        unsafe { madvise(a as *mut u8, e.saturating_sub(a), 4) };
+    });
+    std::process::exit(0); // the kernel reclaims the rest; do not free the big arrays one by one
 }
