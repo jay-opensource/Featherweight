@@ -14,7 +14,7 @@ extern "C" {
 
 /// The scoring box backs anonymous memory with 2 MB pages (THP "always"), and memory.peak charges
 /// a whole 2 MB page for its first touched byte. So every allocation of 256 KB or more is marked
-/// MADV_NOHUGEPAGE, and only the graph arrays, which are dense and hot, opt back in (`huge`).
+/// MADV_NOHUGEPAGE.
 struct Alloc;
 
 unsafe impl std::alloc::GlobalAlloc for Alloc {
@@ -44,9 +44,6 @@ fn advise(p: *mut u8, len: usize, advice: i32) -> *mut u8 {
     p
 }
 
-fn huge<T>(v: &mut Vec<T>) {
-    advise(v.as_mut_ptr() as *mut u8, v.capacity() * std::mem::size_of::<T>(), 14);
-}
 
 /// Read-only private mapping of a whole file; the page cache is not charged to us, a heap copy would be.
 fn map(path: &str) -> &'static [u8] {
@@ -228,7 +225,6 @@ fn layout(n: usize, threads: usize, slots: impl Fn(usize) -> u32 + Sync) -> (Vec
                 total += x;
             }
             base.push(total);
-            huge(&mut rel);
             return (base, rel, sh);
         }
         sh -= 1;
@@ -289,7 +285,6 @@ fn csr(n: usize, threads: usize, vb: u32, esc: u32, items: &[impl Edges]) -> Gra
     }
     start[nb] = acc as usize;
     let (mut edges, mut loc) = (vec![0u32; acc as usize], vec![0u16; acc as usize]);
-    huge(&mut edges);
     let (ep, lp) = (Slots(edges.as_mut_ptr()), Slots(loc.as_mut_ptr()));
     par(threads, &idx, |&i| {
         let (ep, lp) = (&ep, &lp);
@@ -397,7 +392,6 @@ fn relabel(g: &Graph, newid: &[u32], threads: usize) -> Graph {
     let (base, rel, sh) = layout(n, threads, |k| deg[k].load(Relaxed) as u32);
     drop(deg);
     let mut edges = vec![0u32; *base.last().unwrap() as usize];
-    huge(&mut edges);
     let out = Slots(edges.as_mut_ptr());
     par(threads, &ranges, |&(lo, hi)| {
         let out = &out;
