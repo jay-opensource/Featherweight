@@ -12,7 +12,7 @@
 // compared with its dictionary bucket, which the parser prefetched.
 use std::arch::x86_64::*;
 use std::sync::{atomic::Ordering::*, atomic::*, Mutex};
-use std::{fs::File, os::unix::io::AsRawFd};
+use std::{fs::File, os::unix::fs::FileExt, os::unix::io::AsRawFd};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -158,9 +158,9 @@ struct Bucket([AtomicU64; 2], [[AtomicU64; 2]; 3]);
 const BUSY: u32 = 0xFFFF_C000;
 const LONG: u64 = 1 << 63;
 
-/// One thread's state: aggregates per group, its block of free ids, and its bit queues (64 regions
-/// x 64 pairs `word << 6 | bit`, and their lengths).
-type Local = ([Agg; 256], (u32, u32), Pend);
+/// One thread's state: aggregates per group, its block of free ids, its bit queues (64 regions x 64
+/// pairs `word << 6 | bit`, and their lengths), and its read buffer.
+type Local = ([Agg; 256], (u32, u32), Pend, *mut u8);
 type Pend = ([[u32; 64]; 64], [usize; 64]);
 
 impl Shared<'_> {
@@ -329,6 +329,36 @@ fn record(b: &[u8], rs: usize, lf: usize, quotes: u32, sh: &Shared) -> Rec {
     Rec(key, s, n, h, region, id, cents, nb, tb)
 }
 
+/// Bytes of records.csv read at a time into a thread's buffer, which stays in its L2 cache. The
+/// parse does not map the file: no page-table entries to fault in while reading, none to tear down
+/// at exit, and the kernel copies from the page cache in big strides.
+const PIECE: usize = 1 << 16;
+
+/// Parse the records of f (len bytes) that start in [from, to), one piece at a time through the
+/// thread's buffer: 64 bytes in front (a record looks back up to 32), the piece, then zero bytes.
+/// A record cut by the end of a piece is read again at the start of the next. Parsing starts at the
+/// first line start at or after `from` (`from` itself for the first record of the file). Returns
+/// where parsing started and where it stopped: the first record start at or after `to`, or `len`.
+fn read(f: &File, len: usize, from: usize, to: usize, sh: &Shared, me: &mut Local) -> [usize; 2] {
+    let (mut pos, mut start, buf) = (from - 1, None, me.3);
+    loop {
+        let n = PIECE.min(len - pos);
+        let piece = unsafe { std::slice::from_raw_parts_mut(buf.add(64), n + 64) };
+        f.read_exact_at(&mut piece[..n], pos as u64).unwrap();
+        piece[n..].fill(0); // no stale LF after the data
+        let b = unsafe { std::slice::from_raw_parts(buf, PIECE + 192) };
+        let find = || (65..64 + n).find(|&i| line_start(b, i)).unwrap_or(64 + n) - 64;
+        let skip = if start.is_none() { find() } else { 0 };
+        start = start.or(Some(pos + skip));
+        let stop = chunk(b, 64 + skip, to + 64 - pos, 64 + n, sh, me);
+        pos += stop - 64;
+        if pos >= to || n < PIECE {
+            return [start.unwrap(), pos];
+        }
+        assert!(stop > 64 + skip, "a record longer than a piece");
+    }
+}
+
 /// Parse the records that start in b[start..end) and end in b[..valid) (start is a record start).
 /// Returns where parsing stopped: at `end` or later if `end` is passed, else at the first record
 /// that is not complete (or `valid`).
@@ -361,7 +391,7 @@ fn chunk(b: &[u8], start: usize, end: usize, valid: usize, sh: &Shared, me: &mut
 }
 
 /// Lookups for a batch: its region bytes and dictionary buckets were prefetched while it was parsed.
-fn flush(b: &[u8], batch: &[Rec], sh: &Shared, (agg, ids, pend): &mut Local) {
+fn flush(b: &[u8], batch: &[Rec], sh: &Shared, (agg, ids, pend, _): &mut Local) {
     for r @ &Rec(.., region, id, cents, nb, tb) in batch {
         let g = sh.0.get(region).map_or(0, |g| g.load(Relaxed)) as usize;
         let name = sh.id(b, r, ids);
@@ -401,27 +431,29 @@ fn jobs(next: &AtomicUsize, n: usize) -> impl Iterator<Item = usize> + '_ {
 /// record boundary at or after cut(1). If that equals where job 1 started (by the shape of the data), job 1 started at a true
 /// record start too, and so on by induction. A start inside a quoted field shows up as a job whose
 /// predecessor stopped elsewhere. The starts are found by the jobs themselves, in parallel.
-fn run(b: &[u8], from: usize, tab: &[AtomicU8], attempt: u32, threads: usize) -> Option<Vec<Agg>> {
+fn run(f: &File, from: usize, tab: &[AtomicU8], attempt: u32, threads: usize) -> Option<Vec<Agg>> {
     let threads = if attempt > 0 { 1 } else { threads };
     let cap = 3 << (14 + 2 * attempt);
     if attempt > 0 {
         eprintln!("warning: parallel run rejected; attempt {attempt} on one thread, {cap} buckets");
     }
-    let (k, len) = (if threads > 1 { threads * 48 } else { 1 }, b.len());
+    let k = if threads > 1 { threads * 48 } else { 1 };
+    let len = f.metadata().unwrap().len() as usize;
     let cut = |j: usize| from + (len - from) * j / k; // job j's records start at or after cut(j)
     let bits = zeroed((cap * 3 / 8 * 7 / 4096 + 1) * 256 * 64);
     let locks = (0..64).map(|_| Mutex::new(())).collect();
     let dict = (zeroed(cap), zeroed(1 << 23), (0.into(), 0.into()));
     let sh = Shared(tab, dict.0, dict.1, dict.2, bits, locks);
     let ends: Vec<[AtomicUsize; 2]> = (0..k).map(|_| Default::default()).collect();
+    let bufs = zeroed::<u8>(threads * (PIECE + 192)); // one buffer per thread (see `read`)
     let (next, me) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let aggs = par(threads, || {
-        let t = me.fetch_add(1, Relaxed); // this thread's share of the dictionary to map
+        let t = me.fetch_add(1, Relaxed); // this thread's buffer and share of the dictionary to map
         dict.0.chunks(cap / threads + 64 & !63).nth(t).map(populate);
-        let mut me: Local = ([NEW; 256], (0, 0), ([[0; 64]; 64], [0; 64]));
+        let buf = bufs[t * (PIECE + 192)..].as_ptr() as *mut u8;
+        let mut me: Local = ([NEW; 256], (0, 0), ([[0; 64]; 64], [0; 64]), buf);
         for j in jobs(&next, k) {
-            let start = (cut(j)..len).find(|&i| line_start(b, i)).unwrap_or(len);
-            let stop = chunk(b, start, cut(j + 1), len, &sh, &mut me);
+            let [start, stop] = read(f, len, cut(j), cut(j + 1), &sh, &mut me);
             ends[j][0].store(start, Relaxed);
             ends[j][1].store(stop, Relaxed);
         }
@@ -484,9 +516,11 @@ fn main() {
     let codes = codes.into_inner().unwrap();
     let tab = &tab[..=last.into_inner()]; // ids above it are unknown without a lookup
 
-    let rc = map("/data/records.csv");
-    let from = find(rc, 0, b'\n') + 1; // the first record
-    let total = (0..).find_map(|k| run(rc, from, tab, k, threads)).unwrap();
+    // records.csv is read, not mapped (see `read`); its records start after the header line.
+    let (f, mut head) = (File::open("/data/records.csv").unwrap(), [0; 64]);
+    let n = f.read_at(&mut head, 0).unwrap();
+    let from = find(&head[..n], 0, b'\n') + 1;
+    let total = (0..).find_map(|k| run(&f, from, tab, k, threads)).unwrap();
     let mut order: Vec<usize> = (0..codes.len()).filter(|&g| total[g][0] > 0).collect();
     order.sort_by_key(|&g| codes[g]); // _UNMATCHED is [255; 3]: last
     let mut text = String::new();

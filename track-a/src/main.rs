@@ -99,7 +99,10 @@ fn same(p: *const u8, q: *const u8, n: usize) -> bool {
     loop {
         let ne = unsafe {
             let (p, q) = (p.add(i) as *const __m256i, q.add(i) as *const __m256i);
-            let e = |k| _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(p.add(k)), _mm256_loadu_si256(q.add(k)))) as u32;
+            let e = |k| {
+                let (x, y) = (_mm256_loadu_si256(p.add(k)), _mm256_loadu_si256(q.add(k)));
+                _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32
+            };
             !(e(0) as u64 | (e(1) as u64) << 32)
         };
         if n - i <= 64 {
@@ -126,7 +129,8 @@ fn swar(v: u64) -> u32 {
 #[cold]
 fn long(b: &[u8], i: usize) -> (u32, usize) {
     let k = b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
-    (b[i..i + k].iter().fold(0, |x, &c| x * 10 + (c - b'0') as u32), k)
+    let x = b[i..i + k].iter().fold(0, |x, c| x * 10 + (c & 15) as u32);
+    (x, k)
 }
 
 /// Endpoint interner shared by all threads. A slot is 0 or crc << 32 | len << 24 | id << 12 | at,
@@ -197,20 +201,19 @@ impl Pool {
     }
 
     fn words(&self, h: usize) -> &[u32] {
-        unsafe { std::slice::from_raw_parts(self.base.add(h * self.region), self.used[h].load(Relaxed) * B) }
+        let n = self.used[h].load(Relaxed) * B;
+        unsafe { std::slice::from_raw_parts(self.base.add(h * self.region), n) }
     }
 
     /// Hour h's region seen as group statistics (it holds them once its records are consumed).
     fn stats(&self, h: usize) -> &mut [[u32; 6]] {
-        unsafe { std::slice::from_raw_parts_mut(self.base.add(h * self.region) as *mut [u32; 6], 2048) }
+        unsafe { std::slice::from_raw_parts_mut(self.base.add(h * self.region) as *mut _, 2048) }
     }
 
     /// Give bytes [lo, hi) of hour h's region, widened to whole pages at the top, back to the kernel.
     fn free(&self, h: usize, lo: usize, hi: usize) {
-        let (lo, hi) = ((lo + 4095) & !4095, (hi + 4095) & !4095);
-        if hi > lo {
-            unsafe { madvise((self.base.add(h * self.region) as *mut u8).add(lo), hi - lo, 4) };
-        }
+        let p = unsafe { (self.base.add(h * self.region) as *const u8).add(lo) };
+        zap(p, ((hi + 4095) & !4095).saturating_sub(lo)); // regions are page-aligned
     }
 }
 
@@ -245,7 +248,8 @@ fn parse(b: &[u8], lo: usize, hi: usize, names: &Names, pool: &Pool, cur: &mut [
         let n = e - s;
         // The latency's digits run to the first byte that is not a digit (the LF).
         let d = ld8(b, e + 5) ^ 0x3030_3030_3030_3030;
-        let k = (d.wrapping_add(0x7676_7676_7676_7676) & 0x8080_8080_8080_8080).trailing_zeros() as usize / 8;
+        let k = d.wrapping_add(0x7676_7676_7676_7676) & 0x8080_8080_8080_8080;
+        let k = k.trailing_zeros() as usize / 8;
         let (lat, k) = if k < 8 { (swar(d << (64 - 8 * k)), k) } else { long(b, e + 5) };
         p = e + 6 + k;
         // Hash the first 16 and last 8 bytes of the endpoint (all of it when shorter).
@@ -308,18 +312,47 @@ fn put(o: &mut [u8], i: &mut usize, mut v: u32) {
 fn pct(v: &mut [u32]) -> [u32; 3] {
     let n = v.len();
     let r = [50, 95, 99].map(|q| (q * n + 99) / 100 - 1);
-    if n <= SMALL {
-        v.sort_unstable();
-        return r.map(|i| v[i]);
+    match n {
+        0..=8 => return ranks::<1>(v, r),
+        9..=16 => return ranks::<2>(v, r),
+        17..=32 => return ranks::<4>(v, r),
+        _ => {}
     }
-    let (mut out, mut lo) = ([0u32; 3], 0);
-    for k in 0..3 {
-        out[k] = if r[k] >= lo { *v[lo..].select_nth_unstable(r[k] - lo).1 } else { out[k - 1] };
-        lo = lo.max(r[k] + 1);
-    }
-    out
+    // From n = 33 on the three ranks differ: each select works above the previous one.
+    let a = *v.select_nth_unstable(r[0]).1;
+    let b = *v[r[0] + 1..].select_nth_unstable(r[1] - r[0] - 1).1;
+    [a, b, *v[r[1] + 1..].select_nth_unstable(r[2] - r[1] - 1).1]
 }
-const SMALL: usize = 32;
+
+/// The values at 0-based ranks r of v (at most 8K values) with no branch on the data: in AVX2
+/// lanes each value counts the values below (lt) and above (gt) it, and the value at rank r is one
+/// with lt <= r and gt <= n - 1 - r. Padding is u32::MAX, which can only match a maximum.
+#[inline(always)]
+fn ranks<const K: usize>(v: &[u32], r: [usize; 3]) -> [u32; 3] {
+    let mut x = [i32::MAX; 32]; // values with the sign bit flipped: signed compares order them
+    for (x, &a) in x.iter_mut().zip(v) {
+        *x = (a ^ 1 << 31) as i32;
+    }
+    unsafe {
+        let (z, y) = (_mm256_setzero_si256(), x.as_ptr() as *const __m256i);
+        let y: [__m256i; K] = std::array::from_fn(|q| _mm256_loadu_si256(y.add(q)));
+        let (mut lt, mut gt) = ([z; K], [z; K]);
+        for &a in &x[..v.len()] {
+            let a = _mm256_set1_epi32(a);
+            for q in 0..K {
+                lt[q] = _mm256_sub_epi32(lt[q], _mm256_cmpgt_epi32(y[q], a));
+                gt[q] = _mm256_sub_epi32(gt[q], _mm256_cmpgt_epi32(a, y[q]));
+            }
+        }
+        r.map(|r| {
+            let a = _mm256_set1_epi32(r as i32);
+            let b = _mm256_set1_epi32((v.len() - 1 - r) as i32);
+            let miss = |q: usize| _mm256_or_si256(_mm256_cmpgt_epi32(lt[q], a), _mm256_cmpgt_epi32(gt[q], b));
+            let m = (0..K).fold(0, |m, q| m | (_mm256_movemask_ps(_mm256_castsi256_ps(miss(q))) as u32) << 8 * q);
+            x[(!m).trailing_zeros() as usize] as u32 ^ 1 << 31
+        })
+    }
+}
 
 /// A pointer that threads share, writing disjoint ranges.
 struct Ptr(*mut u8);
