@@ -561,9 +561,8 @@ fn step<const S: usize>(pg: &mut Pages, h: &mut Dial, gr: &Graph, m: &mut [u64; 
                 return;
             }
             let iv = pg.at(v, S);
-            let lv = ld(&pg.pool, iv);
-            if lv & SETTLED != 0 || lv as u64 <= nd {
-                return;
+            if ld(&pg.pool, iv) as i32 <= nd as i32 {
+                return; // settled (negative as i32), or labelled no worse
             }
             *mt(&mut pg.pool, iv) = nd as u32;
             // Start fetching the node's edges now: it is usually popped later.
