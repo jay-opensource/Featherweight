@@ -224,6 +224,9 @@ fn parse(b: &[u8], lo: usize, hi: usize, names: &Names, pool: &Pool, cur: &mut [
             h = (24 * (x >> 8 & 0xFF) + (x >> 32 & 0xFF) + 744 * (w >> 8 & 1) - 738) as usize;
             c = cur[h];
         }
+        // The hardware prefetcher stops at every 4 KB page (page cache pages are scattered), so ask
+        // for the bytes 1 KB ahead now. A prefetch never faults, even past the end of the mapping.
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(b.as_ptr().wrapping_add(p + 1024) as *const i8) };
         // Separators from the method's third byte on: the method ends at the first, the endpoint
         // at the second.
         let (mut q, mut m) = (p + 31, seps(b, p + 31));
