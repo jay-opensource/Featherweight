@@ -566,11 +566,9 @@ fn plain(g: &Graph, s: usize, t: usize) -> i64 {
 
 fn main() {
     // The scoring box backs anonymous memory with 2 MB pages. That helps the graph, but would round
-    // every thread's stack and malloc arena up to 2 MB: so small stacks, one arena (M_ARENA_MAX),
-    // and every block of 4 KB or more in its own mapping (M_MMAP_THRESHOLD), too small for a 2 MB
-    // page, instead of in a heap that grows and fragments under the search's growing vectors.
+    // every thread's stack and malloc arena up to 2 MB: so small stacks, and one arena (M_ARENA_MAX).
     std::env::set_var("RUST_MIN_STACK", "262144");
-    unsafe { (mallopt(-8, 1), mallopt(-3, 4096)) };
+    unsafe { mallopt(-8, 1) };
     let t0 = std::time::Instant::now();
     let threads = std::env::var("FW_THREADS").ok().and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |p| p.get()));
