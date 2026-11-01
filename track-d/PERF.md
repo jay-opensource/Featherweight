@@ -75,7 +75,7 @@ operating point 1% of T is worth about 0.11 points, 1% of M about 0.04, and 10 l
 | 42 | bbee872 | Same D code as step 40 (the shipped commit) | run-74ad01ee4c63 | 0.1432 | 64.9 | 454 | 71.35 |
 | 43 | 8a67e30 | Same D code as step 40 (documentation change) | run-8b3afbc8368f | 0.1344 | 64.4 | 454 | 72.07 |
 | 44 | 48198af | Build rework (a9974c9): per-bucket offsets in the builder's finish, relabelled graph built by the same builder (no copy, no degree arrays, no 65k degree limit), builder split so the ids are freed first | run-665c3b98b9ee | 0.1331 | 63.3 | 430 | 72.43 |
-| 45 | 9477275 | Same D code as step 44 (another track changed), re-run at 10:29 UTC | TODO: run ID not in the board JSON (only the best and latest runs are listed) | 0.1327 | 62.5 | 430 | 72.51 |
+| 45 | 9477275 | Same D code as step 44 (another track changed), re-run at 10:29 UTC | (run ID not recorded: the board JSON lists only best and latest runs) | 0.1327 | 62.5 | 430 | 72.51 |
 | 46 | b5f8df8 | Same D code as step 44 | run-1a26c84a5351 | 0.1361 | 62.7 | 430 | 72.23 |
 | 47 | a8fb336 | Same D code as step 44, on a slow stretch of the box (unchanged C code ran 31.8 ms instead of 29-30 ms in the same push) | run-29a3a688b9e1 | 0.1402 | 62.5 | 430 | 71.92 |
 | 48 | 96c67ed | Text parsed once with overflow restart; BFS claims in a bitset; helper inlining (7f21d9f) + far pairs first and the capped `via` fallback (D4) | run-b28ea11afb16 | 0.1253 | 62.5 | 458 | 72.93 |
