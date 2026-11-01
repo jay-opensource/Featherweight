@@ -239,9 +239,10 @@ fn layout(n: usize, threads: usize, slots: impl Fn(usize) -> u32 + Sync) -> (Vec
 /// edges of one work item, and runs twice. Every random access stays inside a small region:
 /// 1. count each item's slots per bucket of 8192 nodes (213 counters per item, no atomics);
 /// 2. append each slot to its bucket's region through the item's own cursor, with the node's
-///    place inside the bucket in a parallel u16 array (213 sequential streams per thread);
-/// 3. per bucket, count each node's slots; once the layout is known, reorder the bucket's
-///    ~94 KB of slots by node through a scratch copy.
+///    place inside the bucket in a parallel u16 array (213 sequential streams per thread; both
+///    slots of an escaped edge get it, so the slots can be counted and moved one by one);
+/// 3. per bucket, count each node's slots from the u16s alone; once the layout is known, reorder
+///    the bucket's ~94 KB of slots by node through a scratch copy.
 /// Nothing is locked, and no store lands outside the bucket being worked on.
 fn csr<T: Sync>(n: usize, threads: usize, vb: u32, esc: u32, items: &[T], each: impl Fn(&T, &mut dyn FnMut(usize, u32, u32)) + Sync) -> Graph {
     const BS: u32 = 13;
@@ -268,35 +269,29 @@ fn csr<T: Sync>(n: usize, threads: usize, vb: u32, esc: u32, items: &[T], each: 
         let (ep, lp) = (&ep, &lp);
         let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
         each(&items[i], &mut |u, v, w| {
-            let p = c[u >> BS] as usize;
-            c[u >> BS] += store(ep, p, v, w, vb, esc) as u32;
-            unsafe { *lp.0.add(p) = (u & ((1 << BS) - 1)) as u16 };
+            let (p, l) = (c[u >> BS] as usize, (u & ((1 << BS) - 1)) as u16);
+            let k = store(ep, p, v, w, vb, esc);
+            c[u >> BS] += k as u32;
+            unsafe { (*lp.0.add(p), *lp.0.add(p + k - 1)) = (l, l) };
         });
     });
     let mut deg = vec![0u16; n + 1];
     let dp = Slots(deg.as_mut_ptr());
     let buckets: Vec<usize> = (0..nb).collect();
     par(threads, &buckets, |&b| {
-        let mut p = start[b];
-        while p < start[b + 1] {
-            let k = 1 + (edges[p] >> vb == esc) as u16;
-            let d = unsafe { &mut *(&dp).0.add(b << BS | loc[p] as usize) };
-            *d = d.checked_add(k).expect("out-degree above 65k");
-            p += k as usize;
+        for &l in &loc[start[b]..start[b + 1]] {
+            let d = unsafe { &mut *(&dp).0.add(b << BS | l as usize) };
+            *d = d.checked_add(1).expect("out-degree above 65k");
         }
     });
     let (base, rel, sh) = layout(n, threads, |k| deg[k] as u32);
     par(threads, &buckets, |&b| {
         let (lo, hi) = (start[b], start[b + 1]);
         let e = unsafe { std::slice::from_raw_parts((&ep).0.add(lo), hi - lo) }.to_vec();
-        let l = &loc[lo..hi];
         let mut at: Vec<usize> = (b << BS..((b + 1) << BS).min(n + 1)).map(|k| base[k >> sh] as usize + rel[k] as usize).collect();
-        let mut q = 0;
-        while q < e.len() {
-            let k = 1 + (e[q] >> vb == esc) as usize;
-            let p = &mut at[l[q] as usize];
-            unsafe { std::ptr::copy_nonoverlapping(e.as_ptr().add(q), (&ep).0.add(*p), k) };
-            (*p, q) = (*p + k, q + k);
+        for (&x, &l) in e.iter().zip(&loc[lo..hi]) {
+            unsafe { *(&ep).0.add(at[l as usize]) = x };
+            at[l as usize] += 1;
         }
     });
     Graph { edges, base, rel, sh, vb, esc }
