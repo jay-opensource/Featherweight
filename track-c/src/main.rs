@@ -11,7 +11,7 @@
 // hash set per thread. The input is mapped, not copied, and is never compared against: a name is
 // compared with its dictionary bucket, which the parser prefetched.
 use std::arch::x86_64::*;
-use std::sync::{atomic::Ordering::*, atomic::*, Mutex};
+use std::sync::{atomic::Ordering::*, atomic::*, Barrier, Mutex};
 use std::{fs::File, os::unix::fs::FileExt, os::unix::io::AsRawFd};
 
 extern "C" {
@@ -119,7 +119,7 @@ fn text(b: &[u8], p: usize) -> (usize, u32) {
 }
 
 /// Running aggregates of one group: count, id sum, amount sum, min, max, name bytes, note bytes,
-/// distinct names (bits this thread turned on).
+/// distinct names (bits this thread counted at the end).
 type Agg = [i64; 8];
 const NEW: Agg = [0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0];
 type Words = &'static [AtomicU64];
@@ -142,7 +142,7 @@ type Words = &'static [AtomicU64];
 /// locked OR waits for its line, which another core has usually just written, and blocks every
 /// later load meanwhile. Each thread queues (word, bit) pairs per region of the array (64 regions)
 /// and applies a full queue with plain loads and stores under that region's lock. A word always
-/// maps to the same lock, so each bit turns on exactly once: that is the distinct-name count.
+/// maps to the same lock, so no bit is lost. When all are on, the threads count them by page share.
 struct Shared<'a>(&'a [AtomicU8], &'a [Bucket], Words, Ids, Words, Locks);
 type Ids = (AtomicUsize, AtomicU32);
 type Locks = Vec<Mutex<()>>;
@@ -163,8 +163,7 @@ impl Shared<'_> {
     /// Dense id of the name of r (raw bytes b[r.1..r.1 + r.2]). An overfull dictionary sets the id
     /// counter past every limit, and the run is redone.
     fn id(&self, b: &[u8], r: &Rec, ids: &mut (u32, u32)) -> u32 {
-        let (buckets, tag) = (self.1, r.3 as u32 & 0x1FFF | 0x2000);
-        let mut i = ((r.3 >> 32) * buckets.len() as u64 >> 32) as usize;
+        let (buckets, tag, mut i) = (self.1, r.3 as u32, (r.3 >> 32) as usize);
         loop {
             let k = &buckets[i];
             let h = [k.0[0].load(Acquire), k.0[1].load(Acquire)];
@@ -225,24 +224,22 @@ impl Shared<'_> {
             long[o].store(n as u64, Relaxed);
             (1..nw).for_each(|i| long[o + i].store(kw(b, r.1, n, i), Relaxed));
         }
-        let hdr = r.3 as u32 & 0x1FFF | 0x2000 | (ids.0 + 1) << 14;
+        let hdr = r.3 as u32 | (ids.0 + 1) << 14;
         w.fetch_xor(((BUSY ^ hdr) as u64) << shift, Release);
         ids.0 += 1;
         Some(ids.0 - 1)
     }
 
     /// The queued words are fetched for writing first, so their cache misses overlap.
-    fn apply(&self, q: &[u32; 64], len: &mut usize, r: usize, agg: &mut [Agg; 256]) {
+    fn apply(&self, q: &[u32; 64], len: &mut usize, r: usize) {
         for &x in &q[..*len] {
             let p = self.4.as_ptr().wrapping_add(x as usize >> 6) as *const i8;
             unsafe { _mm_prefetch(p, _MM_HINT_ET0) };
         }
         let _lock = self.5[r].lock().unwrap();
         for &x in &q[..*len] {
-            let (a, m) = (&self.4[(x >> 6) as usize], 1 << (x & 63));
-            let old = a.load(Relaxed);
-            a.store(old | m, Relaxed);
-            agg[(x >> 12) as usize & 255][7] += (old & m == 0) as i64; // x = (page, group, word, bit)
+            let a = &self.4[(x >> 6) as usize];
+            a.store(a.load(Relaxed) | 1 << (x & 63), Relaxed);
         }
         *len = 0;
     }
@@ -259,8 +256,8 @@ fn lanes(h: [u64; 2], tag: u32) -> [u32; 3] {
     }
 }
 
-/// A parsed record waiting for its lookups: the name's first 16 bytes (zero-padded), start, length
-/// and hash; the region, id and amount; the name's and the note's bytes after unescaping.
+/// A parsed record waiting for its lookups: the name's first 16 bytes (zero-padded), start, length,
+/// and bucket << 32 | tag; the region, id and amount; the name's and the note's bytes unescaped.
 #[derive(Clone, Copy, Default)]
 struct Rec([u64; 2], usize, usize, u64, usize, i64, i64, i64, i64);
 
@@ -297,9 +294,9 @@ fn record(b: &[u8], rs: usize, lf: usize, quotes: u32, sh: &Shared) -> Rec {
         let h = _mm_cvtsi128_si64(_mm_aesenc_si128(h, r)) as u64;
         (std::mem::transmute(k), h)
     };
-    let k = &sh.1[((h >> 32) * sh.1.len() as u64 >> 32) as usize];
-    let region = region as usize;
-    unsafe { _mm_prefetch(k as *const Bucket as *const i8, _MM_HINT_T0) }; // the name's bucket
+    let h = (h >> 32) * sh.1.len() as u64 & !0xFFFF_FFFF | h & 0x1FFF | 0x2000; // bucket, tag
+    let (k, region) = (h as usize >> 32, region as usize);
+    unsafe { _mm_prefetch(sh.1.as_ptr().add(k) as *const i8, _MM_HINT_T0) }; // the name's bucket
     unsafe { _mm_prefetch(sh.0.as_ptr().wrapping_add(region) as *const i8, _MM_HINT_T0) };
     let nb = (n + quoted - nq as usize / 2) as i64;
     let tb = (c2 - c1 - 1 - tq / 2 - (tq > 0) as usize) as i64;
@@ -307,10 +304,11 @@ fn record(b: &[u8], rs: usize, lf: usize, quotes: u32, sh: &Shared) -> Rec {
     Rec(key, s, n, h, region, id, cents, nb, tb)
 }
 
-/// Bytes of records.csv read at a time into a thread's buffer, which stays in its L2 cache. The
-/// parse does not map the file: no page-table entries to fault in while reading, none to tear down
-/// at exit, and the kernel copies from the page cache in big strides.
-const PIECE: usize = 1 << 16;
+/// Bytes of records.csv read at a time into a thread's buffer, which stays in its cache. The parse
+/// does not map the file: no page-table entries to fault in while reading, none to tear down at
+/// exit, and the kernel copies from the page cache in big strides. 32 KB costs no time against 64
+/// KB and 0.4 MB less memory; 16 KB costs kernel time.
+const PIECE: usize = 1 << 15;
 
 /// Parse the records of f (len bytes) that start in [from, to), one piece at a time through the
 /// thread's buffer: 64 bytes in front (a record looks back up to 32), the piece, then zero bytes.
@@ -372,9 +370,7 @@ fn flush(b: &[u8], batch: &[Rec], sh: &Shared, (agg, ids, (q, len), _): &mut Loc
         let r = (name as usize >> 6 ^ g) & 63; // the region of the name's word
         q[r][len[r]] = (name >> 12) << 20 | (g as u32) << 12 | name & 0xFFF; // word << 6 | bit
         len[r] += 1;
-        if len[r] == 64 {
-            sh.apply(&q[r], &mut len[r], r, agg);
-        }
+        (len[r] == 64).then(|| sh.apply(&q[r], &mut len[r], r));
     }
 }
 
@@ -385,12 +381,9 @@ fn line_start(b: &[u8], i: usize) -> bool {
     at(b, i - 1) == b'\n' && (at(b, i).is_ascii_digit() || at(b, i) == 0xEF)
 }
 
-/// Run `f` on `threads` threads and collect the results.
-fn par<T: Send>(threads: usize, f: impl Fn() -> T + Sync) -> Vec<T> {
-    std::thread::scope(|s| {
-        let hs: Vec<_> = (0..threads).map(|_| s.spawn(&f)).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    })
+/// Run `f` on `threads` threads; the scope waits for them all.
+fn par(threads: usize, f: impl Fn() + Sync) {
+    std::thread::scope(|s| (0..threads).for_each(|_| drop(s.spawn(&f))));
 }
 
 /// Job numbers below n, handed out one at a time.
@@ -398,7 +391,7 @@ fn jobs(next: &AtomicUsize, n: usize) -> impl Iterator<Item = usize> + '_ {
     std::iter::repeat_with(|| next.fetch_add(1, Relaxed)).take_while(move |&j| j < n)
 }
 
-/// Aggregates and distinct-name counts per group. Attempt 0 uses all threads; a later attempt
+/// Aggregates and distinct-name counts per group. Round 0 uses all threads; a later round
 /// (never needed on generated data) uses one thread and a dictionary 4 times larger. None if a cut
 /// was not a record boundary or the dictionary filled up.
 ///
@@ -407,12 +400,19 @@ fn jobs(next: &AtomicUsize, n: usize) -> impl Iterator<Item = usize> + '_ {
 /// record boundary at or after cut(1). If that equals where job 1 started (by the shape of the
 /// data), job 1 started at a true record start too, and so on by induction. A start inside a quoted
 /// field shows up as a job whose predecessor stopped elsewhere. Jobs find their starts in parallel.
-fn run(f: &File, from: usize, tab: &[AtomicU8], attempt: u32, threads: usize) -> Option<Vec<Agg>> {
-    let threads = if attempt > 0 { 1 } else { threads };
-    let cap = 3 << (14 + 2 * attempt);
-    (attempt > 0).then(|| eprintln!("warning: parallel run rejected; attempt {attempt} on 1 thread"));
+///
+/// The threads first run `pre` (the regions jobs; none are left in a later round) and map their
+/// share of the dictionary, then wait for each other: one round of thread starts, not two.
+fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) -> Option<Vec<Agg>> {
+    let threads = if round > 0 { 1 } else { threads };
+    let cap = 3 << (14 + 2 * round);
+    (round > 0).then(|| eprintln!("warning: parallel run rejected; attempt {round} on 1 thread"));
     let k = if threads > 1 { threads * 48 } else { 1 };
+    // records.csv is read, not mapped (see `read`); its records start after the header line.
+    let (f, mut head) = (File::open("/data/records.csv").unwrap(), [0; 64]);
+    let n = f.read_at(&mut head, 0).unwrap();
     let len = f.metadata().unwrap().len() as usize;
+    let from = find(&head[..n], 0, b'\n') + 1;
     let cut = |j: usize| from + (len - from) * j / k; // job j's records start at or after cut(j)
     let bits = zeroed((cap * 3 / 8 * 7 / 4096 + 1) * 256 * 64);
     let locks = (0..64).map(|_| Mutex::new(())).collect();
@@ -424,30 +424,38 @@ fn run(f: &File, from: usize, tab: &[AtomicU8], attempt: u32, threads: usize) ->
     let ends: Vec<[AtomicUsize; 2]> = (0..k).map(|_| Default::default()).collect();
     let bufs = zeroed::<u8>(threads * (PIECE + 192)); // one buffer per thread (see `read`)
     let (next, me) = (AtomicUsize::new(0), AtomicUsize::new(0));
-    let aggs = par(threads, || {
+    let (wait, total) = (Barrier::new(threads), Mutex::new([NEW; 256])); // total: what threads add
+    par(threads, || {
         let t = me.fetch_add(1, Relaxed); // this thread's buffer and share of the dictionary to map
-        dict.0.chunks(cap / threads + 64 & !63).nth(t).map(populate);
+        let r = &dict.0[1 << 15..]; // the dictionary after its first 2 MB
+        r.chunks(r.len() / threads + 64 & !63).nth(t).map(populate); // whole pages
+        // One thread maps each 2 MB page: threads racing to fault one in would each clear and charge
+        // a 2 MB page, and all but one would then free theirs.
+        (t == 0).then(|| populate(&dict.0[..1 << 15]));
+        (t == 1 % threads).then(|| populate(&bits[..1 << 18]));
+        pre();
+        wait.wait();
         let buf = bufs[t * (PIECE + 192)..].as_ptr() as *mut u8;
         let mut me: Local = ([NEW; 256], (0, 0), ([[0; 64]; 64], [0; 64]), buf);
         for j in jobs(&next, k) {
-            let [start, stop] = read(f, len, cut(j), cut(j + 1), &sh, &mut me);
+            let [start, stop] = read(&f, len, cut(j), cut(j + 1), &sh, &mut me);
             ends[j][0].store(start, Relaxed);
             ends[j][1].store(stop, Relaxed);
         }
-        (0..64).for_each(|r| sh.apply(&me.2 .0[r], &mut me.2 .1[r], r, &mut me.0));
-        me.0
+        (0..64).for_each(|r| sh.apply(&me.2 .0[r], &mut me.2 .1[r], r));
+        wait.wait(); // all bits are on: each thread counts them in its share of the used pages
+        let w = (sh.3 .1.load(Relaxed) as usize + 4095 >> 12).min(bits.len() >> 14) << 14;
+        for i in w * t / threads..w * (t + 1) / threads {
+            me.0[i >> 6 & 255][7] += bits[i].load(Relaxed).count_ones() as i64;
+        }
+        for (s, x) in total.lock().unwrap().iter_mut().zip(&me.0) {
+            (s[0], s[1], s[2], s[3]) = (s[0] + x[0], s[1] + x[1], s[2] + x[2], s[3].min(x[3]));
+            (s[4], s[5], s[6], s[7]) = (s[4].max(x[4]), s[5] + x[5], s[6] + x[6], s[7] + x[7]);
+        }
     });
     let overfull = sh.3 .1.load(Relaxed) as usize >= cap * 3 / 8 * 7;
-    if overfull || (1..k).any(|j| ends[j - 1][1].load(Relaxed) != ends[j][0].load(Relaxed)) {
-        return None;
-    }
-    let mut total = vec![NEW; 256];
-    for (g, x) in aggs.iter().flat_map(|a| a.iter().enumerate()) {
-        let t = &mut total[g];
-        (t[0], t[1], t[2], t[3]) = (t[0] + x[0], t[1] + x[1], t[2] + x[2], t[3].min(x[3]));
-        (t[4], t[5], t[6], t[7]) = (t[4].max(x[4]), t[5] + x[5], t[6] + x[6], t[7] + x[7]);
-    }
-    Some(total)
+    let proved = (1..k).all(|j| ends[j - 1][1].load(Relaxed) == ends[j][0].load(Relaxed));
+    (proved && !overfull).then(|| total.into_inner().unwrap().to_vec())
 }
 
 fn money(c: i64) -> String {
@@ -461,17 +469,19 @@ fn main() {
     let threads = std::env::var("FW_THREADS").map_or(cores, |v| v.parse().unwrap());
 
     // regions.csv: a header, then "id,CCC" lines. tab maps a region id to its group: 0 is
-    // _UNMATCHED, and countries are numbered 1.. in order of first sight (codes[g]).
+    // _UNMATCHED, and countries are numbered 1.. in order of first sight (codes[g]). Ids ascend, so
+    // the last line holds the largest, and ids above it are unknown without a lookup.
     let rg = map("/data/regions.csv");
-    let tab: &[AtomicU8] = zeroed(1 << 24); // region ids are below 10^7; only touched pages count
+    let c = rg.len() - 5; // the comma of the last line
+    let p = rg[..c].iter().rposition(|&x| x == b'\n').unwrap() + 1;
+    let tab: &[AtomicU8] = zeroed(numbers([word(rg, c - 8), 0, 0], [c - p, 0, 0])[0] as usize + 1);
     let (codes, seen) = (Mutex::new(vec![[255u8; 3]]), zeroed::<AtomicU8>(1 << 15));
-    let last = AtomicUsize::new(0); // the largest region id
     let (from, k, next) = (find(rg, 0, b'\n') + 1, threads * 4, AtomicUsize::new(0));
     let cut = |j: usize| from + (rg.len() - from) * j / k; // job j's lines start at or after cut(j)
-    par(threads, || {
+    let regions = || {
         for j in jobs(&next, k) {
             let line = (cut(j)..rg.len()).find(|&i| line_start(rg, i));
-            let (mut p, mut region) = (line.unwrap_or(rg.len()), 0);
+            let mut p = line.unwrap_or(rg.len());
             while p < cut(j + 1) {
                 let c = find(rg, p, b',');
                 let code = unsafe { _pext_u64(word(rg, c + 1), 0x1F1F1F) } as usize;
@@ -483,21 +493,14 @@ fn main() {
                         seen[code].store(list.len() as u8 - 1, Release);
                     }
                 }
-                region = numbers([word(rg, c - 8), 0, 0], [c - p, 0, 0])[0] as usize;
+                let region = numbers([word(rg, c - 8), 0, 0], [c - p, 0, 0])[0] as usize;
                 tab[region].store(seen[code].load(Acquire), Relaxed);
                 p = c + 5;
             }
-            last.fetch_max(region, Relaxed); // ids ascend
         }
-    });
+    };
+    let total = (0..).find_map(|k| run(tab, &regions, k, threads)).unwrap();
     let codes = codes.into_inner().unwrap();
-    let tab = &tab[..=last.into_inner()]; // ids above it are unknown without a lookup
-
-    // records.csv is read, not mapped (see `read`); its records start after the header line.
-    let (f, mut head) = (File::open("/data/records.csv").unwrap(), [0; 64]);
-    let n = f.read_at(&mut head, 0).unwrap();
-    let from = find(&head[..n], 0, b'\n') + 1;
-    let total = (0..).find_map(|k| run(&f, from, tab, k, threads)).unwrap();
     let mut order: Vec<usize> = (0..codes.len()).filter(|&g| total[g][0] > 0).collect();
     order.sort_by_key(|&g| codes[g]); // _UNMATCHED is [255; 3]: last
     let mut text = String::new();

@@ -130,43 +130,17 @@ impl Graph {
     }
 }
 
-/// Offsets for nodes 0..n with `slots(k)` slots each (k = n too, the sentinel): the largest block
-/// (16 nodes on these graphs) whose in-block offsets fit a u8. Blocks are independent, so threads
-/// fill them; only the u32 block bases are a serial prefix sum. Returns the graph without edges.
-fn layout(n: usize, t: usize, vb: u32, esc: u32, slots: impl Fn(usize) -> u32 + Sync) -> Graph {
-    for sh in (0..=4).rev() {
-        let (mut rel, mut base) = (vec![0u8; n + 1], vec![0u32; (n >> sh) + 2]);
-        let (rp, bp) = (Slots(rel.as_mut_ptr()), Slots(base.as_mut_ptr()));
-        let ok = AtomicBool::new(true);
-        par(t, &spans((), (n >> sh) + 1, t * 4), |&(_, lo, hi)| {
-            for b in lo..hi {
-                let mut acc = 0;
-                for k in b << sh..((b + 1) << sh).min(n + 1) {
-                    (acc > 255).then(|| ok.store(false, Relaxed));
-                    unsafe { *(&rp).0.add(k) = acc as u8 };
-                    acc += slots(k);
-                }
-                unsafe { *(&bp).0.add(b + 1) = acc };
-            }
-        });
-        if ok.into_inner() || sh == 0 {
-            (1..base.len()).for_each(|b| base[b] += base[b - 1]);
-            return Graph { edges: vec![], base, rel, sh, vb, esc };
-        }
-    }
-    unreachable!()
-}
-
-/// A work item of an edge stream: `each(emit)` calls emit(u, v, w) for each of its edges. A trait
-/// (not a closure taking a `dyn` emitter) so that the emitter is inlined into the parsing loop.
+/// A work item of an edge stream: `each(fill, emit)` calls emit(u, v, w) for each of its edges
+/// (`fill`: the caller uses v). A trait (not a closure taking a `dyn` emitter) so that the emitter
+/// is inlined into the parsing loop.
 trait Edges: Sync {
-    fn each(&self, emit: impl FnMut(usize, u32, u32));
+    fn each(&self, fill: bool, emit: impl FnMut(usize, u32, u32));
 }
 
 /// The lines of the graph text that start at a byte in lo..hi (a line that starts before lo and
 /// ends inside it belongs to the item before).
 impl Edges for (&[u8], usize, usize) {
-    fn each(&self, mut emit: impl FnMut(usize, u32, u32)) {
+    fn each(&self, _: bool, mut emit: impl FnMut(usize, u32, u32)) {
         let (b, lo, hi) = *self;
         let mut i = (lo..hi).find(|&p| p == 0 || b[p - 1] == 10).unwrap_or(hi); // 10: LF
         while i < hi {
@@ -176,11 +150,20 @@ impl Edges for (&[u8], usize, usize) {
     }
 }
 
-/// The edges u -> v of nodes lo..hi of a graph, as v -> u.
-impl Edges for (&Graph, usize, usize) {
-    fn each(&self, mut emit: impl FnMut(usize, u32, u32)) {
-        for u in self.1..self.2 {
-            self.0.adj(u, |v, w| emit(v as usize, u as u32, w));
+/// The edges u -> v of nodes lo..hi of a graph: as id[u] -> id[v] (relabelled), or as v -> u
+/// (reversed) if `id` is empty.
+impl Edges for ((&Graph, &[u32]), usize, usize) {
+    fn each(&self, fill: bool, mut emit: impl FnMut(usize, u32, u32)) {
+        let ((g, id), lo, hi) = *self;
+        for u in lo..hi {
+            match id.get(u) {
+                Some(&x) => {
+                    // the new ids of the targets of node u + 8 (random reads)
+                    fill.then(|| g.adj((u + 8).min(hi - 1), |v, _| prefetch(&id[v as usize])));
+                    g.adj(u, |v, w| emit(x as usize, ld(id, v as usize), w))
+                }
+                None => g.adj(u, |v, w| emit(v as usize, u as u32, w)),
+            }
         }
     }
 }
@@ -191,20 +174,22 @@ impl Edges for (&Graph, usize, usize) {
 /// 2. append each slot to its bucket's region through the item's own cursor, with the node's
 ///    place inside the bucket in a parallel u16 array (213 sequential streams per thread; both
 ///    slots of an escaped edge get it, so the slots can be counted and moved one by one);
-/// 3. per bucket, count each node's slots from the u16s alone; once the layout is known, reorder
-///    the bucket's ~94 KB of slots by node through a scratch copy.
+/// 3. per bucket, count each node's slots from the u16s alone, lay its offsets out from the
+///    bucket's first slot, and reorder the bucket's ~94 KB of slots by node through a scratch
+///    copy. Offsets come in blocks of 16 nodes (a u32 base each, u8 offsets inside); if an
+///    in-block offset does not fit, they are laid out again with smaller blocks (the slots stay).
 /// Nothing is locked, and no store lands outside the bucket being worked on. `buf`, if given, is
 /// the edge array of a graph dropped by the caller with exactly as many slots: its pages are
 /// already mapped, so they are neither unmapped nor faulted in again (every slot is written).
-fn csr(n: usize, threads: usize, vb: u32, items: &[impl Edges], buf: Option<Vec<u32>>) -> Graph {
-    const BS: u32 = 13;
+/// Steps 1-2 here; `finish` does step 3, after the caller has dropped what the items read.
+fn csr(n: usize, threads: usize, vb: u32, items: &[impl Edges], buf: Option<Vec<u32>>) -> Staged {
     let esc = u32::MAX >> vb; // the escape value: all ones in the weight bits
     let (nb, ni) = ((n >> BS) + 1, items.len());
     let mut cur = vec![0u32; ni * nb];
     let cp = Slots(cur.as_mut_ptr());
     par(threads, &(0..ni).collect::<Vec<_>>(), |&i| {
         let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
-        items[i].each(|u, _, w| c[u >> BS] += 1 + (w >= esc) as u32);
+        items[i].each(false, |u, _, w| c[u >> BS] += 1 + (w >= esc) as u32);
     });
     let (mut start, mut acc) = (vec![0usize; nb + 1], 0u32);
     for b in 0..nb {
@@ -218,33 +203,56 @@ fn csr(n: usize, threads: usize, vb: u32, items: &[impl Edges], buf: Option<Vec<
     let (ep, lp) = (Slots(edges.as_mut_ptr()), Slots(loc.as_mut_ptr()));
     par(threads, &(0..ni).collect::<Vec<_>>(), |&i| {
         let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
-        items[i].each(|u, v, w| {
+        items[i].each(true, |u, v, w| {
             let (p, l) = (c[u >> BS] as usize, (u & ((1 << BS) - 1)) as u16);
             let k = store(&ep, p, v, w, vb, esc);
             c[u >> BS] += k as u32;
             unsafe { (*(&lp).0.add(p), *(&lp).0.add(p + k - 1)) = (l, l) };
         });
     });
-    let mut deg = vec![0u16; n + 1];
-    let dp = Slots(deg.as_mut_ptr());
-    let buckets: Vec<usize> = (0..nb).collect();
-    par(threads, &buckets, |&b| {
-        for &l in &loc[start[b]..start[b + 1]] {
-            let d = unsafe { &mut *(&dp).0.add(b << BS | l as usize) };
-            *d = d.checked_add(1).expect("out-degree above 65k");
+    (edges, loc, start)
+}
+
+/// Bits of a bucket's node range in `csr`.
+const BS: u32 = 13;
+
+/// The slots of a graph grouped by bucket, the node's place in its bucket for each slot, and the
+/// first slot of each bucket.
+type Staged = (Vec<u32>, Vec<u16>, Vec<usize>);
+
+/// Step 3 of `csr`.
+fn finish(n: usize, threads: usize, vb: u32, (mut edges, loc, start): Staged) -> Graph {
+    let (nb, esc, ep) = ((n >> BS) + 1, u32::MAX >> vb, Slots(edges.as_mut_ptr()));
+    for sh in (0..=4).rev() {
+        let (mut rel, mut base) = (vec![0u8; n + 1], vec![0u32; (n >> sh) + 1]);
+        let (rp, bp) = (Slots(rel.as_mut_ptr()), Slots(base.as_mut_ptr()));
+        let ok = AtomicBool::new(true);
+        par(threads, &(0..nb).collect::<Vec<_>>(), |&b| {
+            let (lo, hi, k0) = (start[b], start[b + 1], b << BS);
+            let mut at = vec![0u32; (n + 1 - k0).min(1 << BS)];
+            loc[lo..hi].iter().for_each(|&l| at[l as usize] += 1);
+            let (mut p, mut p0) = (lo as u32, 0);
+            for (k, a) in (k0..).zip(&mut at) {
+                if k & ((1 << sh) - 1) == 0 {
+                    (p0, _) = (p, unsafe { *(&bp).0.add(k >> sh) = p }); // a block starts at p
+                }
+                (p - p0 > 255).then(|| ok.store(false, Relaxed));
+                (*a, p) = (p, p + *a);
+                unsafe { *(&rp).0.add(k) = (*a - p0) as u8 };
+            }
+            if sh == 4 {
+                let e = unsafe { std::slice::from_raw_parts((&ep).0.add(lo), hi - lo) }.to_vec();
+                for (&x, &l) in e.iter().zip(&loc[lo..hi]) {
+                    unsafe { *(&ep).0.add(at[l as usize] as usize) = x };
+                    at[l as usize] += 1;
+                }
+            }
+        });
+        if ok.into_inner() || sh == 0 {
+            return Graph { edges, base, rel, sh, vb, esc };
         }
-    });
-    let lay = layout(n, threads, vb, esc, |k| deg[k] as u32);
-    par(threads, &buckets, |&b| {
-        let (lo, hi) = (start[b], start[b + 1]);
-        let e = unsafe { std::slice::from_raw_parts((&ep).0.add(lo), hi - lo) }.to_vec();
-        let mut at = Vec::from_iter((b << BS..((b + 1) << BS).min(n + 1)).map(|k| lay.off(k)));
-        for (&x, &l) in e.iter().zip(&loc[lo..hi]) {
-            unsafe { *(&ep).0.add(at[l as usize]) = x };
-            at[l as usize] += 1;
-        }
-    });
-    Graph { edges, ..lay }
+    }
+    unreachable!()
 }
 
 /// Breadth-first relabelling, in parallel: each thread grows its own region from a seed in its
@@ -295,36 +303,6 @@ fn bfs_order(g: &Graph, n: usize, threads: usize) -> Vec<u32> {
         }
     });
     id
-}
-
-/// Copy `g` into the order given by `id` (old id -> new id), each node's slots by one thread,
-/// with every target rewritten to its new id.
-fn relabel(g: &Graph, id: &[u32], threads: usize) -> Graph {
-    let (n, ranges) = (id.len(), spans((), id.len(), threads * 4));
-    let mut deg = vec![0u16; n + 1]; // id is a permutation: no two threads write one entry
-    let dp = Slots(deg.as_mut_ptr());
-    par(threads, &ranges, |&(_, lo, hi)| {
-        for u in lo..hi {
-            unsafe { *(&dp).0.add(id[u] as usize) = (g.off(u + 1) - g.off(u)) as u16 };
-        }
-    });
-    let lay = layout(n, threads, g.vb, g.esc, |k| deg[k] as u32);
-    let mut edges = vec![0u32; g.edges.len()];
-    let ep = Slots(edges.as_mut_ptr());
-    par(threads, &ranges, |&(_, lo, hi)| {
-        for u in lo..hi {
-            if u + 8 < hi {
-                // Prefetch where node u+8 goes and the new ids of its targets.
-                let w = id[u + 8] as usize;
-                prefetch(&lay.rel[w]);
-                prefetch(&lay.base[w >> lay.sh]);
-                g.adj(u + 8, |v, _| prefetch(&id[v as usize]));
-            }
-            let mut p = lay.off(id[u] as usize);
-            g.adj(u, |v, w| p += store(&ep, p, id[v as usize], w, g.vb, g.esc));
-        }
-    });
-    Graph { edges, ..lay }
 }
 
 /// Buckets per queue: the search relaxes only edges lighter than W (see `bidir`).
@@ -543,14 +521,18 @@ fn main() {
     // n, m (the edge lines are simply read to the end) and the text after the header line
     let (n, _m, body) = (num(gt, &mut i) as usize, num(gt, &mut i), &gt[i..]);
     let vb = (usize::BITS - (n.max(2) - 1).leading_zeros()).max(1);
-    let (g, buf) = {
-        let g0 = csr(n, threads, vb, &spans(body, body.len(), threads * 4), None);
-        let newid = bfs_order(&g0, n, threads);
-        qs.iter_mut().for_each(|q| *q = (newid[q.0] as usize, newid[q.1] as usize));
-        (relabel(&g0, &newid, threads), g0.edges)
-    };
-    // The reverse graph has exactly g0's slot count: it takes over g0's mapped edge pages.
-    let r = csr(n, threads, vb, &spans(&g, n, threads * 4), Some(buf));
+    let k = threads * 4; // work items per pass
+    let g0 = csr(n, threads, vb, &spans(body, body.len(), k), None);
+    let g0 = finish(n, threads, vb, g0);
+    let newid = bfs_order(&g0, n, threads);
+    qs.iter_mut().for_each(|q| *q = (newid[q.0] as usize, newid[q.1] as usize));
+    let g = csr(n, threads, vb, &spans((&g0, &newid[..]), n, k), None);
+    // Free the ids and g0's offsets first: the finish takes its memory from them. The reverse
+    // graph has exactly g0's slot count: it takes over g0's mapped edge pages.
+    let (buf, _) = ({ g0 }.edges, drop(newid));
+    let g = finish(n, threads, vb, g);
+    let r = csr(n, threads, vb, &spans((&g, &[][..]), n, k), Some(buf));
+    let r = finish(n, threads, vb, r);
 
     let ans: Vec<AtomicI64> = qs.iter().map(|_| AtomicI64::new(-1)).collect();
     let next = AtomicUsize::new(0);
