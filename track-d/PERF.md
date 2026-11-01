@@ -21,6 +21,10 @@ Local box: i5-11400H laptop (6 cores, 12 MB L3) running Docker; the scoring box 
 | 7 | b7dc4ef | Skip labels above 31 bits instead of abandoning the two-ended search | run-d0196c98deea | 0.248 | 78.5 | 721 | 63.0 |
 | 8 | d70cf3a | 8-byte queue entries (distance << 32 \| node), unchecked hot lookups | run-ae48272541b4 | 0.233 | 74.6 | 720 | 64.0 |
 | 9 | 7971071 | Software prefetch in the BFS walk and the relabel copy | run-a5a954964edb | 0.226 | 72.4 | 738 | 64.3 |
+| 10 | eab717a | Per-side 64-node label pages; expand the side with fewer queued entries | run-8098591c571a | 0.224 | 72.2 | 775 | 64.3 |
+| 11 | 5d9967b | One CSR builder and one edge iterator (-120 lines); SWAR number parsing | run-125edba6abfe | 0.200 | 72.0 | 619 | 66.3 |
+| 12 | 064a61b | Experiment: every malloc block >= 4 KB in its own mapping | run-e10a2dc56bee | 0.200 | 72.1 | 636 | 66.1 |
+| 13 | 2babdea | Bucketed CSR builder: no locked ops, no store outside the current bucket | run-6e37653c1567 | 0.178 | 77.0 | 644 | 67.1 |
 
 ## How it works now
 
@@ -74,6 +78,19 @@ about half of the large queries, so 5.0M of the 11.3M settled nodes were fallbac
 such a label keeps the search exact for answers below 2^31 (every path through it is longer);
 only 10 queries on the full set still fall back. Single-thread query phase 0.90 s -> 0.64 s.
 
+**Step 11: parsing is arithmetic too.** On a 2.5 GHz box, two passes over 88 MB of text cost real
+CPU. The SWAR parse loads 8 bytes, finds the first non-digit with one add and mask, shifts the
+digits to the top (the empty low bytes act as leading zeros) and combines pairs, quads and octets
+with three multiplies. Local build phase about 149 -> 138 ms; checked against a scalar parse on
+200,000 random numbers.
+
+**Step 13: keep every store near the last one.** The builder did one random locked update and
+one random store into a 20 MB array per edge. Now each work item counts its slots per bucket of
+8,192 nodes (213 counters, no atomics), appends each slot to its bucket's region (213 sequential
+streams per thread, with the node's place in the bucket in a u16 side array), and each bucket is
+then sorted by node through a 94 KB scratch copy. Local build 133-152 -> 108-114 ms, board
+0.200 -> 0.178 s. The u16 side array costs about 5 MB while building.
+
 **Settled nodes over all 2,000 queries:** one-ended 23.2M; two-ended 7.38M; expanding the side
 with fewer queued entries instead of the smaller key, 7.15M.
 
@@ -88,6 +105,11 @@ with fewer queued entries instead of the smaller key, 7.15M.
 | THP off for the whole process (step 4) | match local memory | 58.9 MB but +17% time | the graph needs its 2 MB pages |
 | Two-ended labels in two hash tables (step 6) | | 101 ns per settled node | replaced by paged labels: 80 ns |
 | Pages of 128 ids holding both sides | one lookup for both labels | pool 17.4 MB | the two balls rarely share pages; per-side 64-id pages: about 9 MB |
+| Every malloc block >= 4 KB in its own mapping (step 12) | remove the board's +10 MB | 72.1 MB, unchanged | the gap is not malloc's heap; it has been about +10 MB since step 2, so it looks like the box's own accounting |
+| Pruning in the two-ended search (skip labels with nd + other side's minimum >= mu) | fewer pushes near the meeting point | query phase unchanged within noise | one more lookup on the other side for every edge cost what the pruning saved |
+| Queries sorted by source id | the 12 threads search nearby parts of the map, warm L3 | no gain (228-282 vs 254-286 ms) | |
+| Both sides' directory entries interleaved in one cache line | one line for both lookups | single-thread queries 512-567 vs 493-610 ms | each side now gets half as many pages per line |
+| 6 or 8 threads instead of 12 | more L2 per search | 12 threads fastest | the search waits on memory, and hyper-threads hide that |
 
 ## Correctness
 
