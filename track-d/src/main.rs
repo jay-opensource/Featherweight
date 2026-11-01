@@ -507,8 +507,10 @@ fn step<const S: usize>(pg: &mut Pages, h: &mut Dial, gr: &Graph, m: &mut [u64; 
 }
 
 /// One-ended Dijkstra with u64 distances, for the few queries whose distances need more than
-/// 31 bits (edges of weight near 2^32 at the special nodes). Speed does not matter here: a stale
-/// heap entry is simply expanded again (it cannot improve anything).
+/// 31 bits (edges of weight near 2^32 at the special nodes). A stale heap entry is simply expanded
+/// again (it cannot improve anything). Slow per node, but the long ones (from a source without
+/// in-edges) run first, beside the other queries (see main); answering them through the source's
+/// out-neighbours with two two-ended searches was 3-4x faster for those but gained nothing more.
 fn plain(g: &Graph, s: usize, t: usize) -> i64 {
     use std::collections::{BTreeSet, HashMap};
     let (mut dist, mut q) = (HashMap::from([(s, 0)]), BTreeSet::from([(0, s)]));
