@@ -532,7 +532,6 @@ fn main() {
     // (measured on the board), so the process opts out: PR_SET_THP_DISABLE = 41. One malloc arena
     // (M_ARENA_MAX = 1) instead of one per thread keeps the search's small vectors packed.
     unsafe { (prctl(41, 1, 0, 0, 0), mallopt(-8, 1)) };
-    let t0 = std::time::Instant::now();
     let par0 = std::thread::available_parallelism().map_or(1, |p| p.get());
     let threads = std::env::var("FW_THREADS").map_or(par0, |v| v.parse().unwrap());
     let (q, mut qs, mut j) = (map("/data/queries.txt"), Vec::new(), 0);
@@ -552,7 +551,6 @@ fn main() {
     };
     // The reverse graph has exactly g0's slot count: it takes over g0's mapped edge pages.
     let r = csr(n, threads, vb, &spans(&g, n, threads * 4), Some(buf));
-    let t1 = t0.elapsed();
 
     let ans: Vec<AtomicI64> = qs.iter().map(|_| AtomicI64::new(-1)).collect();
     let next = AtomicUsize::new(0);
@@ -572,7 +570,6 @@ fn main() {
     });
     let out: String = ans.iter().map(|a| format!("{a:?}\n")).collect(); // Debug: the value
     std::fs::write("/out/distances.txt", out).unwrap();
-    eprintln!("build {t1:?} total {:?}", t0.elapsed());
     // The kernel's exit unmaps every page on one core (~0.1-0.4 us per 4 KB page; 5 ms locally
     // for the text and the two graphs). Drop those pages on all threads first: MADV_DONTNEED on the
     // whole pages inside each thread's share (nothing reads them again).
