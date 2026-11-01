@@ -681,4 +681,5 @@ fn main() {
     }
     std::fs::write("/out/distances.txt", out).expect("write distances.txt");
     eprintln!("build {t1:?} total {:?}", t0.elapsed());
+    std::process::exit(0); // the kernel reclaims everything; do not free the big arrays one by one
 }

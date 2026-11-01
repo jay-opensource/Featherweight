@@ -1,0 +1,4 @@
+# The scoring box is an i5-13500 (AVX2, BMI2, LZCNT). x86-64-v3, not "native": the builder may be a
+# newer CPU. A static binary skips the dynamic loader at start-up.
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static"]
