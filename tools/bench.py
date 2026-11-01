@@ -22,8 +22,10 @@ GATES = {
     "G3": [""],  # full seed 1 lives at DATA_ROOT/<track>
 }
 # Inside the container: time only the solution, then read the cgroup high-water mark.
+# /out is a tmpfs, as on the board: the output is charged to memory.peak and can be mmapped.
 PROBE = ('s=$(date +%s%N); /app/solution; c=$?; e=$(date +%s%N); '
-         'echo "BENCH $c $((e-s)) $(cat /sys/fs/cgroup/memory.peak)"')
+         'echo "BENCH $c $((e-s)) $(cat /sys/fs/cgroup/memory.peak) $(ls /out | paste -sd /)"; '
+         'sha256sum /out/* 2>/dev/null | head -1')
 
 
 def expected_hashes():
@@ -57,19 +59,19 @@ def run_once(track, tag, data, rel, threads):
     cmd = ["docker", "run", "--rm", "--network=none", "--read-only", "--tmpfs", "/tmp:rw,size=1g,exec",
            "--memory=8g", "--memory-swap=8g", "--pids-limit=512", "--cap-drop=ALL",
            "--security-opt=no-new-privileges", "--user", "65534:65534", "--ulimit", "nofile=8192:8192",
-           *env, *mount, "-v", f"{out}:/out:rw",
+           *env, *mount, "--tmpfs", "/out:rw,size=1g,mode=1777",
            "--entrypoint", "/bin/sh", tag, "-c", PROBE]
     r = subprocess.run(cmd, capture_output=True, text=True)
     line = [l for l in r.stdout.splitlines() if l.startswith("BENCH ")]
     if not line:
         sys.exit(f"no BENCH line; stdout={r.stdout[-500:]!r} stderr={r.stderr[-1500:]!r}")
-    _, code, ns, peak = line[-1].split()
+    parts = line[-1].split()
+    code, ns, peak, files = parts[1], parts[2], parts[3], (parts[4] if len(parts) > 4 else "")
     if code != "0":
         sys.exit(f"solution exited {code}; stderr={r.stderr[-1500:]!r}")
-    files = sorted(os.listdir(out))
-    if files != [OUTPUT[track]]:
-        sys.exit(f"/out must hold exactly {OUTPUT[track]}, found {files}")
-    h = hashlib.sha256(open(os.path.join(out, OUTPUT[track]), "rb").read()).hexdigest()
+    if files.strip("/") != OUTPUT[track]:
+        sys.exit(f"/out must hold exactly {OUTPUT[track]}, found {files!r}")
+    h = [l.split()[0] for l in r.stdout.splitlines() if l.endswith(OUTPUT[track])][0]
     return int(ns) / 1e6, int(peak) / 1e6, h, r.stderr.strip()
 
 
