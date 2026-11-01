@@ -193,9 +193,12 @@ impl Edges for (&Graph, usize, usize) {
 ///    slots of an escaped edge get it, so the slots can be counted and moved one by one);
 /// 3. per bucket, count each node's slots from the u16s alone; once the layout is known, reorder
 ///    the bucket's ~94 KB of slots by node through a scratch copy.
-/// Nothing is locked, and no store lands outside the bucket being worked on.
-fn csr(n: usize, threads: usize, vb: u32, esc: u32, items: &[impl Edges]) -> Graph {
+/// Nothing is locked, and no store lands outside the bucket being worked on. `buf`, if given, is
+/// the edge array of a graph dropped by the caller with exactly as many slots: its pages are
+/// already mapped, so they are neither unmapped nor faulted in again (every slot is written).
+fn csr(n: usize, threads: usize, vb: u32, items: &[impl Edges], buf: Option<Vec<u32>>) -> Graph {
     const BS: u32 = 13;
+    let esc = u32::MAX >> vb; // the escape value: all ones in the weight bits
     let (nb, ni) = ((n >> BS) + 1, items.len());
     let mut cur = vec![0u32; ni * nb];
     let cp = Slots(cur.as_mut_ptr());
@@ -210,7 +213,8 @@ fn csr(n: usize, threads: usize, vb: u32, esc: u32, items: &[impl Edges]) -> Gra
         }
         start[b + 1] = acc as usize;
     }
-    let (mut edges, mut loc) = (vec![0u32; acc as usize], vec![0u16; acc as usize]);
+    let mut edges = buf.unwrap_or_else(|| vec![0; acc as usize]); // every slot is written below
+    let mut loc = vec![0u16; acc as usize];
     let (ep, lp) = (Slots(edges.as_mut_ptr()), Slots(loc.as_mut_ptr()));
     par(threads, &(0..ni).collect::<Vec<_>>(), |&i| {
         let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
@@ -305,7 +309,6 @@ fn relabel(g: &Graph, id: &[u32], threads: usize) -> Graph {
         }
     });
     let lay = layout(n, threads, g.vb, g.esc, |k| deg[k] as u32);
-    drop(deg);
     let mut edges = vec![0u32; g.edges.len()];
     let ep = Slots(edges.as_mut_ptr());
     par(threads, &ranges, |&(_, lo, hi)| {
@@ -539,14 +542,14 @@ fn main() {
     // n, m (the edge lines are simply read to the end) and the text after the header line
     let (n, _m, body) = (num(gt, &mut i) as usize, num(gt, &mut i), &gt[i..]);
     let vb = (usize::BITS - (n.max(2) - 1).leading_zeros()).max(1);
-    let esc = (1u32 << (32 - vb)) - 1;
-    let g = {
-        let g0 = csr(n, threads, vb, esc, &spans(body, body.len(), threads * 4));
+    let (g, buf) = {
+        let g0 = csr(n, threads, vb, &spans(body, body.len(), threads * 4), None);
         let newid = bfs_order(&g0, n, threads);
         qs.iter_mut().for_each(|q| *q = (newid[q.0] as usize, newid[q.1] as usize));
-        relabel(&g0, &newid, threads)
+        (relabel(&g0, &newid, threads), g0.edges)
     };
-    let r = csr(n, threads, vb, esc, &spans(&g, n, threads * 4));
+    // The reverse graph has exactly g0's slot count: it takes over g0's mapped edge pages.
+    let r = csr(n, threads, vb, &spans(&g, n, threads * 4), Some(buf));
     let t1 = t0.elapsed();
 
     let ans: Vec<AtomicI64> = qs.iter().map(|_| AtomicI64::new(-1)).collect();
