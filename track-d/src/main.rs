@@ -4,7 +4,7 @@
 // size of the graph. See PERF.md for the measurements behind each choice.
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -286,14 +286,16 @@ fn csr(n: usize, threads: usize, vb: u32, esc: u32, items: &[impl Edges]) -> Gra
 /// slice of the id range (claiming nodes with a CAS) and re-seeds from that slice when its region
 /// is enclosed. New ids follow thread 0's visit order, then thread 1's, and so on.
 fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
-    const FREE: u32 = u32::MAX;
     let n = g.rel.len() - 1;
-    let id: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(FREE)).collect();
-    let claim = |v: usize| id[v].load(Relaxed) == FREE && id[v].compare_exchange(FREE, 0, Relaxed, Relaxed).is_ok();
+    // Zeroed by the kernel on first touch (in parallel); 0 is free, 1 claimed, until the ids.
+    let mut id = vec![0u32; n];
+    let ip = Slots(id.as_mut_ptr());
+    let at = |v: usize| unsafe { AtomicU32::from_ptr((&ip).0.add(v)) };
+    let claim = |v: usize| at(v).load(Relaxed) == 0 && at(v).compare_exchange(0, 1, Relaxed, Relaxed).is_ok();
     let lists: Vec<Vec<u32>> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..threads)
             .map(|t| {
-                let claim = &claim;
+                let (claim, at) = (&claim, &at);
                 s.spawn(move || {
                     let mut list: Vec<u32> = Vec::with_capacity(n); // only touched pages are charged
                     let (mut scan, end, mut head) = (t * n / threads, (t + 1) * n / threads, 0);
@@ -316,6 +318,9 @@ fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
                         if let Some(x) = list.get(head + 8).and_then(|&w| g.edges.get(g.off(w as usize))) {
                             prefetch(x);
                         }
+                        if let Some(&w) = list.get(head + 4) {
+                            g.adj(w as usize, |v, _| prefetch(at(v as usize))); // the claim words
+                        }
                         head += 1;
                         g.adj(list[head - 1] as usize, |v, _| {
                             if claim(v as usize) {
@@ -336,10 +341,10 @@ fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
     let jobs: Vec<usize> = (0..lists.len()).collect();
     par(threads, &jobs, |&j| {
         for (i, &v) in lists[j].iter().enumerate() {
-            id[v as usize].store(start[j] + i as u32, Relaxed);
+            at(v as usize).store(start[j] + i as u32, Relaxed);
         }
     });
-    id.into_iter().map(|a| a.into_inner()).collect()
+    id
 }
 
 /// Copy `g` into the order given by `newid` (old id -> new id), each node's slots by one thread,
@@ -347,13 +352,14 @@ fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
 fn relabel(g: &Graph, newid: &[u32], threads: usize) -> Graph {
     let n = newid.len();
     let ranges = spans(n, threads * 4);
-    let deg: Vec<AtomicU16> = (0..n).map(|_| AtomicU16::new(0)).collect();
+    let mut deg = vec![0u16; n]; // newid is a permutation: no two threads write one entry
+    let dp = Slots(deg.as_mut_ptr());
     par(threads, &ranges, |&(lo, hi)| {
         for u in lo..hi {
-            deg[newid[u] as usize].store((g.off(u + 1) - g.off(u)) as u16, Relaxed);
+            unsafe { *(&dp).0.add(newid[u] as usize) = (g.off(u + 1) - g.off(u)) as u16 };
         }
     });
-    let (base, rel, sh) = layout(n, threads, |k| deg[k].load(Relaxed) as u32);
+    let (base, rel, sh) = layout(n, threads, |k| deg[k] as u32);
     drop(deg);
     let mut edges = vec![0u32; *base.last().unwrap() as usize];
     let out = Slots(edges.as_mut_ptr());
