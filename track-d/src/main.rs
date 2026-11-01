@@ -4,7 +4,7 @@
 // size of the graph. See PERF.md for the measurements behind each choice.
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -70,16 +70,8 @@ fn mt<T>(s: &mut [T], i: usize) -> &mut T {
 
 /// Split `b` into `k` byte ranges that start and end on line boundaries.
 fn chunks(b: &[u8], k: usize) -> Vec<(&[u8], usize, usize)> {
-    let mut cut = vec![0];
-    for j in 1..k {
-        let mut p = (b.len() * j / k).max(*cut.last().unwrap());
-        while p > 0 && p < b.len() && b[p - 1] != b'\n' {
-            p += 1;
-        }
-        cut.push(p);
-    }
-    cut.push(b.len());
-    cut.windows(2).map(|w| (b, w[0], w[1])).collect()
+    let cut = |j: usize| (b.len() * j / k..b.len()).find(|&p| p == 0 || b[p - 1] == b'\n').unwrap_or(b.len());
+    (0..k).map(|j| (b, cut(j), cut(j + 1))).collect()
 }
 
 /// `0..n` in `k` ranges.
@@ -109,14 +101,9 @@ unsafe impl<T> Sync for Slots<T> {}
 /// value in that slot and the full weight in the next. Returns the slots used.
 #[inline(always)]
 fn store(out: &Slots<u32>, p: usize, v: u32, w: u32, vb: u32, esc: u32) -> usize {
-    unsafe {
-        *out.0.add(p) = v | w.min(esc) << vb;
-        if w >= esc {
-            *out.0.add(p + 1) = w;
-            return 2;
-        }
-    }
-    1
+    let k = 1 + (w >= esc) as usize; // the weight goes first, so that without an escape it is overwritten
+    unsafe { (*out.0.add(p + k - 1), *out.0.add(p)) = (w, v | w.min(esc) << vb) };
+    k
 }
 
 /// Compact CSR. Node k's slots start at base[k >> sh] + rel[k] (see `store` for a slot).
@@ -157,42 +144,33 @@ impl Graph {
     }
 }
 
-/// Offsets for nodes 0..n with `slots(k)` slots each: the largest block (16 nodes on these graphs)
-/// whose in-block offsets fit a u8. Blocks are independent, so threads fill them; only the u32
-/// block bases are a serial prefix sum. Returns (base per block + sentinel, rel per node + sentinel,
-/// shift).
-fn layout(n: usize, threads: usize, slots: impl Fn(usize) -> u32 + Sync) -> (Vec<u32>, Vec<u8>, u32) {
-    let mut sh = 4u32;
-    loop {
-        let nb = (n >> sh) + 1;
-        let (mut rel, mut sums) = (vec![0u8; n + 1], vec![0u32; nb]);
-        let (rp, sp, ok) = (Slots(rel.as_mut_ptr()), Slots(sums.as_mut_ptr()), std::sync::atomic::AtomicBool::new(true));
-        par(threads, &spans(nb, threads * 4), |&(lo, hi)| {
-            let (rp, sp) = (&rp, &sp);
+/// Offsets for nodes 0..n with `slots(k)` slots each (k = n too, the sentinel): the largest block
+/// (16 nodes on these graphs) whose in-block offsets fit a u8. Blocks are independent, so threads
+/// fill them; only the u32 block bases are a serial prefix sum. Returns the graph without edges.
+fn layout(n: usize, t: usize, vb: u32, esc: u32, slots: impl Fn(usize) -> u32 + Sync) -> Graph {
+    for sh in (0..=4).rev() {
+        let (mut rel, mut base) = (vec![0u8; n + 1], vec![0u32; (n >> sh) + 2]);
+        let (rp, bp) = (Slots(rel.as_mut_ptr()), Slots(base.as_mut_ptr()));
+        let ok = AtomicBool::new(true);
+        par(t, &spans((n >> sh) + 1, t * 4), |&(lo, hi)| {
             for b in lo..hi {
-                let mut acc = 0u32;
+                let mut acc = 0;
                 for k in b << sh..((b + 1) << sh).min(n + 1) {
                     if acc > 255 {
                         ok.store(false, Relaxed);
                     }
-                    unsafe { *rp.0.add(k) = acc as u8 };
-                    acc += if k < n { slots(k) } else { 0 };
+                    unsafe { *(&rp).0.add(k) = acc as u8 };
+                    acc += slots(k);
                 }
-                unsafe { *sp.0.add(b) = acc };
+                unsafe { *(&bp).0.add(b + 1) = acc };
             }
         });
         if ok.into_inner() || sh == 0 {
-            let mut base = Vec::with_capacity(nb + 1);
-            let mut total = 0u32;
-            for &x in &sums {
-                base.push(total);
-                total += x;
-            }
-            base.push(total);
-            return (base, rel, sh);
+            (1..base.len()).for_each(|b| base[b] += base[b - 1]);
+            return Graph { edges: vec![], base, rel, sh, vb, esc };
         }
-        sh -= 1;
     }
+    unreachable!()
 }
 
 /// A work item of an edge stream: `each(emit)` calls emit(u, v, w) for each of its edges. A trait
@@ -233,10 +211,9 @@ impl Edges for (&Graph, usize, usize) {
 fn csr(n: usize, threads: usize, vb: u32, esc: u32, items: &[impl Edges]) -> Graph {
     const BS: u32 = 13;
     let (nb, ni) = ((n >> BS) + 1, items.len());
-    let idx: Vec<usize> = (0..ni).collect();
     let mut cur = vec![0u32; ni * nb];
     let cp = Slots(cur.as_mut_ptr());
-    par(threads, &idx, |&i| {
+    par(threads, &(0..ni).collect::<Vec<_>>(), |&i| {
         let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
         items[i].each(|u, _, w| c[u >> BS] += 1 + (w >= esc) as u32);
     });
@@ -250,14 +227,13 @@ fn csr(n: usize, threads: usize, vb: u32, esc: u32, items: &[impl Edges]) -> Gra
     start[nb] = acc as usize;
     let (mut edges, mut loc) = (vec![0u32; acc as usize], vec![0u16; acc as usize]);
     let (ep, lp) = (Slots(edges.as_mut_ptr()), Slots(loc.as_mut_ptr()));
-    par(threads, &idx, |&i| {
-        let (ep, lp) = (&ep, &lp);
+    par(threads, &(0..ni).collect::<Vec<_>>(), |&i| {
         let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
         items[i].each(|u, v, w| {
             let (p, l) = (c[u >> BS] as usize, (u & ((1 << BS) - 1)) as u16);
-            let k = store(ep, p, v, w, vb, esc);
+            let k = store(&ep, p, v, w, vb, esc);
             c[u >> BS] += k as u32;
-            unsafe { (*lp.0.add(p), *lp.0.add(p + k - 1)) = (l, l) };
+            unsafe { (*(&lp).0.add(p), *(&lp).0.add(p + k - 1)) = (l, l) };
         });
     });
     let mut deg = vec![0u16; n + 1];
@@ -269,22 +245,22 @@ fn csr(n: usize, threads: usize, vb: u32, esc: u32, items: &[impl Edges]) -> Gra
             *d = d.checked_add(1).expect("out-degree above 65k");
         }
     });
-    let (base, rel, sh) = layout(n, threads, |k| deg[k] as u32);
+    let lay = layout(n, threads, vb, esc, |k| deg[k] as u32);
     par(threads, &buckets, |&b| {
         let (lo, hi) = (start[b], start[b + 1]);
         let e = unsafe { std::slice::from_raw_parts((&ep).0.add(lo), hi - lo) }.to_vec();
-        let mut at: Vec<usize> = (b << BS..((b + 1) << BS).min(n + 1)).map(|k| base[k >> sh] as usize + rel[k] as usize).collect();
+        let mut at: Vec<_> = (b << BS..((b + 1) << BS).min(n + 1)).map(|k| lay.off(k)).collect();
         for (&x, &l) in e.iter().zip(&loc[lo..hi]) {
             unsafe { *(&ep).0.add(at[l as usize]) = x };
             at[l as usize] += 1;
         }
     });
-    Graph { edges, base, rel, sh, vb, esc }
+    Graph { edges, ..lay }
 }
 
 /// Breadth-first relabelling, in parallel: each thread grows its own region from a seed in its
 /// slice of the id range (claiming nodes with a CAS) and re-seeds from that slice when its region
-/// is enclosed. New ids follow thread 0's visit order, then thread 1's, and so on.
+/// is enclosed. New ids follow one region's visit order, then the next region's, and so on.
 fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
     let n = g.rel.len() - 1;
     // Zeroed by the kernel on first touch (in parallel); 0 is free, 1 claimed, until the ids.
@@ -292,54 +268,42 @@ fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
     let ip = Slots(id.as_mut_ptr());
     let at = |v: usize| unsafe { AtomicU32::from_ptr((&ip).0.add(v)) };
     let claim = |v: usize| at(v).load(Relaxed) == 0 && at(v).compare_exchange(0, 1, Relaxed, Relaxed).is_ok();
-    let lists: Vec<Vec<u32>> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..threads)
-            .map(|t| {
-                let (claim, at) = (&claim, &at);
-                s.spawn(move || {
-                    let mut list: Vec<u32> = Vec::with_capacity(n); // only touched pages are charged
-                    let (mut scan, end, mut head) = (t * n / threads, (t + 1) * n / threads, 0);
-                    loop {
-                        if head == list.len() {
-                            while scan < end && !claim(scan) {
-                                scan += 1;
-                            }
-                            if scan == end {
-                                break;
-                            }
-                            list.push(scan as u32);
-                        }
-                        // Software pipeline over the queue: offsets 16 nodes ahead, edge lists 8
-                        // ahead, so the misses of upcoming nodes overlap with this one's work.
-                        if let Some(&w) = list.get(head + 16) {
-                            prefetch(&g.rel[w as usize]);
-                            prefetch(&g.base[w as usize >> g.sh]);
-                        }
-                        if let Some(x) = list.get(head + 8).and_then(|&w| g.edges.get(g.off(w as usize))) {
-                            prefetch(x);
-                        }
-                        if let Some(&w) = list.get(head + 4) {
-                            g.adj(w as usize, |v, _| prefetch(at(v as usize))); // the claim words
-                        }
-                        head += 1;
-                        g.adj(list[head - 1] as usize, |v, _| {
-                            if claim(v as usize) {
-                                list.push(v);
-                            }
-                        });
-                    }
-                    list
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    let lists = std::sync::Mutex::new(Vec::new());
+    par(threads, &spans(n, threads), |&(mut scan, end)| {
+        let (mut list, mut head) = (Vec::with_capacity(n), 0); // only touched pages are charged
+        loop {
+            if head == list.len() {
+                while scan < end && !claim(scan) {
+                    scan += 1;
+                }
+                if scan == end {
+                    break;
+                }
+                list.push(scan as u32);
+            }
+            // Software pipeline over the queue: offsets 16 nodes ahead, edge lists 8 ahead, the
+            // claim words of the targets 4 ahead, so the misses of upcoming nodes overlap.
+            if let Some(&w) = list.get(head + 16) {
+                prefetch(&g.rel[w as usize]);
+                prefetch(&g.base[w as usize >> g.sh]);
+            }
+            if let Some(x) = list.get(head + 8).and_then(|&w| g.edges.get(g.off(w as usize))) {
+                prefetch(x);
+            }
+            if let Some(&w) = list.get(head + 4) {
+                g.adj(w as usize, |v, _| prefetch(at(v as usize)));
+            }
+            head += 1;
+            g.adj(list[head - 1] as usize, |v, _| _ = claim(v as usize).then(|| list.push(v)));
+        }
+        lists.lock().unwrap().push(list);
     });
+    let lists = lists.into_inner().unwrap();
     let mut start = vec![0u32];
     for l in &lists {
         start.push(start.last().unwrap() + l.len() as u32);
     }
-    let jobs: Vec<usize> = (0..lists.len()).collect();
-    par(threads, &jobs, |&j| {
+    par(threads, &(0..lists.len()).collect::<Vec<_>>(), |&j| {
         for (i, &v) in lists[j].iter().enumerate() {
             at(v as usize).store(start[j] + i as u32, Relaxed);
         }
@@ -350,35 +314,32 @@ fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
 /// Copy `g` into the order given by `newid` (old id -> new id), each node's slots by one thread,
 /// with every target rewritten to its new id.
 fn relabel(g: &Graph, newid: &[u32], threads: usize) -> Graph {
-    let n = newid.len();
-    let ranges = spans(n, threads * 4);
-    let mut deg = vec![0u16; n]; // newid is a permutation: no two threads write one entry
+    let (n, ranges) = (newid.len(), spans(newid.len(), threads * 4));
+    let mut deg = vec![0u16; n + 1]; // newid is a permutation: no two threads write one entry
     let dp = Slots(deg.as_mut_ptr());
     par(threads, &ranges, |&(lo, hi)| {
         for u in lo..hi {
             unsafe { *(&dp).0.add(newid[u] as usize) = (g.off(u + 1) - g.off(u)) as u16 };
         }
     });
-    let (base, rel, sh) = layout(n, threads, |k| deg[k] as u32);
+    let lay = layout(n, threads, g.vb, g.esc, |k| deg[k] as u32);
     drop(deg);
-    let mut edges = vec![0u32; *base.last().unwrap() as usize];
+    let mut edges = vec![0u32; g.edges.len()];
     let out = Slots(edges.as_mut_ptr());
     par(threads, &ranges, |&(lo, hi)| {
-        let out = &out;
         for u in lo..hi {
             if u + 8 < hi {
                 // Prefetch where node u+8 goes and the new ids of its targets.
                 let w = newid[u + 8] as usize;
-                prefetch(&rel[w]);
-                prefetch(&base[w >> sh]);
+                prefetch(&lay.rel[w]);
+                prefetch(&lay.base[w >> lay.sh]);
                 g.adj(u + 8, |v, _| prefetch(&newid[v as usize]));
             }
-            let k = newid[u] as usize;
-            let mut p = base[k >> sh] as usize + rel[k] as usize;
-            g.adj(u, |v, w| p += store(out, p, newid[v as usize], w, g.vb, g.esc));
+            let mut p = lay.off(newid[u] as usize);
+            g.adj(u, |v, w| p += store(&out, p, newid[v as usize], w, g.vb, g.esc));
         }
     });
-    Graph { edges, base, rel, sh, vb: g.vb, esc: g.esc }
+    Graph { edges, ..lay }
 }
 
 /// A queued node: its label's index in the pages, then its first and end edge slot.
