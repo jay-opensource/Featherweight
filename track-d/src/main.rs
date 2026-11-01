@@ -342,17 +342,14 @@ fn relabel(g: &Graph, newid: &[u32], threads: usize) -> Graph {
     Graph { edges, ..lay }
 }
 
-/// A queued node: its label's index in the pages, then its first and end edge slot.
-type Item = [u32; 3];
-
 /// Buckets per queue: the search relaxes only edges lighter than W (see `bidir`).
 const W: usize = 1 << 13;
 
 /// Monotone bucket queue (Dial): one bucket per key modulo W. Each key pushed is the popped key
 /// cur plus an edge lighter than W, so every queued key lies in [cur, cur + W) and a bucket's
 /// position gives its key; the next key is found by stepping cur over empty buckets (the frontier
-/// is dense: a few steps). A bucket is a list through a pool of entries (an Item and the next
-/// entry's index) that reuses popped entries. The Item holds all that settling the node needs, so
+/// is dense: a few steps). A bucket is a list through a pool of entries (an item and the next
+/// entry's index) that reuses popped entries. The item holds all that settling the node needs, so
 /// a pop starts on the label and the edges at once. Entry 0 is a sentinel: index 0 means "none" in
 /// `head`, in a next field and in `free`.
 #[derive(Default)]
@@ -365,9 +362,10 @@ struct Dial {
 }
 
 impl Dial {
-    /// Queue x with key d in [cur, cur + W).
+    /// Queue a node with key d in [cur, cur + W): its label's index in the pages, then its first
+    /// and end edge slot.
     #[inline(always)]
-    fn put(&mut self, d: u32, [i, a, e]: Item) {
+    fn put(&mut self, d: u32, [i, a, e]: [u32; 3]) {
         if self.free == 0 {
             self.free = self.pool.len() as u32;
             self.pool.push([0; 4]);
@@ -390,11 +388,12 @@ impl Dial {
 
     /// Take an item of key cur; min() must have returned true since the last pop.
     #[inline(always)]
-    fn pop(&mut self) -> Item {
-        let (b, f) = (self.cur as usize % W, self.free);
-        self.free = ld(&self.head, b);
-        let [i, a, e, next] = ld(&self.pool, self.free as usize);
-        (*mt(&mut self.head, b), mt(&mut self.pool, self.free as usize)[3]) = (next, f);
+    fn pop(&mut self) -> [u32; 3] {
+        let b = self.cur as usize % W;
+        let k = ld(&self.head, b) as usize;
+        let [i, a, e, next] = ld(&self.pool, k);
+        *mt(&mut self.head, b) = next;
+        mt(&mut self.pool, k)[3] = std::mem::replace(&mut self.free, k as u32);
         self.len -= 1;
         [i, a, e]
     }
@@ -402,8 +401,7 @@ impl Dial {
     /// Empty the queue (the first time, size it).
     fn clear(&mut self) {
         (self.free, self.cur, self.len) = (0, 0, 0);
-        self.head.clear();
-        self.head.resize(W, 0);
+        self.head = vec![0; W];
         self.pool.resize(1, [0; 4]);
     }
 }
@@ -422,14 +420,14 @@ struct Pages {
     dir: Vec<u16>,
     pb: u32,
     pool: Vec<u32>,
-    used: Vec<u32>,
+    own: Vec<u32>, // the dir entries of the pages in use
 }
 
 impl Pages {
     fn new(n: usize) -> Self {
         let pb = 6.max(usize::BITS - (n / 32766).leading_zeros());
-        let (dir, pool) = (vec![0; 2 * ((n >> pb) + 1)], vec![INF; 1 << pb]);
-        Pages { dir, pb, pool, used: Vec::new() }
+        let (dir, pool, own) = (vec![0; 2 * ((n >> pb) + 1)], vec![INF; 1 << pb], Vec::new());
+        Pages { dir, pb, pool, own }
     }
 
     /// Index of v's label on `side`, allocating its page.
@@ -439,7 +437,7 @@ impl Pages {
         if ld(&self.dir, d) == 0 {
             self.dir[d] = (self.pool.len() >> self.pb) as u16;
             self.pool.resize(self.pool.len() + (1 << self.pb), INF);
-            self.used.push(d as u32);
+            self.own.push(d as u32);
         }
         self.ix(v, side)
     }
@@ -447,12 +445,12 @@ impl Pages {
     /// Index of v's label on `side`, in page 0 if v has none.
     #[inline(always)]
     fn ix(&self, v: u32, side: usize) -> usize {
-        let p = ld(&self.dir, side * self.dir.len() / 2 + (v >> self.pb) as usize) as usize;
-        p << self.pb | v as usize & ((1 << self.pb) - 1)
+        let d = side * self.dir.len() / 2 + (v >> self.pb) as usize;
+        (ld(&self.dir, d) as usize) << self.pb | v as usize & ((1 << self.pb) - 1)
     }
 
     fn clear(&mut self) {
-        self.used.drain(..).for_each(|d| self.dir[d as usize] = 0);
+        self.own.drain(..).for_each(|d| self.dir[d as usize] = 0);
         self.pool.truncate(1 << self.pb);
     }
 }
@@ -473,11 +471,11 @@ impl Pages {
 fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: [&Graph; 2], s: usize, t: usize) -> Option<i64> {
     pg.clear();
     let mut m = [if s == t { 0 } else { u64::MAX }, u64::MAX]; // mu, skip
-    for (side, x) in [(0, s), (1, t)] {
+    for (side, x, gr) in [(0, s, g[0]), (1, t, g[1])] {
         let i = pg.at(x as u32, side);
         pg.pool[i] = 0;
         hs[side].clear();
-        hs[side].put(0, [i as u32, g[side].off(x) as u32, g[side].off(x + 1) as u32]);
+        hs[side].put(0, [i as u32, gr.off(x) as u32, gr.off(x + 1) as u32]);
     }
     let mut go = true;
     while go && (hs[0].cur as u64 + hs[1].cur as u64) < m[0] {
@@ -517,10 +515,8 @@ fn step<const S: usize>(pg: &mut Pages, h: &mut Dial, gr: &Graph, m: &mut [u64; 
             let (a, b) = (gr.off(v as usize), gr.off(v as usize + 1));
             prefetch(gr.edges.as_ptr().wrapping_add(a));
             h.put(nd as u32, [iv as u32, a as u32, b as u32]);
-            let o = ld(&pg.pool, pg.ix(v, 1 - S)) & !SETTLED;
-            if o != INF {
-                m[0] = m[0].min(nd + o as u64);
-            }
+            let o = ld(&pg.pool, pg.ix(v, 1 - S)) & !SETTLED; // INF: no label on the other side
+            m[0] = m[0].min(nd + o as u64 | (o == INF) as u64 * u64::MAX);
         });
     }
     h.min()
@@ -575,7 +571,8 @@ fn main() {
         qs.iter_mut().for_each(|q| *q = (newid[q.0] as usize, newid[q.1] as usize));
         relabel(&g0, &newid, threads)
     };
-    let parts: Vec<_> = spans(n, threads * 4).into_iter().map(|(lo, hi)| (&g, lo, hi)).collect();
+    let sp = spans(n, threads * 4);
+    let parts: Vec<_> = sp.iter().map(|&(lo, hi)| (&g, lo, hi)).collect();
     let r = csr(n, threads, vb, esc, &parts);
     let t1 = t0.elapsed();
 
