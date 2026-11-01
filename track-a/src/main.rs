@@ -218,7 +218,8 @@ impl Names {
                 let (id, at) = (next.0 + 1, next.1);
                 assert!(id < 2048, "more than 2047 endpoints");
                 // SAFETY: we hold the `next` lock, so no one else writes; `at` is a fresh line-aligned offset.
-                // Relies on all names fitting in `text` (2048 x 128 bytes; real names are far shorter).
+                // In bounds: the spec caps an endpoint at 125 bytes (`"/" *124echar`), so each padded copy
+                // takes at most 128 bytes, and the assert above keeps ids below 2048: 2047 x 128 < 2048 x 128.
                 unsafe { std::ptr::copy_nonoverlapping(q, self.text.add(at), n) };
                 self.keys[id].store((at << 8 | n) as u64, Release);
                 *next = (id, at + (n + 63) / 64 * 64);
@@ -505,7 +506,7 @@ fn main() {
     let b = map("/data/requests.log");
     let slots = Box::new([const { AtomicU64::new(0) }; SLOTS]);
     let keys = Box::new([const { AtomicU64::new(0) }; 2048]);
-    // `text` holds the name copies: 128 bytes per possible id is ample for the generated names.
+    // `text` holds the name copies: 128 bytes per possible id, the padded size of a 125-byte endpoint.
     let names = Names { slots, keys, next: Mutex::new((0, 0)), text: anon(2048 * 128) };
     // Any hour may hold every line (two words each at worst) plus a partly filled block per thread.
     let region = (b.len() / 19 + (threads + 1) * B + 1023) & !1023;
