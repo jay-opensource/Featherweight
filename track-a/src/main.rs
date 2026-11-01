@@ -52,8 +52,12 @@ fn map(path: &str) -> &'static [u8] {
     let len = f.metadata().unwrap().len() as usize;
     assert!(len < 1 << 32);
     unsafe {
-        let p = mmap(std::ptr::null_mut(), len + 4096, 1, 0x22, -1, 0);
+        // At a 2 MB-aligned address, so page-cache folios of 2 MB can be mapped by one PMD entry
+        // (fault-around and unmapping then work per 2 MB, not per 4 KB page).
+        let p = mmap(std::ptr::null_mut(), len + 4096 + (2 << 20), 1, 0x22, -1, 0) as usize;
+        let p = (p + (2 << 20) - 1 & !((2 << 20) - 1)) as *mut u8;
         assert!(p as isize != -1 && (len == 0 || mmap(p, len, 1, 0x12, f.as_raw_fd(), 0) == p));
+        madvise(p, len, 14); // MADV_HUGEPAGE, for boxes with THP "madvise"
         madvise(p, len, 2); // MADV_SEQUENTIAL: unmapping skips the per-page accessed marking
         std::slice::from_raw_parts(p, len)
     }
@@ -282,33 +286,31 @@ fn digits(v: u32) -> usize {
     v.checked_ilog10().map_or(1, |l| l as usize + 1)
 }
 
-/// "00" to "99".
-const PAIRS: [u8; 200] = {
-    let (mut t, mut i) = ([0; 200], 0);
-    while i < 200 {
-        t[i] = b'0' + (i / 20) as u8;
-        t[i + 1] = b'0' + (i / 2 % 10) as u8;
-        i += 2;
+/// "00" to "99", as the two bytes of a little-endian u16.
+const PAIRS: [u16; 100] = {
+    let (mut t, mut i) = ([0; 100], 0);
+    while i < 100 {
+        t[i] = (b'0' as usize + i / 10 | (b'0' as usize + i % 10) << 8) as u16;
+        i += 1;
     }
     t
 };
 
-/// Write " v" at o[*i..] and advance.
+/// Write " v" at o + i, two digits at a time from the right, and return where it ends.
+/// SAFETY: the caller sized o's range for exactly these lines.
 #[inline(always)]
-fn put(o: &mut [u8], i: &mut usize, mut v: u32) {
-    let mut j = *i + 1 + digits(v);
-    o[*i] = b' ';
-    *i = j;
-    while v >= 100 {
-        let r = (v % 100) as usize * 2;
-        o[j - 2..j].copy_from_slice(&PAIRS[r..r + 2]);
-        (j, v) = (j - 2, v / 100);
+unsafe fn put(o: *mut u8, i: usize, mut v: u32) -> usize {
+    let (end, mut j) = (i + 1 + digits(v), i + 1 + digits(v));
+    *o.add(i) = b' ';
+    while v >= 10 {
+        j -= 2;
+        (o.add(j) as *mut u16).write_unaligned(PAIRS[(v % 100) as usize]);
+        v /= 100;
     }
-    if v >= 10 {
-        o[j - 2..j].copy_from_slice(&PAIRS[v as usize * 2..v as usize * 2 + 2]);
-    } else {
-        o[j - 1] = b'0' + v as u8;
+    if j > i + 1 {
+        *o.add(i + 1) = b'0' + v as u8;
     }
+    end
 }
 
 /// Nearest-rank p50, p95, p99 of v (reorders v).
@@ -420,7 +422,8 @@ fn main() {
                     for (i, &w) in words.iter().enumerate() {
                         let (v, x) = (w >> 12, unsafe { *words.as_ptr().add(i + 1) });
                         let c = &mut at[(w & 2047) as usize];
-                        lat[*c as usize] = if v >= ESC { x | v & 2047 } else { v };
+                        // c < words.len() <= lat.len(): every word has a slot.
+                        unsafe { *lat.get_unchecked_mut(*c as usize) = if v >= ESC { x | v & 2047 } else { v } };
                         *c += 1;
                     }
                     let nw = words.len();
@@ -467,16 +470,18 @@ fn main() {
                     let (d, hh) = (t / 24, t % 24);
                     let (mo, d) = if d > 31 { (11, d - 31) } else { (10, d) };
                     let stamp = format!("2026-{mo}-{d:02}T{hh:02}:00:00Z ");
-                    let mut i = 0;
+                    let (mut i, p) = (0, o.as_mut_ptr());
                     for &[id, n, e, p50, p95, p99] in &pool.stats(h)[..groups[h].load(Relaxed)] {
                         let k = names.text(keys[id as usize - 1]);
-                        o[i..i + 21].copy_from_slice(stamp.as_bytes());
-                        o[i + 21..i + 21 + k.len()].copy_from_slice(k);
-                        i += 21 + k.len();
-                        for v in [n, p50, p95, p99, e, ppm(e, n)] {
-                            put(o, &mut i, v);
+                        unsafe {
+                            p.add(i).copy_from_nonoverlapping(stamp.as_ptr(), 21);
+                            p.add(i + 21).copy_from_nonoverlapping(k.as_ptr(), k.len());
+                            i += 21 + k.len();
+                            for v in [n, p50, p95, p99, e, ppm(e, n)] {
+                                i = put(p, i, v);
+                            }
+                            *p.add(i) = b'\n';
                         }
-                        o[i] = b'\n';
                         i += 1;
                     }
                     pool.free(h, 0, groups[h].load(Relaxed) * 24);
