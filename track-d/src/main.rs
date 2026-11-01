@@ -246,8 +246,7 @@ fn csr(n: usize, threads: usize, vb: u32, esc: u32, items: &[impl Edges]) -> Gra
 /// Breadth-first relabelling, in parallel: each thread grows its own region from a seed in its
 /// slice of the id range (claiming nodes with a CAS) and re-seeds from that slice when its region
 /// is enclosed. New ids follow one region's visit order, then the next region's, and so on.
-fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
-    let n = g.rel.len() - 1;
+fn bfs_order(g: &Graph, n: usize, threads: usize) -> Vec<u32> {
     // Zeroed by the kernel on first touch (in parallel); 0 is free, 1 claimed, until the ids.
     let mut id = vec![0u32; n];
     let ip = Slots(id.as_mut_ptr());
@@ -460,13 +459,13 @@ fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: [&Graph; 2], s: usize, t: usize)
         hs[side].clear();
         hs[side].put(0, [i as u32, gr.off(x) as u32, gr.off(x + 1) as u32]);
     }
-    let mut go = true;
-    while go && (hs[0].cur as u64 + hs[1].cur as u64) < m[0] {
-        go = match hs[0].len > hs[1].len {
+    // Step the chosen side while the minimums are below mu; a step that empties its queue ends it.
+    while (hs[0].cur as u64 + hs[1].cur as u64) < m[0]
+        && match hs[0].len > hs[1].len {
             true => step::<1>(pg, &mut hs[1], g[1], &mut m),
             false => step::<0>(pg, &mut hs[0], g[0], &mut m),
-        };
-    }
+        }
+    {}
     let [mu, skip] = m; // mu = u64::MAX (no path) casts to -1
     (skip >= mu && (skip == u64::MAX || mu < INF as u64)).then_some(mu as i64)
 }
@@ -541,7 +540,7 @@ fn main() {
     let esc = (1u32 << (32 - vb)) - 1;
     let g = {
         let g0 = csr(n, threads, vb, esc, &spans(body, body.len(), threads * 4));
-        let newid = bfs_order(&g0, threads);
+        let newid = bfs_order(&g0, n, threads);
         qs.iter_mut().for_each(|q| *q = (newid[q.0] as usize, newid[q.1] as usize));
         relabel(&g0, &newid, threads)
     };
