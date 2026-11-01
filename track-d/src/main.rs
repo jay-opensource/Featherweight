@@ -430,9 +430,9 @@ impl Dial {
         self.len += 1;
     }
 
-    /// Move cur to the smallest key and return it; None if the queue is empty.
+    /// Move cur to the smallest key; false if the queue is empty.
     #[inline(always)]
-    fn min(&mut self) -> Option<u32> {
+    fn min(&mut self) -> bool {
         let p = self.cur as usize % W;
         let (mut j, mut m) = (p / 64, ld(&self.bits, p / 64) >> p % 64 << p % 64);
         while m == 0 && self.len > 0 {
@@ -440,7 +440,7 @@ impl Dial {
             m = ld(&self.bits, j);
         }
         self.cur += ((j * 64 + m.trailing_zeros() as usize + W - p) % W) as u32;
-        (self.len > 0).then_some(self.cur)
+        self.len > 0
     }
 
     /// Take an item of key cur; min() must have returned Some since the last pop.
@@ -540,53 +540,56 @@ impl Pages {
 /// the caller runs the one-ended u64 search.
 fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: &Graph, r: &Graph, s: usize, t: usize) -> Option<i64> {
     pg.clear();
-    let (mut mu, mut skip) = (if s == t { 0 } else { u64::MAX }, u64::MAX);
+    let mut m = [if s == t { 0 } else { u64::MAX }, u64::MAX]; // mu, skip
     for (side, x, gr) in [(0, s, g), (1, t, r)] {
         let i = pg.at(x as u32, side);
         pg.pool[i] = 0;
         hs[side].clear();
         hs[side].put(0, [i as u32, gr.off(x) as u32, gr.off(x + 1) as u32]);
     }
-    let mut key = [0u32; 2]; // each side's smallest queued key
-    while (key[0] as u64 + key[1] as u64) < mu {
-        let side = (hs[0].len > hs[1].len) as usize;
-        let (gr, h, d) = (if side == 0 { g } else { r }, &mut hs[side], key[side]);
-        let [iu, e, end] = h.pop();
-        if ld(&pg.pool, iu as usize) == d {
-            // not settled, and not a stale entry (a label only drops after a push)
-            *mt(&mut pg.pool, iu as usize) |= SETTLED;
-            gr.slots(e as usize, end as usize, |v, w| {
-                let nd = d as u64 + w as u64;
-                if nd >= INF as u64 || w as usize >= W {
-                    skip = skip.min(nd);
-                    return;
-                }
-                let iv = pg.at(v, side);
-                let lv = ld(&pg.pool, iv);
-                if lv & SETTLED != 0 || lv as u64 <= nd {
-                    return;
-                }
-                *mt(&mut pg.pool, iv) = nd as u32;
-                // Start fetching the node's edges now: it is usually popped later.
-                let (a, b) = (gr.off(v as usize), gr.off(v as usize + 1));
-                prefetch(gr.edges.as_ptr().wrapping_add(a));
-                h.put(nd as u32, [iv as u32, a as u32, b as u32]);
-                let o = ld(&pg.pool, pg.ix(v, 1 - side)) & !SETTLED;
-                if o != INF {
-                    mu = mu.min(nd + o as u64);
-                }
-            });
-        }
-        match h.min() {
-            Some(k) => key[side] = k,
-            None => break,
-        }
+    let mut go = true;
+    while go && (hs[0].cur as u64 + hs[1].cur as u64) < m[0] {
+        go = if hs[0].len > hs[1].len { step::<1>(pg, &mut hs[1], r, &mut m) } else { step::<0>(pg, &mut hs[0], g, &mut m) };
     }
-    match mu {
-        _ if skip < mu || skip < u64::MAX && mu >= INF as u64 => None,
-        u64::MAX => Some(-1),
-        _ => Some(mu as i64),
+    match m {
+        [mu, skip] if skip < mu || skip < u64::MAX && mu >= INF as u64 => None,
+        [u64::MAX, _] => Some(-1),
+        [mu, _] => Some(mu as i64),
     }
+}
+
+/// One step of side S (0: forward on g, 1: backward on r, so the side is a constant in the code):
+/// pop its smallest entry, settle the node unless the entry is stale, and move to the next key.
+/// m is [mu, skip]. False once the side's queue is empty.
+#[inline(always)]
+fn step<const S: usize>(pg: &mut Pages, h: &mut Dial, gr: &Graph, m: &mut [u64; 2]) -> bool {
+    let (d, [iu, e, end]) = (h.cur, h.pop());
+    if ld(&pg.pool, iu as usize) == d {
+        // not settled, and not a stale entry (a label only drops after a push)
+        *mt(&mut pg.pool, iu as usize) |= SETTLED;
+        gr.slots(e as usize, end as usize, |v, w| {
+            let nd = d as u64 + w as u64;
+            if nd >= INF as u64 || w as usize >= W {
+                m[1] = m[1].min(nd);
+                return;
+            }
+            let iv = pg.at(v, S);
+            let lv = ld(&pg.pool, iv);
+            if lv & SETTLED != 0 || lv as u64 <= nd {
+                return;
+            }
+            *mt(&mut pg.pool, iv) = nd as u32;
+            // Start fetching the node's edges now: it is usually popped later.
+            let (a, b) = (gr.off(v as usize), gr.off(v as usize + 1));
+            prefetch(gr.edges.as_ptr().wrapping_add(a));
+            h.put(nd as u32, [iv as u32, a as u32, b as u32]);
+            let o = ld(&pg.pool, pg.ix(v, 1 - S)) & !SETTLED;
+            if o != INF {
+                m[0] = m[0].min(nd + o as u64);
+            }
+        });
+    }
+    h.min()
 }
 
 /// One-ended Dijkstra with u64 distances, for the few queries whose distances need more than
