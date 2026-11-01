@@ -15,11 +15,8 @@ extern "C" {
 /// Read-only private mapping of a whole file; the page cache is not charged to us, a heap copy would be.
 fn map(path: &str) -> &'static [u8] {
     let f = File::open(path).expect(path);
-    let len = f.metadata().unwrap().len() as usize;
-    if len == 0 {
-        return &[];
-    }
-    let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0) };
+    let len = f.metadata().unwrap().len() as usize; // an empty file still maps a page, never read
+    let p = unsafe { mmap(std::ptr::null_mut(), len.max(1), 1, 2, f.as_raw_fd(), 0) };
     assert!(p as isize != -1, "mmap {path}");
     unsafe { std::slice::from_raw_parts(p, len) }
 }
@@ -35,7 +32,7 @@ fn num(b: &[u8], i: &mut usize) -> u64 {
         let len = stop.trailing_zeros() as usize / 8;
         if len < 8 {
             *i += len + 1;
-            let v = if len == 0 { 0 } else { (d << (64 - 8 * len)) & 0x0F0F_0F0F_0F0F_0F0F };
+            let v = d.checked_shl(64 - 8 * len as u32).unwrap_or(0) & 0x0F0F_0F0F_0F0F_0F0F;
             let v = v.wrapping_mul(2561) >> 8 & 0x00FF_00FF_00FF_00FF;
             let v = v.wrapping_mul(6553601) >> 16 & 0x0000_FFFF_0000_FFFF;
             return v.wrapping_mul(42949672960001) >> 32;
@@ -51,7 +48,6 @@ fn num(b: &[u8], i: &mut usize) -> u64 {
 }
 
 /// Hint the cache to fetch the line holding `x`.
-#[inline(always)]
 fn prefetch<T>(x: *const T) {
     unsafe { std::arch::x86_64::_mm_prefetch(x as *const i8, std::arch::x86_64::_MM_HINT_T0) };
 }
@@ -74,9 +70,9 @@ fn chunks(b: &[u8], k: usize) -> Vec<(&[u8], usize, usize)> {
     (0..k).map(|j| (b, cut(j), cut(j + 1))).collect()
 }
 
-/// `0..n` in `k` ranges.
-fn spans(n: usize, k: usize) -> Vec<(usize, usize)> {
-    (0..k).map(|j| (j * n / k, (j + 1) * n / k)).collect()
+/// `0..n` in `k` ranges, each with the tag `x`.
+fn spans<T: Copy>(x: T, n: usize, k: usize) -> Vec<(T, usize, usize)> {
+    (0..k).map(|j| (x, j * n / k, (j + 1) * n / k)).collect()
 }
 
 /// Run `f` on `threads` threads, each pulling work items from `items` until they run out.
@@ -99,7 +95,6 @@ unsafe impl<T> Sync for Slots<T> {}
 
 /// Write edge (v, w) at slot p: one slot `v | w << vb`, or, when w does not fit, the escape
 /// value in that slot and the full weight in the next. Returns the slots used.
-#[inline(always)]
 fn store(out: &Slots<u32>, p: usize, v: u32, w: u32, vb: u32, esc: u32) -> usize {
     let k = 1 + (w >= esc) as usize; // the weight goes first, so that without an escape it is overwritten
     unsafe { (*out.0.add(p + k - 1), *out.0.add(p)) = (w, v | w.min(esc) << vb) };
@@ -152,7 +147,7 @@ fn layout(n: usize, t: usize, vb: u32, esc: u32, slots: impl Fn(usize) -> u32 + 
         let (mut rel, mut base) = (vec![0u8; n + 1], vec![0u32; (n >> sh) + 2]);
         let (rp, bp) = (Slots(rel.as_mut_ptr()), Slots(base.as_mut_ptr()));
         let ok = AtomicBool::new(true);
-        par(t, &spans((n >> sh) + 1, t * 4), |&(lo, hi)| {
+        par(t, &spans((), (n >> sh) + 1, t * 4), |&(_, lo, hi)| {
             for b in lo..hi {
                 let mut acc = 0;
                 for k in b << sh..((b + 1) << sh).min(n + 1) {
@@ -269,7 +264,7 @@ fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
     let at = |v: usize| unsafe { AtomicU32::from_ptr((&ip).0.add(v)) };
     let claim = |v: usize| at(v).load(Relaxed) == 0 && at(v).compare_exchange(0, 1, Relaxed, Relaxed).is_ok();
     let lists = std::sync::Mutex::new(Vec::new());
-    par(threads, &spans(n, threads), |&(mut scan, end)| {
+    par(threads, &spans((), n, threads), |&(_, mut scan, end)| {
         let (mut list, mut head) = (Vec::with_capacity(n), 0); // only touched pages are charged
         loop {
             if head == list.len() {
@@ -287,8 +282,8 @@ fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
                 prefetch(&g.rel[w as usize]);
                 prefetch(&g.base[w as usize >> g.sh]);
             }
-            if let Some(x) = list.get(head + 8).and_then(|&w| g.edges.get(g.off(w as usize))) {
-                prefetch(x);
+            if let Some(&w) = list.get(head + 8) {
+                prefetch(g.edges.as_ptr().wrapping_add(g.off(w as usize)));
             }
             if let Some(&w) = list.get(head + 4) {
                 g.adj(w as usize, |v, _| prefetch(at(v as usize)));
@@ -314,10 +309,10 @@ fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
 /// Copy `g` into the order given by `newid` (old id -> new id), each node's slots by one thread,
 /// with every target rewritten to its new id.
 fn relabel(g: &Graph, newid: &[u32], threads: usize) -> Graph {
-    let (n, ranges) = (newid.len(), spans(newid.len(), threads * 4));
+    let (n, ranges) = (newid.len(), spans((), newid.len(), threads * 4));
     let mut deg = vec![0u16; n + 1]; // newid is a permutation: no two threads write one entry
     let dp = Slots(deg.as_mut_ptr());
-    par(threads, &ranges, |&(lo, hi)| {
+    par(threads, &ranges, |&(_, lo, hi)| {
         for u in lo..hi {
             unsafe { *(&dp).0.add(newid[u] as usize) = (g.off(u + 1) - g.off(u)) as u16 };
         }
@@ -326,7 +321,7 @@ fn relabel(g: &Graph, newid: &[u32], threads: usize) -> Graph {
     drop(deg);
     let mut edges = vec![0u32; g.edges.len()];
     let out = Slots(edges.as_mut_ptr());
-    par(threads, &ranges, |&(lo, hi)| {
+    par(threads, &ranges, |&(_, lo, hi)| {
         for u in lo..hi {
             if u + 8 < hi {
                 // Prefetch where node u+8 goes and the new ids of its targets.
@@ -571,9 +566,7 @@ fn main() {
         qs.iter_mut().for_each(|q| *q = (newid[q.0] as usize, newid[q.1] as usize));
         relabel(&g0, &newid, threads)
     };
-    let sp = spans(n, threads * 4);
-    let parts: Vec<_> = sp.iter().map(|&(lo, hi)| (&g, lo, hi)).collect();
-    let r = csr(n, threads, vb, esc, &parts);
+    let r = csr(n, threads, vb, esc, &spans(&g, n, threads * 4));
     let t1 = t0.elapsed();
 
     let ans: Vec<AtomicI64> = qs.iter().map(|_| AtomicI64::new(-1)).collect();
