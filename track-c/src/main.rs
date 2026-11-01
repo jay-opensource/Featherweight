@@ -10,6 +10,7 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
+    fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
 }
 
 /// The scoring box backs anonymous memory with 2 MB pages (THP "always"), and memory.peak charges
@@ -56,9 +57,13 @@ fn map(path: &str) -> &'static [u8] {
     }
 }
 
-/// n zeroed values from calloc: fresh pages, charged only when touched. T is an atomic integer.
-fn zeroed<T>(n: usize) -> Vec<T> {
-    unsafe { Vec::from_raw_parts(std::alloc::alloc_zeroed(std::alloc::Layout::array::<T>(n).unwrap()) as *mut T, n, n) }
+/// n zeroed values in fresh anonymous pages (page-aligned, charged only when touched, never
+/// freed: the process ends first). T is an atomic integer.
+fn zeroed<T>(n: usize) -> &'static [T] {
+    let len = (n * std::mem::size_of::<T>()).max(1);
+    let p = unsafe { mmap(std::ptr::null_mut(), len, 3, 0x22, -1, 0) }; // READ | WRITE, PRIVATE | ANONYMOUS
+    assert!(p as isize != -1, "mmap");
+    unsafe { std::slice::from_raw_parts(advise(p, len) as *const T, n) }
 }
 
 /// Byte at i, which may be up to 4 KB past the end of b (the zero padding of `map`).
@@ -122,7 +127,7 @@ fn inside(q: u64) -> u64 {
 /// Word j of the key b[s..s + n], zero-padded past its end.
 #[inline(always)]
 fn kw(b: &[u8], s: usize, n: usize, j: usize) -> u64 {
-    word(b, s + 8 * j) & ((1u128 << (8 * n.saturating_sub(8 * j).min(8))) - 1) as u64
+    unsafe { std::arch::x86_64::_bzhi_u64(word(b, s + 8 * j), (8 * n.saturating_sub(8 * j)).min(64) as u32) }
 }
 
 #[inline(always)]
@@ -132,11 +137,10 @@ fn hash(b: &[u8], s: usize, n: usize) -> u64 {
 }
 
 #[inline(always)]
-fn prefetch<T>(x: &T) {
-    unsafe { std::arch::x86_64::_mm_prefetch(x as *const T as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+fn prefetch<T>(x: *const T) {
+    unsafe { std::arch::x86_64::_mm_prefetch(x as *const i8, std::arch::x86_64::_MM_HINT_T0) };
 }
 
-static EXP: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| std::env::var("FW_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
 
 /// Running aggregates of one group, per thread.
 #[derive(Clone, Copy)]
@@ -156,204 +160,234 @@ const NEW: Agg = Agg { n: 0, ids: 0, sum: 0, min: i64::MAX, max: i64::MIN, name_
 struct Slots<T>(*mut T);
 unsafe impl<T> Sync for Slots<T> {}
 
-/// Insert-only concurrent name dictionary. A table slot holds an 8-bit hash tag and the arena word
-/// offset + 1 of the entry; an entry is one word `id | len << 32` and the name bytes, zero-padded
-/// to whole words. Threads take arena space and ids in blocks, so the shared counters stay cold.
+/// Insert-only concurrent name dictionary with the names inline. A slot is 32 bytes: a header
+/// `n | pairs << 20 | (id + 1) << 40` (0 = empty, BUSY while being filled; pairs = the `""` in the
+/// raw name) and the first 24 bytes of the name, zero-padded. Two slots share a cache line, so a lookup is one prefetched line. A name longer
+/// than 24 bytes keeps all its words in `long` and their offset in the slot's second word.
 struct Names {
-    table: Vec<AtomicU32>,
+    slots: &'static [AtomicU64],
     shift: u32,
-    _arena: Vec<u64>,
-    words: Slots<u64>,
+    long: Slots<u64>,
     top: AtomicUsize,
     next_id: AtomicU32,
     max_ids: u32,
     full: AtomicBool,
 }
 
-/// Arena words: a table slot has 24 bits for the offset.
-const ARENA: usize = (1 << 24) - 1;
+const BUSY: u64 = u64::MAX;
+const LONG: usize = 1 << 23; // words reserved for long names; only touched pages are charged
 
-/// One thread's current arena block and id block.
+/// One thread's current block of ids.
 #[derive(Default)]
 struct Local {
-    at: usize,
-    end: usize,
     id: u32,
     id_end: u32,
 }
 
 impl Names {
     fn new(cap: usize) -> Self {
-        let mut arena = Vec::with_capacity(ARENA); // only touched pages are charged
-        let words = Slots(arena.as_mut_ptr());
         Names {
-            table: zeroed(cap),
+            slots: zeroed(4 * cap),
             shift: 64 - cap.trailing_zeros(),
-            _arena: arena,
-            words,
+            long: Slots(Vec::<u64>::with_capacity(LONG).leak().as_mut_ptr()),
             top: AtomicUsize::new(0),
             next_id: AtomicU32::new(0),
-            max_ids: (cap / 4 * 3) as u32,
+            max_ids: (cap / 8 * 7) as u32,
             full: AtomicBool::new(false),
         }
     }
 
-    /// Dense id of the name b[s..s + n] with hash h (a slice of the mapped file, so loads may run
-    /// past its end).
+    /// Dense id and `""` count of the raw name b[s..s + n] with hash h (a slice of the mapped file,
+    /// so loads may run past its end).
     #[inline(always)]
-    fn id(&self, b: &[u8], s: usize, n: usize, h: u64, loc: &mut Local) -> u32 {
-        let w = |j: usize| kw(b, s, n, j);
-        let (tag, nw) = ((h >> 8) as u32 & 0xFF00_0000, (n + 7) / 8);
+    fn id(&self, b: &[u8], s: usize, n: usize, h: u64, loc: &mut Local) -> (u32, usize) {
+        let (w, nw) = (|j: usize| kw(b, s, n, j), (n + 7) / 8);
         let mut i = (h >> self.shift) as usize;
         loop {
-            let mut e = self.table[i].load(Acquire);
-            if e == 0 {
-                if loc.at + 1 + nw > loc.end {
-                    let size = (1 + nw).max(512);
-                    loc.at = self.top.fetch_add(size, Relaxed);
-                    loc.end = loc.at + size;
-                }
+            let slot = &self.slots[4 * i..4 * i + 4];
+            let hdr = slot[0].load(Acquire);
+            if hdr == 0 && slot[0].compare_exchange(0, BUSY, Acquire, Relaxed).is_ok() {
                 if loc.id == loc.id_end {
                     loc.id = self.next_id.fetch_add(64, Relaxed);
                     loc.id_end = loc.id + 64;
                 }
-                if loc.end >= ARENA || loc.id >= self.max_ids {
+                let o = if n > 24 { self.top.fetch_add(nw, Relaxed) } else { 0 };
+                if loc.id >= self.max_ids || o + nw > LONG || n >= 1 << 20 {
                     self.full.store(true, Relaxed);
-                    return 0;
+                    slot[0].store(0, Release);
+                    return (0, 0);
                 }
-                unsafe {
-                    *self.words.0.add(loc.at) = loc.id as u64 | (n as u64) << 32;
-                    for j in 0..nw {
-                        *self.words.0.add(loc.at + 1 + j) = w(j);
-                    }
+                for j in 0..3 {
+                    slot[1 + j].store(if n > 24 { o as u64 * (j == 0) as u64 } else { w(j) }, Relaxed);
                 }
-                match self.table[i].compare_exchange(0, tag | (loc.at as u32 + 1), Release, Acquire) {
-                    Ok(_) => {
-                        loc.at += 1 + nw;
-                        loc.id += 1;
-                        return loc.id - 1;
-                    }
-                    Err(cur) => e = cur,
+                for j in 0..nw * (n > 24) as usize {
+                    unsafe { *self.long.0.add(o + j) = w(j) };
                 }
+                let pairs = (s..s + n).filter(|&j| at(b, j) == b'"').count() / 2;
+                slot[0].store((n | pairs << 20) as u64 | (loc.id as u64 + 1) << 40, Release);
+                loc.id += 1;
+                return (loc.id - 1, pairs);
             }
-            if e & 0xFF00_0000 == tag {
-                let o = (e & 0xFF_FFFF) as usize - 1;
-                let hdr = unsafe { *self.words.0.add(o) };
-                if hdr >> 32 == n as u64 && (0..nw).all(|j| unsafe { *self.words.0.add(o + 1 + j) } == w(j)) {
-                    return hdr as u32;
-                }
+            if hdr == BUSY || hdr == 0 {
+                std::hint::spin_loop(); // another thread is filling this slot: look again
+                continue;
             }
-            i = (i + 1) & (self.table.len() - 1);
+            let same = || {
+                if n > 24 {
+                    let o = slot[1].load(Relaxed) as usize;
+                    (0..nw).all(|j| unsafe { *self.long.0.add(o + j) } == w(j))
+                } else {
+                    (slot[1].load(Relaxed) ^ w(0)) | (slot[2].load(Relaxed) ^ w(1)) | (slot[3].load(Relaxed) ^ w(2)) == 0
+                }
+            };
+            if hdr as usize & 0xF_FFFF == n && same() {
+                return ((hdr >> 40) as u32 - 1, (hdr >> 20) as usize & 0xF_FFFF);
+            }
+            i = (i + 1) & (self.slots.len() / 4 - 1);
         }
     }
 }
 
-/// Bit (group g, name id) lives in pages of 4096 names: [page][group][64 words], so a group's bits
-/// for one page are contiguous (fast popcount) and pages past the last id are never touched.
-#[inline(always)]
-fn bit(g: usize, id: u32) -> (usize, u64) {
-    (((id >> 12) as usize * 256 + g) * 64 + (id as usize >> 6 & 63), 1 << (id & 63))
+/// One bit per (group, name id), in pages of 4096 names: [page][group][64 words], so a group's
+/// bits for one page are contiguous (fast popcount) and pages past the last id are never touched.
+/// Threads never use locked instructions on it: a locked OR waits for its line, which another core
+/// has usually just written, and blocks every later load meanwhile. Instead each thread queues
+/// (word, bit) pairs per region of the array (64 regions) and applies a full queue of 64 with plain
+/// loads and stores while holding that region's lock: one lock per 64 bits.
+struct Bits {
+    w: &'static [AtomicU64],
+    locks: Vec<Mutex<()>>,
 }
 
-/// One parsed record waiting for its name lookup: group, name key span and its hash.
+/// One thread's queues: 64 regions x 64 pairs `word << 6 | bit`.
+struct Pend {
+    q: [[u32; 64]; 64],
+    n: [usize; 64],
+}
+
+impl Bits {
+    #[inline(always)]
+    fn set(&self, p: &mut Pend, g: usize, id: u32) {
+        let w = ((id >> 12) as usize * 256 + g) * 64 + (id as usize >> 6 & 63);
+        let r = (w ^ w >> 6) & 63;
+        p.q[r][p.n[r]] = (w as u32) << 6 | id & 63;
+        p.n[r] += 1;
+        if p.n[r] == 64 {
+            self.apply(p, r);
+        }
+    }
+
+    fn apply(&self, p: &mut Pend, r: usize) {
+        let _lock = self.locks[r].lock().unwrap();
+        for &x in &p.q[r][..p.n[r]] {
+            let a = &self.w[(x >> 6) as usize];
+            a.store(a.load(Relaxed) | 1 << (x & 63), Relaxed);
+        }
+        p.n[r] = 0;
+    }
+}
+
+/// One parsed record waiting for its lookups.
 #[derive(Clone, Copy, Default)]
 struct Rec {
-    g: usize,
+    r: usize,
     s: usize,
     n: usize,
     h: u64,
+    id: i64,
+    v: i64,
+    quoted: usize,
+    quotes: usize,
+    note: usize,
 }
+
+const BATCH: usize = 32;
 
 /// Parse the records that start in b[start..end) (start is a record start) into agg, names and
 /// bits. Returns where parsing stopped: exactly `end` when `end` is a record boundary.
 /// Each 64-byte block gives bit masks of quotes, commas and LFs; the commas and LFs outside quotes
-/// are the field ends, so a record's fields come from bit positions and no byte is scanned twice.
-fn chunk(b: &[u8], start: usize, end: usize, tab: &[u8], names: &Names, bits: &[AtomicU64], loc: &mut Local, agg: &mut [Agg; 256]) -> usize {
-    let (mut base, mut carry, mut quotes) = (start, 0u64, 0usize);
-    let (mut rs, mut f, mut cs, mut qs) = (start, 0usize, [0usize; 5], [0usize; 3]);
-    let (mut batch, mut nb) = ([Rec::default(); 16], 0);
-    while rs < end && base < b.len() {
+/// are the field ends. Their positions go into a buffer without branches, and every record takes
+/// exactly five of them (four commas and the LF), so fields come from positions alone.
+fn chunk(b: &[u8], start: usize, end: usize, tab: &[u8], names: &Names, bits: &Bits, loc: &mut Local, pend: &mut Pend, agg: &mut [Agg; 256]) -> usize {
+    let (mut base, mut carry, mut quotes, mut rs) = (start, 0u64, 0usize, start);
+    // Ring of structural positions, n written, i consumed; quotes before the record start.
+    let (mut pos, mut n, mut i, mut qrs) = ([0usize; 128], 0usize, 0usize, 0usize);
+    let (mut batch, mut nb) = ([Rec::default(); BATCH], 0);
+    'blocks: while rs < end && base < b.len() {
         let (q, c, l) = masks(b, base);
         let x = inside(q) ^ carry;
         carry = ((x as i64) >> 63) as u64;
         let mut s = (c | l) & !x;
-        while s != 0 {
-            let t = s.trailing_zeros() as usize;
-            s &= s - 1;
-            if f < 3 {
-                qs[f] = quotes + (q & ((1u64 << t) - 1)).count_ones() as usize;
-            }
-            if l >> t & 1 == 0 {
-                cs[f] = base + t;
-                f = (f + 1).min(4);
-                continue;
-            }
-            if f == 4 {
-                // id , name , note , region , amount (CR) LF; a BOM may precede the id.
-                let mut p = rs + 3 * (at(b, rs) == 0xEF) as usize;
-                let id = num(b, &mut p) as i64;
-                let (nq, tq) = (qs[1] - qs[0], qs[2] - qs[1]);
-                let r = &mut batch[nb];
-                r.g = tab.get(num(b, &mut { cs[2] + 1 }) as usize).copied().unwrap_or(0) as usize;
-                r.s = cs[0] + 1 + (nq > 0) as usize;
-                r.n = (cs[1] - (nq > 0) as usize).saturating_sub(r.s);
-                r.h = hash(b, r.s, r.n);
-                prefetch(&names.table[(r.h >> names.shift) as usize]);
-                let mut p = cs[3] + 1;
-                let neg = at(b, p) == b'-';
-                p += neg as usize;
-                let v = num(b, &mut p) as i64 * 100 + (at(b, p) as i64 - 48) * 10 + at(b, p + 1) as i64 - 48;
-                let v = if neg { -v } else { v };
-                let a = &mut agg[r.g];
-                a.n += 1;
-                a.ids += id;
-                a.sum += v;
-                a.min = a.min.min(v);
-                a.max = a.max.max(v);
-                a.name_bytes += (cs[1] - cs[0] - 1 - nq / 2 - (nq > 0) as usize) as i64;
-                a.note_bytes += (cs[2] - cs[1] - 1 - tq / 2 - (tq > 0) as usize) as i64;
-                nb += 1;
-                if nb == batch.len() {
-                    flush(b, &batch, names, bits, loc);
-                    nb = 0;
-                }
-            }
-            (rs, f) = (base + t + 1, 0);
-            if rs >= end {
-                break;
+        let k = n + s.count_ones() as usize;
+        while n < k {
+            for _ in 0..8 {
+                pos[n & 127] = base + s.trailing_zeros() as usize;
+                s &= s.wrapping_sub(1);
+                n += 1;
             }
         }
-        quotes += q.count_ones() as usize;
-        base += 64;
+        n = k;
+        while i + 5 <= n {
+            // id , name , note , region , amount (CR) LF; a BOM may precede the id. A record's
+            // fifth position is always in this block, so its quotes are counted up to there; the
+            // name's are known to the dictionary, and the rest are the note's.
+            let at5 = |j: usize| pos[(i + j) & 127];
+            let (c0, c1, c2, c3, lf) = (at5(0), at5(1), at5(2), at5(3), at5(4));
+            let qlf = quotes + unsafe { std::arch::x86_64::_bzhi_u64(q, (lf - base) as u32) }.count_ones() as usize;
+            let r = &mut batch[nb & (BATCH - 1)];
+            (r.quotes, qrs) = (qlf.wrapping_sub(qrs), qlf);
+            r.quoted = (at(b, c0 + 1) == b'"') as usize;
+            r.note = c2 - c1 - 1;
+            r.id = num(b, &mut (rs + 3 * (at(b, rs) == 0xEF) as usize)) as i64;
+            r.s = c0 + 1 + r.quoted;
+            r.n = (c1 - r.quoted).saturating_sub(r.s);
+            r.h = hash(b, r.s, r.n);
+            prefetch(names.slots.as_ptr().wrapping_add(4 * (r.h >> names.shift) as usize));
+            r.r = num(b, &mut (c2 + 1)) as usize;
+            prefetch(tab.as_ptr().wrapping_add(r.r)); // a prefetch never faults
+            let mut p = c3 + 1;
+            let neg = at(b, p) == b'-';
+            p += neg as usize;
+            let v = num(b, &mut p) as i64 * 100 + (at(b, p) as i64 - 48) * 10 + at(b, p + 1) as i64 - 48;
+            r.v = if neg { -v } else { v };
+            nb += 1;
+            if nb == BATCH {
+                flush(b, &batch, tab, names, bits, loc, pend, agg);
+                nb = 0;
+            }
+            rs = lf + 1;
+            i += 5;
+            if rs >= end {
+                break 'blocks;
+            }
+        }
+        (quotes, base) = (quotes + q.count_ones() as usize, base + 64);
     }
-    flush(b, &batch[..nb], names, bits, loc);
+    flush(b, &batch[..nb], tab, names, bits, loc, pend, agg);
     rs
 }
 
-/// Name lookups for a batch, then the bit sets: the table lines were prefetched while the batch was
-/// parsed, the arena loads of different records overlap, and each locked OR (which waits for all
-/// earlier memory operations) finds its line already fetched.
+/// Lookups for a batch: the region byte and the dictionary slot were prefetched while the batch was
+/// parsed; pass one adds each record to its group, pass two finds the name's id and queues its bit.
 #[inline(always)]
-fn flush(b: &[u8], batch: &[Rec], names: &Names, bits: &[AtomicU64], loc: &mut Local) {
-    let x = *EXP;
-    if x == 1 {
-        return;
+fn flush(b: &[u8], batch: &[Rec], tab: &[u8], names: &Names, bits: &Bits, loc: &mut Local, pend: &mut Pend, agg: &mut [Agg; 256]) {
+    let mut gs = [0usize; BATCH];
+    for (r, g) in batch.iter().zip(gs.iter_mut()) {
+        *g = tab.get(r.r).copied().unwrap_or(0) as usize;
+        let a = &mut agg[*g];
+        a.n += 1;
+        a.ids += r.id;
+        a.sum += r.v;
+        a.min = a.min.min(r.v);
+        a.max = a.max.max(r.v);
     }
-    let mut ws = [(0usize, 0u64); 16];
-    for (r, w) in batch.iter().zip(ws.iter_mut()) {
-        *w = bit(r.g, if x == 7 { (r.h >> 47) as u32 } else { names.id(b, r.s, r.n, r.h, loc) });
-        prefetch(&bits[w.0]);
-    }
-    if x == 2 {
-        std::hint::black_box(&ws);
-        return;
-    }
-    for &(w, m) in &ws[..batch.len()] {
-        if x == 6 {
-            bits[w].store(bits[w].load(Relaxed) | m, Relaxed);
-        } else {
-            bits[w].fetch_or(m, Relaxed);
-        }
+    for (r, &g) in batch.iter().zip(gs.iter()) {
+        let (id, pairs) = names.id(b, r.s, r.n, r.h, loc);
+        let tq = r.quotes.wrapping_sub(r.quoted * (2 + 2 * pairs)); // the note's quotes
+        let a = &mut agg[g];
+        a.name_bytes += (r.n - pairs) as i64;
+        a.note_bytes += r.note.wrapping_sub(tq / 2 + (tq > 0) as usize) as i64;
+        bits.set(pend, g, id);
     }
 }
 
@@ -376,19 +410,21 @@ fn run(b: &[u8], tab: &[u8], cap: usize, threads: usize) -> Option<(Vec<Agg>, Ve
     cut[0] = first;
     cut.push(b.len());
     let names = Names::new(cap);
-    let bits: Vec<AtomicU64> = zeroed((names.max_ids as usize / 4096 + 1) * 256 * 64);
+    let bits = Bits { w: zeroed((names.max_ids as usize / 4096 + 1) * 256 * 64), locks: (0..64).map(|_| Mutex::new(())).collect() };
+    assert!(bits.w.len() < 1 << 26);
     let (next, ends) = (AtomicUsize::new(0), Mutex::new(vec![0; k]));
     let aggs: Vec<[Agg; 256]> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..threads)
             .map(|_| {
                 s.spawn(|| {
-                    let (mut agg, mut loc) = ([NEW; 256], Local::default());
+                    let (mut agg, mut loc, mut pend) = ([NEW; 256], Local::default(), Pend { q: [[0; 64]; 64], n: [0; 64] });
                     loop {
                         let j = next.fetch_add(1, Relaxed);
                         if j >= k {
+                            (0..64).for_each(|r| bits.apply(&mut pend, r));
                             break agg;
                         }
-                        let e = chunk(b, cut[j], cut[j + 1], tab, &names, &bits, &mut loc, &mut agg);
+                        let e = chunk(b, cut[j], cut[j + 1], tab, &names, &bits, &mut loc, &mut pend, &mut agg);
                         ends.lock().unwrap()[j] = e;
                     }
                 })
@@ -397,7 +433,7 @@ fn run(b: &[u8], tab: &[u8], cap: usize, threads: usize) -> Option<(Vec<Agg>, Ve
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let ends = ends.into_inner().unwrap();
-    eprintln!("names {} arena words {}", names.next_id.load(Relaxed), names.top.load(Relaxed));
+    eprintln!("names {} long words {}", names.next_id.load(Relaxed), names.top.load(Relaxed));
     if names.full.load(Relaxed) || (0..k - 1).any(|j| ends[j] != cut[j + 1]) {
         return None;
     }
@@ -408,7 +444,7 @@ fn run(b: &[u8], tab: &[u8], cap: usize, threads: usize) -> Option<(Vec<Agg>, Ve
         }
     }
     let distinct = (0..256)
-        .map(|g| bits.chunks(256 * 64).map(|page| page[g * 64..g * 64 + 64].iter().map(|w| w.load(Relaxed).count_ones() as u64).sum::<u64>()).sum())
+        .map(|g| bits.w.chunks(256 * 64).map(|page| page[g * 64..g * 64 + 64].iter().map(|w| w.load(Relaxed).count_ones() as u64).sum::<u64>()).sum())
         .collect();
     Some((total, distinct))
 }
@@ -431,7 +467,7 @@ fn main() {
     let last = body[..body.len() - 1].iter().rposition(|&c| c == b'\n').map_or(0, |i| i + 1);
     let mut tab = vec![0u8; num(body, &mut { last }) as usize + 1];
     let codes = Mutex::new(vec![*b"_UNMATCHED"]);
-    let seen: Vec<AtomicU8> = zeroed(26 * 26 * 26);
+    let seen: &[AtomicU8] = zeroed(26 * 26 * 26);
     let (out, next, len) = (Slots(tab.as_mut_ptr()), AtomicUsize::new(0), tab.len());
     let parts: Vec<usize> = (0..=threads * 4).map(|j| guess_line(body, body.len() * j / (threads * 4))).collect();
     std::thread::scope(|s| {
@@ -469,7 +505,7 @@ fn main() {
     let t1 = t0.elapsed();
 
     let rc = map("/data/records.csv");
-    let (mut cap, mut t) = (1 << 18, threads);
+    let (mut cap, mut t) = (1 << 17, threads);
     let (total, distinct) = loop {
         if let Some(r) = run(rc, &tab, cap, t) {
             break r;
@@ -487,7 +523,9 @@ fn main() {
         text += &format!("{key} {} {} {} {} {} {} {} {}\n", a.n, a.ids, money(a.sum), money(a.min), money(a.max), distinct[g], a.name_bytes, a.note_bytes);
     }
     std::fs::write("/out/aggregates.txt", text).expect("write aggregates.txt");
-    eprintln!("regions {t1:?} records {t2:?} total {:?}", t0.elapsed());
+    let mut ru = [0i64; 18];
+    unsafe { getrusage(0, &mut ru) };
+    eprintln!("cpu {:.1}ms sys {:.1}ms regions {t1:?} records {t2:?} total {:?}", (ru[0] * 1000000 + ru[1] + ru[2] * 1000000 + ru[3]) as f64 / 1e3, (ru[2] * 1000000 + ru[3]) as f64 / 1e3, t0.elapsed());
 }
 
 /// First line start at or after i.
