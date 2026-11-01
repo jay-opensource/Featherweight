@@ -122,7 +122,8 @@ impl Graph {
 }
 
 /// A work item of an edge stream: `each(fill, emit)` calls emit(u, v, w) for each of its edges
-/// (`fill`: the caller uses v). A trait (not a closure taking a `dyn` emitter) so that the emitter
+/// (`fill`: the caller uses v; if not, an item may instead call emit(u, MAX, slots) once per node
+/// u, with all of u's slots). A trait (not a closure taking a `dyn` emitter) so that the emitter
 /// is inlined into the parsing loop.
 trait Edges: Sync {
     fn each(&self, fill: bool, emit: impl FnMut(usize, u32, u32));
@@ -142,15 +143,16 @@ impl Edges for (&[u8], usize, usize) {
 }
 
 /// The edges u -> v of nodes lo..hi of a graph: as id[u] -> id[v] (relabelled), or as v -> u
-/// (reversed) if `id` is empty.
+/// (reversed) if `id` is empty. Relabelled, a count only needs node u's slot count: one per node.
 impl Edges for ((&Graph, &[u32]), usize, usize) {
     fn each(&self, fill: bool, mut emit: impl FnMut(usize, u32, u32)) {
         let ((g, id), lo, hi) = *self;
         for u in lo..hi {
             match id.get(u) {
+                Some(&x) if !fill => emit(x as usize, !0, (g.off(u + 1) - g.off(u)) as u32),
                 Some(&x) => {
                     // the new ids of the targets of node u + 8 (random reads)
-                    fill.then(|| g.adj((u + 8).min(hi - 1), |v, _| prefetch(&id[v as usize])));
+                    g.adj((u + 8).min(hi - 1), |v, _| prefetch(&id[v as usize]));
                     g.adj(u, |v, w| emit(x as usize, ld(id, v as usize), w))
                 }
                 None => g.adj(u, |v, w| emit(v as usize, u as u32, w)),
@@ -159,7 +161,7 @@ impl Edges for ((&Graph, &[u32]), usize, usize) {
     }
 }
 
-/// Build a CSR over n nodes from the edges of `items`. Every random access stays inside a small
+/// Build a CSR over n nodes from the edges of `it`. Every random access stays inside a small
 /// region:
 /// 1. count each item's slots per bucket of 8192 nodes (213 counters per item, no atomics);
 /// 2. append each slot to its bucket's region through the item's own cursor, with the node's
@@ -169,24 +171,29 @@ impl Edges for ((&Graph, &[u32]), usize, usize) {
 ///    the bucket's first slot, and reorder the bucket's ~94 KB of slots by node through a scratch
 ///    copy. Offsets come in blocks of 16 nodes (a u32 base each, u8 offsets inside); if an
 ///    in-block offset does not fit, they are laid out again with smaller blocks (the slots stay).
-/// Nothing is locked, and no store lands outside the bucket being worked on. `buf` is Ok(the edge
+/// Nothing is locked, and no store lands outside the bucket being worked on. `bf` is Ok([the edge
 /// array of a graph dropped by the caller with exactly as many slots: its pages are already
-/// mapped, every slot is written), or Err(est). If est > 0 (the expected slot count), step 1 is
-/// skipped: each item gets room for its share of est in each bucket plus 6 standard deviations
-/// (the text is parsed once), the unused room is holes (place 0), and the
-/// finish packs the slots (see there). A segment that would overflow starts it all again, counted.
-fn csr(n: usize, t: usize, vb: u32, items: &[impl Edges], buf: Result<Vec<u32>, usize>) -> Staged {
+/// mapped, every slot is written; the counts of step 1, which is skipped]), or Err(est). If est > 0
+/// (the expected slot count), step 1 is skipped too: each item gets room for its share of est in
+/// each bucket plus 6 standard deviations (the text is parsed once), the unused room is holes
+/// (place 0), and the finish packs the slots (see there). A segment that would overflow starts it
+/// all again, counted.
+fn csr(n: usize, t: usize, vb: u32, it: &[impl Edges], bf: Result<[Vec<u32>; 2], usize>) -> Staged {
     let esc = u32::MAX >> vb; // the escape value: all ones in the weight bits
-    let (nb, ni) = ((n >> BS) + 1, items.len());
-    let est = *buf.as_ref().err().unwrap_or(&0);
+    let (nb, ni) = ((n >> BS) + 1, it.len());
+    let est = *bf.as_ref().err().unwrap_or(&0);
     // the room of item j / nb in bucket j % nb (8192 of the n + 1 nodes); 0 if counted
     let mu = |j: usize| (est * (n + 1 - j % nb * 8192).min(8192) / (n + 1) / ni) as f64;
-    let mut cur = Vec::from_iter((0..ni * nb).map(|j| (mu(j) + 6.0 * mu(j).sqrt()) as u32));
+    let room = |j: usize| (mu(j) + 6.0 * mu(j).sqrt()) as u32;
+    let [edges, mut cur] = bf.unwrap_or_else(|_| [vec![], (0..ni * nb).map(room).collect()]);
     let cp = Slots(cur.as_mut_ptr());
-    if est == 0 {
+    if est == 0 && edges.is_empty() {
         par(t, &(0..ni).collect::<Vec<_>>(), |&i| {
             let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
-            items[i].each(false, |u, _, w| c[u >> BS] += 1 + (w >= esc) as u32);
+            // v = MAX: w is all of node u's slots (see `Edges`)
+            it[i].each(false, |u, v, w| {
+                c[u >> BS] += [1 + (w >= esc) as u32, w][(v == !0) as usize]
+            });
         });
     }
     let (mut st, mut acc, mut end) = (vec![[0, 0]; nb + 1], 0u32, vec![0; ni * nb]);
@@ -198,13 +205,13 @@ fn csr(n: usize, t: usize, vb: u32, items: &[impl Edges], buf: Result<Vec<u32>, 
         st[b + 1][0] = acc as usize; // each bucket's first slot: staged, packed (no holes)
     }
     let seg = cur.clone(); // where each segment starts
-    let mut edges = buf.unwrap_or_else(|_| vec![0; acc as usize]); // every slot is written below
+    let mut edges = edges.is_empty().then(|| vec![0; acc as _]).unwrap_or(edges); // see `bf`
     let mut loc = vec![0u16; acc as usize];
     let (ep, lp) = (Slots(edges.as_mut_ptr()), Slots(loc.as_mut_ptr()));
     let ok = AtomicBool::new(true);
     par(t, &(0..ni).collect::<Vec<_>>(), |&i| {
         let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
-        items[i].each(true, |u, v, w| {
+        it[i].each(true, |u, v, w| {
             let (b, l) = (u >> BS, (u & ((1 << BS) - 1)) as u16 + 1);
             if est > 0 && c[b] as usize + 1 + (w >= esc) as usize > end[i * nb + b] {
                 return ok.store(false, Relaxed);
@@ -219,7 +226,7 @@ fn csr(n: usize, t: usize, vb: u32, items: &[impl Edges], buf: Result<Vec<u32>, 
         });
     });
     if !ok.into_inner() {
-        return csr(n, t, vb, items, Err(0));
+        return csr(n, t, vb, it, Err(0));
     }
     for b in 0..nb {
         let used: u32 = (0..ni).map(|i| cur[i * nb + b] - seg[i * nb + b]).sum();
@@ -235,14 +242,17 @@ const BS: u32 = 13;
 /// a hole), the first slot of each bucket with and without holes, and n, threads, vb.
 type Staged = (Vec<u32>, Vec<u16>, Vec<[usize; 2]>, usize, usize, u32);
 
-/// Step 3 of `csr`. With holes, a bucket's packed slots start at or before its staged ones, over
+/// Step 3 of `csr`; also counts the reverse graph's slots into rc, if rc is not empty: rc[b * nb +
+/// (v >> BS)] for each edge u -> v of bucket b (step 1 of a build of the reverse graph whose items
+/// are single buckets). With holes, a bucket's packed slots start at or before its staged ones, over
 /// the staged slots of earlier buckets: it writes them only once those buckets have copied theirs
 /// (buckets are taken in order, so it waits only for ones being worked on).
-fn finish((edges, loc, st, n, threads, vb): Staged) -> Graph {
+fn finish(rc: &mut [u32], (edges, loc, st, n, threads, vb): Staged) -> Graph {
     let (nb, mut g) = ((n >> BS) + 1, Graph::default());
     (g.edges, g.vb, g.esc) = (edges, vb, u32::MAX >> vb);
     let ep = Slots(g.edges.as_mut_ptr());
     let copied = Vec::from_iter((0..nb).map(|_| AtomicBool::new(false)));
+    let cp = Slots(rc.as_mut_ptr());
     for sh in (0..=4).rev() {
         (g.sh, g.rel, g.base) = (sh, vec![0; n + 1], vec![0; (n >> sh) + 1]);
         let (rp, bp) = (Slots(g.rel.as_mut_ptr()), Slots(g.base.as_mut_ptr()));
@@ -251,6 +261,13 @@ fn finish((edges, loc, st, n, threads, vb): Staged) -> Graph {
             let ([s0, lo], [s1, _], k0) = (st[b], st[b + 1], b << BS);
             let e = unsafe { std::slice::from_raw_parts((&ep).0.add(s0), s1 - s0) }.to_vec();
             copied[b].store(true, Release);
+            let (mut j, row, esc) = (0, (&cp).0.wrapping_add(b * nb), u32::MAX >> vb);
+            let end = if sh == 4 && rc.len() > 0 { e.len() } else { 0 };
+            while j < end {
+                let (x, k) = (ld(&e, j), 1 + (ld(&e, j) >> vb == esc) as usize);
+                unsafe { *row.add(((x & (1 << vb) - 1) >> BS) as usize) += k as u32 };
+                j += k;
+            }
             let mut at = vec![0u32; (n + 1 - k0).min(1 << BS)];
             for &l in &loc[s0..s1] {
                 at.get_mut(l as usize - 1).map(|a| *a += 1); // not a hole
@@ -545,19 +562,22 @@ fn main() {
 
     let (gt, mut i) = (map("/data/graph.txt"), 0);
     // n, m (the edge lines are simply read to the end) and the text after the header line
-    let (n, m, body) = (num(gt, &mut i) as usize, num(gt, &mut i) as usize, &gt[i..]);
+    let (n, m, tx) = (num(gt, &mut i) as usize, num(gt, &mut i) as usize, &gt[i..]);
     let vb = (usize::BITS - (n.max(2) - 1).leading_zeros()).max(1);
     let k = threads * 4; // work items per pass
-    let est = Err(m.min(body.len() / 6)); // a line has at least 6 bytes
-    let g0 = finish(csr(n, threads, vb, &spans(body, body.len(), k), est));
+    let est = Err(m.min(tx.len() / 6)); // a line has at least 6 bytes
+    let g0 = finish(&mut [], csr(n, threads, vb, &spans(tx, tx.len(), k), est));
     let newid = bfs_order(&g0, n, threads);
     qs.iter_mut().for_each(|q| *q = (newid[q.0] as usize, newid[q.1] as usize));
     let g = csr(n, threads, vb, &spans((&g0, &newid[..]), n, k), Err(0));
     // Free the ids and g0's offsets first: the finish takes its memory from them. The reverse
     // graph has exactly g0's slot count: it takes over g0's mapped edge pages.
     let (buf, _) = ({ g0 }.edges, drop(newid));
-    let g = finish(g);
-    let r = finish(csr(n, threads, vb, &spans((&g, &[][..]), n, k), Ok(buf)));
+    // The relabelled finish counts the reverse graph's slots, for items of one bucket each.
+    let mut rc = vec![0; ((n >> BS) + 1).pow(2)];
+    let g = finish(&mut rc, g);
+    let rev = Vec::from_iter((0..=n >> BS).map(|b| ((&g, &[][..]), b << BS, n.min(b + 1 << BS))));
+    let r = finish(&mut [], csr(n, threads, vb, &rev, Ok([buf, rc])));
 
     let ans: Vec<AtomicI64> = qs.iter().map(|_| AtomicI64::new(-1)).collect();
     let next = AtomicUsize::new(0);
