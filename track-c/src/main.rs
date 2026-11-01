@@ -414,25 +414,26 @@ fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) ->
     let len = f.metadata().unwrap().len() as usize;
     let from = find(&head[..n], 0, b'\n') + 1;
     let cut = |j: usize| from + (len - from) * j / k; // job j's records start at or after cut(j)
-    let bits = zeroed((cap * 3 / 8 * 7 / 4096 + 1) * 256 * 64);
+    // The dictionary, then the bits (a page per 4096 ids), in one mapping. Its first 6 MB are on 2 MB
+    // pages, so random reads there need no page walks; at full scale all of it is used (the
+    // dictionary, and the bits of the first 98,304 names), so they cost no memory.
+    let n = (cap * 3 / 8 * 7 / 4096 + 1) * 256 * 64;
+    let hot = zeroed::<AtomicU64>(cap * 8 + n);
+    unsafe { madvise(hot.as_ptr() as *mut u8, 6 << 20, 14) }; // MADV_HUGEPAGE
+    let (buckets, bits) = hot.split_at(cap * 8);
+    let buckets = unsafe { std::slice::from_raw_parts(buckets.as_ptr() as *const Bucket, cap) };
     let locks = (0..64).map(|_| Mutex::new(())).collect();
-    let dict = (zeroed(cap), zeroed(1 << 23), (0.into(), 0.into()));
-    // The first 2 MB of each (2 MB aligned by `zeroed`, and fully used) on one 2 MB page.
-    unsafe { madvise(dict.0.as_ptr() as *mut u8, 2 << 20, 14) }; // MADV_HUGEPAGE
-    unsafe { madvise(bits.as_ptr() as *mut u8, 2 << 20, 14) };
+    let dict = (buckets, zeroed(1 << 23), (0.into(), 0.into()));
     let sh = Shared(tab, dict.0, dict.1, dict.2, bits, locks);
     let ends: Vec<[AtomicUsize; 2]> = (0..k).map(|_| Default::default()).collect();
     let bufs = zeroed::<u8>(threads * (PIECE + 192)); // one buffer per thread (see `read`)
     let (next, me) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let (wait, total) = (Barrier::new(threads), Mutex::new([NEW; 256])); // total: what threads add
     par(threads, || {
-        let t = me.fetch_add(1, Relaxed); // this thread's buffer and share of the dictionary to map
-        let r = &dict.0[1 << 15..]; // the dictionary after its first 2 MB
-        r.chunks(r.len() / threads + 64 & !63).nth(t).map(populate); // whole pages
+        let t = me.fetch_add(1, Relaxed); // this thread's buffer, and 2 MB page to map
         // One thread maps each 2 MB page: threads racing to fault one in would each clear and charge
         // a 2 MB page, and all but one would then free theirs.
-        (t == 0).then(|| populate(&dict.0[..1 << 15]));
-        (t == 1 % threads).then(|| populate(&bits[..1 << 18]));
+        populate(&hot[t.min(3) << 18..(t + 1).min(3) << 18]);
         pre();
         wait.wait();
         let buf = bufs[t * (PIECE + 192)..].as_ptr() as *mut u8;
