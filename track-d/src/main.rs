@@ -2,8 +2,7 @@
 // Nodes are relabelled in breadth-first order, so a search touches nearby memory, and each query
 // runs as a two-ended Dijkstra whose labels live in small per-thread pages, not in arrays the
 // size of the graph. See PERF.md for the measurements behind each choice.
-use std::fs::File;
-use std::os::unix::io::AsRawFd;
+use std::{fs::File, os::unix::io::AsRawFd};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 extern "C" {
@@ -78,15 +77,12 @@ fn spans<T: Copy>(x: T, n: usize, k: usize) -> Vec<(T, usize, usize)> {
 /// Run `f` on `threads` threads, each pulling work items from `items` until they run out.
 fn par<T: Sync>(threads: usize, items: &[T], f: impl Fn(&T) + Sync) {
     let next = AtomicUsize::new(0);
-    std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| {
-                while let Some(it) = items.get(next.fetch_add(1, Relaxed)) {
-                    f(it);
-                }
-            });
+    let work = || {
+        while let Some(it) = items.get(next.fetch_add(1, Relaxed)) {
+            f(it)
         }
-    });
+    };
+    std::thread::scope(|s| (0..threads).for_each(|_| _ = s.spawn(work)));
 }
 
 /// Shared mutable array written at disjoint indices by several threads.
@@ -151,9 +147,7 @@ fn layout(n: usize, t: usize, vb: u32, esc: u32, slots: impl Fn(usize) -> u32 + 
             for b in lo..hi {
                 let mut acc = 0;
                 for k in b << sh..((b + 1) << sh).min(n + 1) {
-                    if acc > 255 {
-                        ok.store(false, Relaxed);
-                    }
+                    (acc > 255).then(|| ok.store(false, Relaxed));
                     unsafe { *(&rp).0.add(k) = acc as u8 };
                     acc += slots(k);
                 }
@@ -214,12 +208,11 @@ fn csr(n: usize, threads: usize, vb: u32, esc: u32, items: &[impl Edges]) -> Gra
     });
     let (mut start, mut acc) = (vec![0usize; nb + 1], 0u32);
     for b in 0..nb {
-        start[b] = acc as usize;
         for i in 0..ni {
             (cur[i * nb + b], acc) = (acc, acc + cur[i * nb + b]);
         }
+        start[b + 1] = acc as usize;
     }
-    start[nb] = acc as usize;
     let (mut edges, mut loc) = (vec![0u32; acc as usize], vec![0u16; acc as usize]);
     let (ep, lp) = (Slots(edges.as_mut_ptr()), Slots(loc.as_mut_ptr()));
     par(threads, &(0..ni).collect::<Vec<_>>(), |&i| {
@@ -244,7 +237,7 @@ fn csr(n: usize, threads: usize, vb: u32, esc: u32, items: &[impl Edges]) -> Gra
     par(threads, &buckets, |&b| {
         let (lo, hi) = (start[b], start[b + 1]);
         let e = unsafe { std::slice::from_raw_parts((&ep).0.add(lo), hi - lo) }.to_vec();
-        let mut at: Vec<_> = (b << BS..((b + 1) << BS).min(n + 1)).map(|k| lay.off(k)).collect();
+        let mut at = Vec::from_iter((b << BS..((b + 1) << BS).min(n + 1)).map(|k| lay.off(k)));
         for (&x, &l) in e.iter().zip(&loc[lo..hi]) {
             unsafe { *(&ep).0.add(at[l as usize]) = x };
             at[l as usize] += 1;
@@ -262,7 +255,7 @@ fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
     let mut id = vec![0u32; n];
     let ip = Slots(id.as_mut_ptr());
     let at = |v: usize| unsafe { AtomicU32::from_ptr((&ip).0.add(v)) };
-    let claim = |v: usize| at(v).load(Relaxed) == 0 && at(v).compare_exchange(0, 1, Relaxed, Relaxed).is_ok();
+    let claim = |v| at(v).load(Relaxed) == 0 && at(v).compare_exchange(0, 1, Relaxed, Relaxed).is_ok();
     let lists = std::sync::Mutex::new(Vec::new());
     par(threads, &spans((), n, threads), |&(_, mut scan, end)| {
         let (mut list, mut head) = (Vec::with_capacity(n), 0); // only touched pages are charged
@@ -288,50 +281,48 @@ fn bfs_order(g: &Graph, threads: usize) -> Vec<u32> {
             if let Some(&w) = list.get(head + 4) {
                 g.adj(w as usize, |v, _| prefetch(at(v as usize)));
             }
+            let u = list[head] as usize;
             head += 1;
-            g.adj(list[head - 1] as usize, |v, _| _ = claim(v as usize).then(|| list.push(v)));
+            g.adj(u, |v, _| _ = claim(v as usize).then(|| list.push(v)));
         }
         lists.lock().unwrap().push(list);
     });
     let lists = lists.into_inner().unwrap();
-    let mut start = vec![0u32];
-    for l in &lists {
-        start.push(start.last().unwrap() + l.len() as u32);
-    }
     par(threads, &(0..lists.len()).collect::<Vec<_>>(), |&j| {
+        let start = lists[..j].iter().map(|l| l.len()).sum::<usize>();
         for (i, &v) in lists[j].iter().enumerate() {
-            at(v as usize).store(start[j] + i as u32, Relaxed);
+            at(v as usize).store((start + i) as u32, Relaxed);
         }
     });
     id
 }
 
-/// Copy `g` into the order given by `newid` (old id -> new id), each node's slots by one thread,
+/// Copy `g` into the order given by `id` (old id -> new id), each node's slots by one thread,
 /// with every target rewritten to its new id.
-fn relabel(g: &Graph, newid: &[u32], threads: usize) -> Graph {
-    let (n, ranges) = (newid.len(), spans((), newid.len(), threads * 4));
-    let mut deg = vec![0u16; n + 1]; // newid is a permutation: no two threads write one entry
+fn relabel(g: &Graph, id: &[u32], threads: usize) -> Graph {
+    let (n, ranges) = (id.len(), spans((), id.len(), threads * 4));
+    let mut deg = vec![0u16; n + 1]; // id is a permutation: no two threads write one entry
     let dp = Slots(deg.as_mut_ptr());
     par(threads, &ranges, |&(_, lo, hi)| {
         for u in lo..hi {
-            unsafe { *(&dp).0.add(newid[u] as usize) = (g.off(u + 1) - g.off(u)) as u16 };
+            unsafe { *(&dp).0.add(id[u] as usize) = (g.off(u + 1) - g.off(u)) as u16 };
         }
     });
     let lay = layout(n, threads, g.vb, g.esc, |k| deg[k] as u32);
     drop(deg);
     let mut edges = vec![0u32; g.edges.len()];
-    let out = Slots(edges.as_mut_ptr());
+    let ep = Slots(edges.as_mut_ptr());
     par(threads, &ranges, |&(_, lo, hi)| {
         for u in lo..hi {
             if u + 8 < hi {
                 // Prefetch where node u+8 goes and the new ids of its targets.
-                let w = newid[u + 8] as usize;
+                let w = id[u + 8] as usize;
                 prefetch(&lay.rel[w]);
                 prefetch(&lay.base[w >> lay.sh]);
-                g.adj(u + 8, |v, _| prefetch(&newid[v as usize]));
+                g.adj(u + 8, |v, _| prefetch(&id[v as usize]));
             }
-            let mut p = lay.off(newid[u] as usize);
-            g.adj(u, |v, w| p += store(&out, p, newid[v as usize], w, g.vb, g.esc));
+            let mut p = lay.off(id[u] as usize);
+            g.adj(u, |v, w| p += store(&ep, p, id[v as usize], w, g.vb, g.esc));
         }
     });
     Graph { edges, ..lay }
@@ -541,16 +532,13 @@ fn main() {
     let t0 = std::time::Instant::now();
     let par0 = std::thread::available_parallelism().map_or(1, |p| p.get());
     let threads = std::env::var("FW_THREADS").map_or(par0, |v| v.parse().unwrap());
-    let q = map("/data/queries.txt");
-    let (mut qs, mut j) = (Vec::new(), 0);
+    let (q, mut qs, mut j) = (map("/data/queries.txt"), Vec::new(), 0);
     while j < q.len() {
         qs.push((num(q, &mut j) as usize, num(q, &mut j) as usize));
     }
 
-    let gt = map("/data/graph.txt");
-    let mut i = 0;
-    let n = num(gt, &mut i) as usize;
-    num(gt, &mut i); // m: the edge lines are simply read to the end
+    let (gt, mut i) = (map("/data/graph.txt"), 0);
+    let (n, _m) = (num(gt, &mut i) as usize, num(gt, &mut i)); // the edge lines are read to the end
     let body = &gt[i..];
     let vb = (usize::BITS - (n.max(2) - 1).leading_zeros()).max(1);
     let esc = (1u32 << (32 - vb)) - 1;
