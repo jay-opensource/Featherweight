@@ -549,11 +549,16 @@ fn main() {
 
     let ans: Vec<AtomicI64> = qs.iter().map(|_| AtomicI64::new(-1)).collect();
     let next = AtomicUsize::new(0);
+    // Queries from sources without in-edges first: those sources leave through edges near 2^32,
+    // so their queries take the slow one-ended search (up to 25-90 ms on holdout seed 11), which
+    // must not be the last thing running. The rest keep the file order.
+    let mut o = Vec::from_iter(qs.iter().enumerate());
+    o.sort_by_key(|&(_, &(s, _))| r.off(s) < r.off(s + 1));
     par(threads, &vec![(); threads], |_| {
         let (mut pg, mut hs) = (Pages::new(n), <[Dial; 2]>::default());
         loop {
             let k = next.fetch_add(1, Relaxed);
-            let Some(&(s, t)) = qs.get(k) else { break };
+            let Some(&(k, &(s, t))) = o.get(k) else { break };
             let a = bidir(&mut pg, &mut hs, [&g, &r], s, t);
             ans[k].store(a.unwrap_or_else(|| plain(&g, s, t)), Relaxed);
         }
