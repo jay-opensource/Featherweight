@@ -88,10 +88,10 @@ fn num(b: &[u8], i: &mut usize) -> u64 {
 
 /// Hint the cache to fetch the line holding `x`.
 #[inline(always)]
-fn prefetch<T>(x: &T) {
+fn prefetch<T>(x: *const T) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        std::arch::x86_64::_mm_prefetch(x as *const T as *const i8, std::arch::x86_64::_MM_HINT_T0)
+        std::arch::x86_64::_mm_prefetch(x as *const i8, std::arch::x86_64::_MM_HINT_T0)
     };
 }
 
@@ -164,8 +164,13 @@ impl Graph {
 
     /// Call f(v, w) for every edge u -> v of weight w.
     #[inline(always)]
-    fn adj(&self, u: usize, mut f: impl FnMut(u32, u32)) {
-        let (mut e, end) = (self.off(u), self.off(u + 1));
+    fn adj(&self, u: usize, f: impl FnMut(u32, u32)) {
+        self.slots(self.off(u), self.off(u + 1), f)
+    }
+
+    /// Call f(v, w) for the edges stored in slots e..end.
+    #[inline(always)]
+    fn slots(&self, mut e: usize, end: usize, mut f: impl FnMut(u32, u32)) {
         while e < end {
             let x = unsafe { *self.edges.get_unchecked(e) };
             let mut w = x >> self.vb;
@@ -439,135 +444,80 @@ fn bfs_relabel(g: Graph, threads: usize, sh: u32) -> Result<(Graph, impl Fn(usiz
     Ok((Graph { edges, base: base2, rel: rel2, sh, vb, esc }, newid))
 }
 
-/// Buckets per queue: keys within W - 1 of the smallest one go straight to their bucket.
-const W: usize = 1 << 12;
+/// A queued node: its label's index in the pages, then its first and end edge slot.
+type Item = [u32; 3];
+
+/// Buckets per queue: the search relaxes only edges lighter than W (see `bidir`).
+const W: usize = 1 << 13;
 const NIL: u32 = u32::MAX;
 
-/// Monotone bucket queue (Dial): one bucket per key modulo W. Every edge relaxed from the node of
-/// key cur lands below cur + W unless its weight is W or more, so a bucket's position gives its
-/// key. Those heavy entries (none on seed 1) wait in a binary heap, checked whenever cur moves.
-/// A bucket is a list through a pool of (node, next) slots that reuses popped slots; a bitmap of
-/// non-empty buckets and a summary word find the next key in two steps.
+/// Monotone bucket queue (Dial): one bucket per key modulo W. Each key pushed is the popped key
+/// cur plus an edge lighter than W, so every queued key lies in [cur, cur + W) and a bucket's
+/// position gives its key; a bitmap of non-empty buckets finds the next one. A bucket is a list
+/// through a pool of entries (an Item and the next entry's index) that reuses popped entries. The
+/// Item holds all that settling the node needs, so a pop starts on the label and the edges at once.
 struct Dial {
-    head: Vec<u32>,
+    head: Box<[u32; W]>,
     bits: [u64; W / 64],
-    sum: u64, // bit j: bits[j] != 0
-    pool: Vec<[u32; 2]>,
+    pool: Vec<[u32; 4]>,
     free: u32,
     cur: u32,
     len: usize,
-    over: std::collections::BinaryHeap<std::cmp::Reverse<u64>>, // key << 32 | node
-    omin: u32,
 }
 
 impl Dial {
-    fn new() -> Self {
-        Dial { head: vec![NIL; W], bits: [0; W / 64], sum: 0, pool: Vec::new(), free: NIL, cur: 0, len: 0,
-               over: Default::default(), omin: u32::MAX }
-    }
-
-    /// Queue node x with key d >= cur.
+    /// Queue x with key d in [cur, cur + W).
     #[inline(always)]
-    fn put(&mut self, d: u32, x: u32) {
+    fn put(&mut self, d: u32, [i, a, e]: Item) {
+        let b = d as usize % W;
+        if self.free == NIL {
+            self.free = self.pool.len() as u32;
+            self.pool.push([0, 0, 0, NIL]);
+        }
+        let k = self.free as usize;
+        self.free = self.pool[k][3];
+        self.pool[k] = [i, a, e, self.head[b]];
+        self.head[b] = k as u32;
+        self.bits[b / 64] |= 1 << b % 64;
         self.len += 1;
-        if (d - self.cur) as usize >= W {
-            self.over.push(std::cmp::Reverse((d as u64) << 32 | x as u64));
-            self.omin = self.omin.min(d);
-        } else {
-            self.link(d as usize % W, x);
-        }
-    }
-
-    #[inline(always)]
-    fn link(&mut self, b: usize, x: u32) {
-        let k = match self.free {
-            NIL => {
-                self.pool.push([0, 0]);
-                self.pool.len() - 1
-            }
-            k => {
-                self.free = unsafe { self.pool.get_unchecked(k as usize)[1] };
-                k as usize
-            }
-        };
-        unsafe {
-            let h = self.head.get_unchecked_mut(b);
-            *self.pool.get_unchecked_mut(k) = [x, *h];
-            *h = k as u32;
-            *self.bits.get_unchecked_mut(b / 64) |= 1 << b % 64;
-        }
-        self.sum |= 1 << b / 64;
     }
 
     /// Move cur to the smallest key and return it; None if the queue is empty.
     #[inline(always)]
     fn min(&mut self) -> Option<u32> {
         let p = self.cur as usize % W;
-        if unsafe { *self.head.get_unchecked(p) } != NIL {
-            return Some(self.cur);
+        let (mut j, mut m) = (p / 64, self.bits[p / 64] >> p % 64 << p % 64);
+        while m == 0 && self.len > 0 {
+            j = (j + 1) % (W / 64);
+            m = self.bits[j];
         }
-        let w = p / 64;
-        let m = unsafe { *self.bits.get_unchecked(w) } & !0 << p % 64;
-        let next = if m != 0 {
-            Some(w * 64 + m.trailing_zeros() as usize)
-        } else {
-            let hi = self.sum & !1 << w; // words after w, else wrap around
-            let j = if hi != 0 { hi.trailing_zeros() } else { self.sum.trailing_zeros() } as usize;
-            (self.sum != 0).then(|| j * 64 + unsafe { *self.bits.get_unchecked(j) }.trailing_zeros() as usize)
-        };
-        let key = next.map_or(u32::MAX, |b| self.cur + ((b + W - p) % W) as u32);
-        if self.omin < key {
-            self.cur = self.omin;
-            while let Some(&std::cmp::Reverse(e)) = self.over.peek() {
-                if ((e >> 32) as u32 - self.cur) as usize >= W {
-                    break;
-                }
-                self.over.pop();
-                self.link((e >> 32) as usize % W, e as u32);
-            }
-            self.omin = self.over.peek().map_or(u32::MAX, |e| (e.0 >> 32) as u32);
-        } else if key == u32::MAX {
-            return None;
-        } else {
-            self.cur = key;
-        }
-        Some(self.cur)
+        self.cur += ((j * 64 + m.trailing_zeros() as usize + W - p) % W) as u32;
+        (self.len > 0).then_some(self.cur)
     }
 
-    /// Take a node of key cur; min() must have returned Some since the last pop.
+    /// Take an item of key cur; min() must have returned Some since the last pop.
     #[inline(always)]
-    fn pop(&mut self) -> u32 {
+    fn pop(&mut self) -> Item {
         let b = self.cur as usize % W;
-        unsafe {
-            let k = *self.head.get_unchecked(b) as usize;
-            let [x, next] = *self.pool.get_unchecked(k);
-            *self.head.get_unchecked_mut(b) = next;
-            self.pool.get_unchecked_mut(k)[1] = self.free;
-            self.free = k as u32;
-            if next == NIL {
-                let m = self.bits.get_unchecked_mut(b / 64);
-                *m &= !(1 << b % 64);
-                if *m == 0 {
-                    self.sum &= !(1 << b / 64);
-                }
-            }
-            self.len -= 1;
-            x
+        let k = self.head[b] as usize;
+        let [i, a, e, next] = self.pool[k];
+        (self.head[b], self.pool[k][3], self.free) = (next, self.free, k as u32);
+        if next == NIL {
+            self.bits[b / 64] &= !(1 << b % 64);
         }
+        self.len -= 1;
+        [i, a, e]
     }
 
     fn clear(&mut self) {
-        while self.sum != 0 {
-            let j = self.sum.trailing_zeros() as usize;
-            self.sum &= self.sum - 1;
+        for j in 0..W / 64 {
             while self.bits[j] != 0 {
                 self.head[j * 64 + self.bits[j].trailing_zeros() as usize] = NIL;
                 self.bits[j] &= self.bits[j] - 1;
             }
         }
-        (self.free, self.cur, self.len, self.omin) = (NIL, 0, 0, u32::MAX);
+        (self.free, self.cur, self.len) = (NIL, 0, 0);
         self.pool.clear();
-        self.over.clear();
     }
 }
 
@@ -613,12 +563,6 @@ impl Pages {
         (unsafe { *self.dir.get_unchecked(d) } as usize) << self.pb | (v & ((1 << self.pb) - 1)) as usize
     }
 
-    /// Index of v's label on `side`, whose page exists.
-    #[inline(always)]
-    fn slot(&self, v: u32, side: usize) -> usize {
-        (unsafe { *self.dir.get_unchecked(side * self.half + (v >> self.pb) as usize) } as usize) << self.pb | (v & ((1 << self.pb) - 1)) as usize
-    }
-
     /// v's label on `side` (tentative or settled), INF if none.
     #[inline(always)]
     fn get(&self, v: u32, side: usize) -> u32 {
@@ -641,30 +585,33 @@ impl Pages {
 /// expanding the side with fewer queued entries. mu is the best s-t length seen through any node
 /// labelled by both sides; stop when the two queue minimums together reach mu. A source with no
 /// way out or a target with no way in empties its queue at once, so those answer -1 immediately.
-/// A label that would not fit 31 bits is skipped: every path through it is at least that long,
-/// so the search stays exact for shorter answers. If something was skipped and no shorter answer
-/// was found, return None and the caller runs the one-ended u64 search.
+/// Two kinds of relaxation are skipped, and the smallest length they would have given is kept in
+/// `skip`: a label that would not fit 31 bits, and an edge of weight W or more (none is reached on
+/// seed 1). The search is then exact on the graph without the heavy edges for every distance below
+/// 2^31. If a shorter s-t path used a heavy edge, the first one on it starts at a node the forward
+/// search settled, or the last one ends at a node the backward search settled (else the path
+/// would be at least the two queue minimums, hence mu), so skip is below mu. So mu is the answer
+/// unless skip < mu, or something was skipped and mu does not fit 31 bits: then return None and
+/// the caller runs the one-ended u64 search.
 fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: &Graph, r: &Graph, s: usize, t: usize) -> Option<i64> {
-    let (mut mu, mut skipped) = (u64::MAX, false);
-    for (side, x) in [(0, s), (1, t)] {
+    let (mut mu, mut skip) = (u64::MAX, u64::MAX);
+    for (side, x, gr) in [(0, s, g), (1, t, r)] {
         let i = pg.at(x as u32, side);
         pg.pool[i] = 0;
-        hs[side].put(0, x as u32);
+        hs[side].put(0, [i as u32, gr.off(x) as u32, gr.off(x + 1) as u32]);
     }
     let mut key = [0u32; 2]; // each side's smallest queued key
     while (key[0] as u64 + key[1] as u64) < mu {
         let side = (hs[0].len > hs[1].len) as usize;
-        let (d, u) = (key[side], hs[side].pop());
-        let iu = pg.slot(u, side);
-        let lu = unsafe { *pg.pool.get_unchecked(iu) };
-        let (gr, h) = (if side == 0 { g } else { r }, &mut hs[side]);
-        if lu == d {
-            // not settled, and not a stale entry (the label only drops after a push)
-            unsafe { *pg.pool.get_unchecked_mut(iu) = lu | SETTLED };
-            gr.adj(u as usize, |v, w| {
+        let (gr, h, d) = (if side == 0 { g } else { r }, &mut hs[side], key[side]);
+        let [iu, e, end] = h.pop();
+        if pg.pool[iu as usize] == d {
+            // not settled, and not a stale entry (a label only drops after a push)
+            pg.pool[iu as usize] |= SETTLED;
+            gr.slots(e as usize, end as usize, |v, w| {
                 let nd = d as u64 + w as u64;
-                if nd >= INF as u64 {
-                    skipped = true;
+                if nd >= INF as u64 || w as usize >= W {
+                    skip = skip.min(nd);
                     return;
                 }
                 let iv = pg.at(v, side);
@@ -673,8 +620,10 @@ fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: &Graph, r: &Graph, s: usize, t: 
                     return;
                 }
                 unsafe { *pg.pool.get_unchecked_mut(iv) = nd as u32 };
-                h.put(nd as u32, v);
-                prefetch(unsafe { gr.edges.get_unchecked(gr.off(v as usize)) });
+                // Start fetching the node's edges now: it is usually popped later.
+                let (a, b) = (gr.off(v as usize), gr.off(v as usize + 1));
+                prefetch(gr.edges.as_ptr().wrapping_add(a));
+                h.put(nd as u32, [iv as u32, a as u32, b as u32]);
                 let o = pg.get(v, 1 - side) & !SETTLED;
                 if o != INF {
                     mu = mu.min(nd + o as u64);
@@ -689,7 +638,7 @@ fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: &Graph, r: &Graph, s: usize, t: 
     pg.clear();
     hs.iter_mut().for_each(Dial::clear);
     match mu {
-        _ if skipped && mu >= INF as u64 => None,
+        _ if skip < mu || skip < u64::MAX && mu >= INF as u64 => None,
         u64::MAX => Some(-1),
         _ => Some(mu as i64),
     }
@@ -771,7 +720,7 @@ fn main() {
     std::thread::scope(|sc| {
         for _ in 0..threads {
             sc.spawn(|| {
-                let (mut pg, mut hs) = (Pages::new(n), [Dial::new(), Dial::new()]);
+                let (mut pg, mut hs) = (Pages::new(n), [(); 2].map(|_| Dial { head: Box::new([NIL; W]), bits: [0; W / 64], pool: Vec::new(), free: NIL, cur: 0, len: 0 }));
                 loop {
                     let k = next.fetch_add(1, Relaxed);
                     let Some(&(s, t)) = qs.get(k) else { break };
