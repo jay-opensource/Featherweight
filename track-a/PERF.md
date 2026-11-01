@@ -10,10 +10,14 @@ the run IDs are the record.
 |---|---|---|---|---|---|---|
 | Reference (Python) | | | 32.047 s | 228 MB | 56 | 0 |
 | First correct entry (v1) | run-4bc3f917569d | fe231bc | 32.3 ms | 19.3 MB | 486 | 78.6 |
-| **Best** | **run-ac86c3ef1a30** | **477f874** | **18.92 ms** | **20.45 MB** | **440** | **84.48** |
-| Shipped (same code paths, 3 lines fewer) | run-9237e503e115 | bbee872 | 19.15 ms | 20.26 MB | 437 | 84.41 |
+| Fastest run (A2 line) | run-ac86c3ef1a30 | 477f874 | 18.92 ms | 20.45 MB | 440 | 84.48 |
+| A2 final | run-9237e503e115 | bbee872 | 19.15 ms | 20.26 MB | 437 | 84.41 |
+| **Best, and the shipped code** | **run-eaa93041cda1** | **d9663e9** | **19.76 ms** | **13.08 MB** | **439** | **85.95** |
+| The same code, other runs | run-b5aa7b53480c, run-1e9d7e96bee5, run-2c2546d31c68, run-0ce6f8512645 | 9477275 ... 96c67ed | 20.77, 19.91, 19.66, 19.90 ms | 13.64, 13.49, 13.53, 12.86 MB | 439 | 85.23, 85.74, 85.86, 85.95 |
 
-The best run is 1,694 times faster than the reference with 11.1 times less memory. Points are the
+The best run is 1,622 times faster than the reference with 17.4 times less memory. The A3 change
+(steps 27-31) cut memory by 7 MB and cost time that the board noise hides: 19.66-20.77 ms against
+18.92-19.28 ms for the A2 code in its three runs. Points are the
 board's: `50·log10(K)` with K = (T_ref/T)^0.5 × min(50, M_ref/M)^0.2 × min(1, S_ref/S)^0.15. At
 about 20 ms, 1% of T is worth about 0.11 points, 1% of M about 0.04, and 10 lines about 0.07.
 
@@ -31,7 +35,9 @@ lines of the Dockerfile. Identical A code gave these times, so a single run reso
 | r9 (8c1f26b) | 21.78, 23.21 |
 | r10 (5b3321f) | 22.79, 21.80 |
 | start of the A2 line (b1f2ed7) | 20.95, 19.96 |
-| shipped code paths (477f874, bbee872) | 18.92, 19.15 |
+| shipped code paths of the A2 line (477f874, bbee872) | 18.92, 19.15 |
+| A2 code on later pushes (8a67e30, 48198af) | 19.28, 20.31 |
+| A3 round 2 (403034e; steps 29-31) | 19.66, 19.90, 19.76 |
 
 **Local.** An i5-11400H laptop shared with other teams' benchmarks; its wall times move 2-3× with
 the load. What we used:
@@ -49,9 +55,12 @@ the load. What we used:
 ## What the program does, and where the time goes
 
 One parse pass turns every line of `requests.log` (239 MB, 3.1M lines) into a 4-byte record filed
-in its hour's memory region. Then, hour by hour: count per endpoint, scatter the latencies in name
-order, select p50/p95/p99, and keep six words per group where the records were. Last, the output
-is sized, mapped and formatted in parallel. The README describes the design in prose.
+in its hour's memory region. Hours are summarised while the parse is still running (once a line
+of hour h + 2 has been parsed in the file's prefix, hour h is complete): count per endpoint, scatter
+the latencies in name order, select p50/p95/p99, keep six words per group in a small per-hour
+table, and free the hour's records. The output is mapped at the parse barrier, and each hour is
+formatted into it as soon as it and the hours before it are summarised. The README describes the
+design in prose.
 
 **Per-phase profile** (local, 12 threads, full seed 1, medians of 6-8 runs; cycles summed over
 threads; "u+k" adds kernel cycles):
@@ -90,9 +99,24 @@ at 18.4-19.4 MB, 10-run medians):
 | After the stats phase | six words per group in place of the records | 7-8.7 |
 | End | the 10.1 MB output on tmpfs; statistics released hour by hour | 13.6-15.4 |
 
-The board reads 20.3-20.9 MB, 1-2 MB above the local peak; we have not broken that gap down. Below
-this, only smaller records would help: streaming hours during the parse would save at most about
-2 MB, because the 10.1 MB output still accumulates to the end.
+The board read 20.3-20.9 MB for this version, 1-2 MB above the local peak; we have not broken that
+gap down. **Streaming hours during the parse, which this table said would save at most 2 MB, saved
+7 MB** (steps 27-31; see mechanism 10).
+
+**Memory after the A3 change** (A3 engineer's budget at bbee872, then at the A3 head; seed 1, 12
+threads, local):
+
+| Moment | memory.current (MB), bbee872 | What |
+|---|---|---|
+| Before `main` | 1.6-2.8 | container runtime and shell; memory.peak is already 2.9-4.1 (runc init) |
+| End of the parse | 16.9-17.7 | all 12.55 MB of records (RssAnon 13.3), input page tables 0.88 MB |
+| Peak, early stats | 18.0-19.3 | the records plus 12 scatter buffers (~200 KB each), touched at once |
+| End | 13.8-14.7 | 10.11 MB output (tmpfs), 0.6 anon, page tables 0.9, slab 0.4 |
+
+The floor is the end state, about 14 MB locally. With hours summarised and freed during the parse
+the local peak fell to 14.1-15.3 MB (G3 maximum of 6 runs 14.58, against 20.05 for bbee872), and
+the board read 12.9-13.6 MB. memory.current and memory.peak also include up to 63 pre-charged
+pages per CPU (memcg charge batching), about 1-1.5 MB of noise that every entry shares.
 
 ## The mechanisms, each with the measurement behind it
 
@@ -132,7 +156,7 @@ in six; a second at p + 1088: parse ×0.918, total ×0.952. On the board, one pr
 21.80-22.79 ms to 21.49 ms (run-0658770c8cc4), and the second took the A2 line from 20.69 ms to
 19.15 ms (run-91feae67de7b).
 
-**5. Chunks in a strided order.** The input is cut into 16 line-aligned chunks per thread, and the
+**5. Chunks in a strided order (replaced in A3 by 2 MB chunks in file order, mechanism 10).** The input is cut into 16 line-aligned chunks per thread, and the
 claim order sends concurrent threads to chunks far apart. Before, they parsed neighbouring chunks,
 so they shared input page-table pages and filled the same hours' regions. The page-table spinlock
 fell from 4% to 2.6% of cycles and thread CPU time to ×0.94.
@@ -162,6 +186,35 @@ the shipped profile `exit_mmap` is below 0.05% of cycles.
 **9. Small codegen wins.** The scatter store is unchecked (its index is below the hour's word count,
 which is at most the buffer's length), and output digits are written two at a time from a table of
 "00" to "99": scatter ×0.875, format ×0.90, total about ×0.985.
+
+**10. Summarise hours during the parse (A3 round 1, 91c5872).** The peak was the end of the parse,
+where all 12.55 MB of records were alive at once. Now the input is cut into line-aligned chunks of
+2 MB (after every 2 MB mark), claimed in file order. Hour h is summarised, and its records freed,
+once the parsed prefix of the file (the chunks from the start that are all done) holds a line of
+hour h + 2. It is exact: a chunk that joins the prefix with a line of an hour already summarised
+sets a flag, and the run starts over with no early release (the shuffled-file test takes this path
+and still matches the reference). Claims stay within LAG = 32 chunks of the oldest unparsed one, and
+a thread that is too far ahead sleeps 50 µs: without the bound, on a loaded laptop the prefix lagged
+31-111 chunks (chunk p90 15 ms, max 80 ms from preemption) and the parse-phase peak reached
+15-17.9 MB. Statistics go in per-hour tables indexed by endpoint id (5 words × 2,048), so name
+order is only needed at output. Record blocks are B = 1,024 words, one page with one writer (512-byte
+blocks were faulted up to 4× per page by concurrent first touches). The input, the pool and the
+scratch are unmapped before the output is formatted (page tables at the end 0.90 → 0.12 MB). Local
+peak 18.0-19.3 → 14.1-15.3 MB; user cycles ×0.998, kernel ×1.05 (+700 faults from the separate
+tables), user + kernel ×1.014. The count and slot tables moved from thread stacks into the scratch
+mapping (13a94d2: median peak 14.60 → 14.39 MB). Board: 20.77 ms and 13.64 MB (run-b5aa7b53480c).
+
+**11. Format while the parse finishes (A3 round 2, 86f7011, 403034e).** A timeline sampler showed
+the last summary almost always finishes before the parse barrier, so the idle time at the end came
+from three places: the imbalance at the end of the parse with 2 MB chunks, two more barriers
+(statistics, then output), and the leader's serial sort and map. Now the leader maps the output at
+the parse barrier at an upper bound (2,047 × 213 bytes per unsummarised hour) and cuts the file to
+size at the end; hour h is formatted once hours 0..h are summarised; the last summary unmaps the
+pool; and the last 24 MB are cut into 512 KB chunks. Summed thread idle time over 12 rounds fell
+from 112 to 39 ms (small chunks alone: 44), in-process wall median 38.6 → 26.8 ms, instructions
+equal, peak median 14.35 → 14.26 MB. On bench.py G3 (8 runs, alternating images) the T median on holdout seed 11 was
+24.1 / 28.9 ms for the previous image (two sessions) and 22.1 / 21.4 ms for 403034e. Board: 19.66 ms, 13.53 MB (run-2c2546d31c68), on
+a slow stretch of the box.
 
 ## Findings specific to the scoring box
 
@@ -219,6 +272,13 @@ which is at most the buffer's length), and output digits are written two at a ti
 | 22 | d163280 | Unchecked scatter store, two output digits at a time; probe: input mapped 2 MB-aligned with `MADV_HUGEPAGE` | run-7a659e0640c9 | 19.14 | 20.52 | 442 | 84.32 |
 | 23 | 477f874 | The probe dropped (neutral) | run-ac86c3ef1a30 | 18.92 | 20.45 | 440 | 84.48 |
 | 24 | bbee872 | A2 final (9c0770e): three lines fewer, same code paths | run-9237e503e115 | 19.15 | 20.26 | 437 | 84.41 |
+| 25 | 8a67e30 | Same A code as step 24 (documentation change) | run-46870c4a1ce8 | 19.28 | 20.63 | 437 | 84.26 |
+| 26 | 48198af | Same A code as step 24 (another track changed) | run-d87ff9e42574 | 20.31 | 20.30 | 437 | 83.76 |
+| 27 | 9477275 | A3 round 1 (bea2128): hours summarised during the parse and their records freed; input, pool and scratch unmapped before the output; 2 MB chunks claimed in file order | run-b5aa7b53480c | 20.77 | 13.64 | 439 | 85.23 |
+| 28 | b5f8df8 | Same A code as step 27 | run-1e9d7e96bee5 | 19.91 | 13.49 | 439 | 85.74 |
+| 29 | a8fb336 | A3 round 2 (403034e): output mapped at the parse barrier, each hour formatted as soon as it and the hours before it are summarised, the last 24 MB in 512 KB chunks; on a slow stretch of the box (unchanged C and D code ran 6-10% slow in the same push) | run-2c2546d31c68 | 19.66 | 13.53 | 439 | 85.86 |
+| 30 | 96c67ed | Same A code as step 29 | run-0ce6f8512645 | 19.90 | 12.86 | 439 | 85.95 |
+| 31 | d9663e9 | Same A code as step 29 (the shipped commit) | run-eaa93041cda1 | 19.76 | 13.08 | 439 | 85.95 |
 
 **r10 and r11 are not in the shipped code.** Both ran within the noise of r9 (steps 12-16). The A2
 line was built on r9 instead and beat both (steps 18-23), so the shipped parse has one cursor per
@@ -277,6 +337,12 @@ and about 15 per record to formatting.
 | `pwrite` from a 32 KB buffer per thread instead of the mapped output | | format cycles ×2.05, CPU ×2.5 | tmpfs writes to one file serialise on the inode lock |
 | `MADV_POPULATE_WRITE` per output hour range | | format cycles ×0.99, CPU ×1.19 | |
 | PGO (profile from generator seeds 21 and 22) | a few % | instructions −1.0%; cycles +1.7% on 1 thread (1 of 12 rounds won), +1.9% at 12 threads (1 of 15) | slower |
+| Strided chunk order together with early release of hours (A3) | keep the strided order's lower page-table lock | pool faults 3,193 → 4,578, kernel ×1.25 (512-byte blocks); with B = 1,024 faults 11,075, u+k ×0.997 | hours can only be released in file order; the 1,024-word blocks fixed the faults |
+| No lag bound on claimed chunks (A3) | simpler | the prefix lagged 31-111 chunks on the loaded laptop; parse-phase peak 15-17.9 MB | LAG = 32 |
+| `yield_now` while waiting for the prefix (A3) | cheap wait | kernel cycles ×2.1-3.4 | a 50 µs sleep |
+| Merged exits in `same()` (A3) | fewer lines | +24M instructions | |
+| `Names::add` re-probing through `id()` (A3 round 2) | −3 lines | +12M instructions in the parse loop | |
+| Non-mmap output fallback (A3) | | dropped (not needed once the output mapping is made at the barrier) | −lines |
 
 ## Correctness
 

@@ -8,11 +8,11 @@ page-table locks, exit teardown on one core) are measured and designed around.
 
 | Track | What it does | Best board run | T | M | Points | Docs |
 |---|---|---|---|---|---|---|
-| A: Ingest | per-hour, per-endpoint latency percentiles from a 239 MB log | run-ac86c3ef1a30 | 18.92 ms | 20.45 MB | 84.48 | [README](track-a/README.md), [PERF](track-a/PERF.md) |
-| C: Join | a hostile 193 MB CSV joined to a region table, aggregated per country | run-be0296de8c66 | 30.44 ms | 12.04 MB | 77.67 | [README](track-c/README.md), [PERF](track-c/PERF.md) |
-| D: Traverse | 2,000 shortest paths on a 1.7M-node road graph | run-3e0a39c47769 | 133.7 ms | 64.07 MB | 72.15 | [README](track-d/README.md), [PERF](track-d/PERF.md) |
+| A: Ingest | per-hour, per-endpoint latency percentiles from a 239 MB log | run-eaa93041cda1 | 19.76 ms | 13.08 MB | 85.95 | [README](track-a/README.md), [PERF](track-a/PERF.md) |
+| C: Join | a hostile 193 MB CSV joined to a region table, aggregated per country | run-5feec0fbae92 | 28.38 ms | 11.82 MB | 78.56 | [README](track-c/README.md), [PERF](track-c/PERF.md) |
+| D: Traverse | 2,000 shortest paths on a 1.7M-node road graph | run-b28ea11afb16 | 125.30 ms | 62.50 MB | 72.93 | [README](track-d/README.md), [PERF](track-d/PERF.md) |
 
-Each `PERF.md` lists every board run with its ID, the measurements behind each design choice,
+Run IDs are the best run of each track; the shipped commit (d9663e9) scored 19.76 ms / 85.95 (A), 30.78 ms / 77.68 (C) and 127.00 ms / 72.92 (D). Each `PERF.md` lists every board run with its ID, the measurements behind each design choice,
 what we found about the scoring box, and the experiments that lost. `tools/bench.py` builds a
 track and runs it with the board's container flags; `check.py` is the organisers' checker.
 

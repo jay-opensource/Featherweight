@@ -6,9 +6,9 @@ read `requests.log` (239 MB, about 3.1 million lines of timestamp, method, endpo
 latency) and write, for every hour and endpoint, the request count, the nearest-rank p50, p95 and
 p99 latency, the 5xx count and the 5xx rate in parts per million.
 
-Board result: best **18.92 ms, 20.45 MB, 440 lines, 84.48 points** (run-ac86c3ef1a30); the shipped
-code (bbee872, the same code paths in 437 lines) ran 19.15 ms (run-9237e503e115). The reference
-takes 32.047 s and 228 MB. [PERF.md](PERF.md) has every step with its run ID and the experiments
+Board result for the shipped code (d9663e9): **19.76 ms, 13.08 MB, 439 lines, 85.95 points**
+(run-eaa93041cda1; the same code ran 19.66-20.77 ms and 12.86-13.64 MB in four other runs). The
+reference takes 32.047 s and 228 MB. [PERF.md](PERF.md) has every step with its run ID and the experiments
 that lost.
 
 ## Approach
@@ -17,9 +17,9 @@ that lost.
 charged to us. At least 4 KB of zeros sit just past its end, so the parser may always read 64 bytes
 ahead without a bounds check.
 
-**Splitting the work.** The file is cut into 16 line-aligned chunks per thread, and threads claim
-them from a shared counter in a strided order. Threads that run at the same time therefore work far
-apart in the file: they fault in different page tables and fill different hours' regions.
+**Splitting the work.** The file is cut into line-aligned chunks of 2 MB (the last 24 MB into 512 KB
+chunks, so the threads finish together), and threads claim them in file order from a shared
+counter, but never more than 32 chunks past the oldest one not yet parsed.
 
 **Parsing.** Every line becomes one 4-byte record: 11 bits of endpoint id, one bit for a 5xx status
 and 20 bits of latency. A latency of 2^20 − 2048 or more keeps its low 11 bits in the record and
@@ -39,35 +39,43 @@ endpoint's length, first 16 and last 8 bytes picks the slot. The name is then co
 byte against its copy in a small arena, padded to whole 64-byte lines, so a lookup usually reads one
 cache line. A new name is added under a lock, 1,842 times in all.
 
-**Storing records.** Each record goes to the memory region of its hour, in blocks of 128 words
-handed out by a per-hour counter. The regions are one large reservation, charged only where
+**Storing records.** Each record goes to the memory region of its hour, in blocks of 1,024 words (one
+page, so each page has one writer) handed out by a per-hour counter. The regions are one large reservation, charged only where
 touched. A thread that finishes a chunk gives that chunk's input pages back to the kernel at once,
 so unmapping the 239 MB is spread over all threads instead of left to exit on one core.
 
-**Statistics, hour by hour.** After a barrier, one thread sorts the endpoint ids by name and the
-hours by size, largest first. Then each thread takes hours in turn and:
-1. counts the records per endpoint (the 5xx count rides in the same 64-bit counter);
-2. scatters the latencies so each endpoint's are contiguous and in name order; the second words of
+**Statistics, hour by hour, during the parse.** An hour is complete once the parsed prefix of the
+file (the chunks from the start that are all done) holds a line of the hour two later. Threads
+take a complete hour before the next chunk, and:
+1. count the records per endpoint (the 5xx count rides in the same 64-bit counter);
+2. scatter the latencies so each endpoint's are contiguous and in id order; the second words of
    large latencies have id 0, so they land after the real groups like padding;
-3. finds the nearest-rank p50, p95 and p99. For groups of up to 32 (90% of them) every value
+3. find the nearest-rank p50, p95 and p99. For groups of up to 32 (90% of them) every value
    counts, in AVX2 lanes, the values below and above it, which gives each rank without a branch.
    Larger groups use three narrowing quickselects;
-4. writes six numbers per group over the hour's dead records, returns the rest of the region to the
-   kernel, and adds up the exact length of the hour's output.
+4. keep six numbers per group in a small per-hour table, give the hour's records back to the
+   kernel, and record the exact length of the hour's output.
 
-**Writing the output.** After a second barrier the output's exact size is known. One thread sizes
-and maps `summary.txt` (opened read-write, so the mapping can be shared), and each thread formats
-whole hours straight into it, two digits at a time. Each hour's output pages are dropped from our
-page tables once written; the data stays in the file. The process then exits without freeing
-anything.
+This is exact. If a line turns up in an hour already summarised (not in the generated data), the
+run starts over with no early release. At most one chunk in 32 is in work past the oldest unparsed
+one (a thread past that sleeps 50 µs), so the records of unfinished hours cannot pile up.
 
-**Why memory stays low.** `/out` is a tmpfs, so the 10.1 MB answer counts as memory. The order of
-the phases keeps the records, the statistics and the output from all being alive at once. Every big
-buffer is our own `mmap` marked `MADV_NOHUGEPAGE`: the scoring box backs memory with 2 MB pages, and
-`memory.peak` would charge a whole one for its first touched byte. Thread stacks are 256 KB and
-malloc keeps one arena.
+**Writing the output.** When the last chunk is parsed, one thread sorts the endpoint ids by name,
+releases the input's page tables, and maps `summary.txt` (opened read-write, so the mapping can be
+shared) at an upper bound of its size; the file is cut to the exact size at the end. Each thread
+formats an hour straight into it, two digits at a time, as soon as that hour and all hours before
+it are summarised. Each hour's output pages are dropped from our page tables once written; the data
+stays in the file. The process then exits without freeing anything.
 
-**Threads.** One pool of threads runs all three phases, with a barrier between them.
+**Why memory stays low.** `/out` is a tmpfs, so the 10.1 MB answer counts as memory. Summarising
+hours during the parse means the 12.55 MB of records are never all alive at once, so the peak is
+close to the output plus what the runtime already holds (memory use at the board went from 20.5 MB
+to 13.1 MB). Every big buffer is our own `mmap` marked `MADV_NOHUGEPAGE`: the scoring box backs
+memory with 2 MB pages, and `memory.peak` would charge a whole one for its first touched byte.
+Thread stacks are 256 KB and malloc keeps one arena.
+
+**Threads.** One pool of threads runs the parse, the statistics and the formatting, with one
+barrier between the parse and the output.
 
 ## Build and run
 
@@ -96,11 +104,10 @@ None: Rust standard library only.
 
 ## With another 24 hours
 
-- Format each hour's text in the statistics pass, so the output phase becomes a copy (estimated
-  −1.5%, +10 lines).
+- Overlap the formatting of the first hours with the last two or three summaries (the tail is about
+  one hour's summary, ~0.6 ms on the box).
 - A software-pipelined interner: hash the next line and prefetch its slot while this one is
   compared.
-- Stream finished hours during the parse: the data never lags more than one hour behind. This needs
-  an exact disorder check with a full fallback, and would cut about 2-3 MB at the peak.
+- Smaller chunks at the end of the parse still, to shrink the last thread's idle time.
 - Find p50, p95 and p99 of the largest groups from one log-bucket histogram instead of three
   quickselects.

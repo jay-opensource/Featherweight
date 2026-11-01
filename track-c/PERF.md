@@ -10,9 +10,12 @@ the run IDs are the record.
 |---|---|---|---|---|---|---|
 | Reference (Python) | | | 14.444 s | 367.4 MB | 108 | 0 |
 | First correct entry | run-0c6e9d04253d | fe231bc | 51.4 ms | 11.7 MB | 549 | 70.9 |
-| **Best, and the shipped code** | **run-be0296de8c66** | **bbee872** | **30.44 ms** | **12.04 MB** | **378** | **77.67** |
+| Before the final rounds (C2) | run-be0296de8c66 | bbee872 | 30.44 ms | 12.04 MB | 378 | 77.67 |
+| **Best** | **run-5feec0fbae92** | **96c67ed** | **28.38 ms** | **11.82 MB** | **373** | **78.56** |
+| **The shipped code** | **run-53e6d6a5450b** | **d9663e9** | **30.78 ms** | **11.80 MB** | **373** | **77.68** |
+| The same C code, other runs | run-b1d4224ea8b9, run-97705ac8c0bf | b5f8df8, a8fb336 | 29.12, 31.77 ms | 11.61, 11.50 MB | 373 | 78.35, 77.45 |
 
-That is 474 times faster than the reference with 30.5 times less memory. Points are the board's:
+The best run is 509 times faster than the reference with 31.1 times less memory; the shipped code's run, 469 times and 31.1 times. The four runs of the final C code span 28.4 to 31.8 ms (see board noise below). Points are the board's:
 `50·log10(K)` with K = (T_ref/T)^0.5 × min(50, M_ref/M)^0.2 × min(1, S_ref/S)^0.15. At this
 operating point 1% of T is worth about 0.11 points, 1% of M about 0.04, and 10 lines about 0.09.
 
@@ -31,6 +34,7 @@ after rustfmt plus the 7 lines of the Dockerfile.
 | eaefee5 (C2 parse core), alderlake + static build | 48.04, 42.15 |
 | eaefee5, x86-64-v3 dynamic build | 42.70, 44.42, 45.48 |
 | 34f8892 (variant P) | 32.68, 32.07 |
+| 4b5a3b2 (the final C code; steps 28-31) | 29.12, 31.77, 28.38, 30.78 |
 
 A single run cannot resolve a change much below 10%. We decided on local counters and interleaved
 A/B runs, and used the board to confirm the large steps.
@@ -49,9 +53,9 @@ A/B runs, and used the board to confirm the large steps.
 
 `regions.csv` (200,000 lines) becomes a byte table from region id to country number. Then
 `records.csv` (192.6 MB, 3.32 million records) is cut into 48 byte ranges per thread. Each range is
-read in 64 KB pieces into a per-thread buffer and parsed. Each record is added to its country's
+read in 32 KB pieces into a per-thread buffer and parsed. Each record is added to its country's
 per-thread aggregates, and its name goes to one shared dictionary and sets one bit per
-(country, name). The README describes the design in prose.
+(country, name). One thread pool (spawned once) runs the regions jobs, waits at a barrier, parses the records, waits at the barrier again and popcounts the bitset. The README describes the design in prose.
 
 **Timeline** (local, 12 threads, 23e1807: the shipped code before its line pass):
 
@@ -69,6 +73,7 @@ per-thread aggregates, and its name goes to one shared dictionary and sets one b
 | Before C2 (the 04:12 state, step 14) | 546 | 309 | 38 | 165 | 44 |
 | C2 v2 (shape parse, SIMD numbers, AES hash) | 379 | 228 | 19 | 90 | 48 |
 | Shipped (5c8dd35) | 399 | | | | |
+| C3 (5671ab1): popcount after the barrier, bucket index kept in the record | 383 | | | | |
 
 The phase columns come from builds that skip parts of the work. The 64-byte buckets added after v2
 cost 15 instructions per record and roughly halved the branch misses.
@@ -137,11 +142,18 @@ turns on exactly once, and that is when its country's distinct count goes up: no
 the end. The apply loop first prefetches all its words for writing. Without that, 1-thread cycles
 rose 0.94G → 1.10G and 12-thread user cycles 1.00G → 1.19G.
 
-**7. Map the shared tables before the threads touch them (variant M, step 22).** The 11.7% in the
+Distinct names are counted once, after the parse (C3, 16e30ca): `apply` only sets bits, and after
+the last queues are applied the threads wait at the barrier a second time and each popcounts a
+contiguous 1/T of the used bitset pages (those below the id counter) into its per-group counts.
+This dropped the per-bit count from the locked section: 399 → 394 instructions per record, and
+12-thread user cycles −3.1% (better in 14 of 20 interleaved rounds).
+
+**7. Map the shared tables before the threads touch them (variant M, step 22; reworked in 10 and 11).** The 11.7% in the
 page-table lock came from first-touch faults on the dictionary and the bitset (`apply` 6.3%,
 `insert` 3.3%, `flush` 2.5%). Many came in pairs: a read maps the zero page, then the first write
 copies it. Now:
-- each thread maps its slice of the dictionary with `MADV_POPULATE_WRITE` when it starts;
+- each thread maps its slice of the dictionary with `MADV_POPULATE_WRITE` when it starts (since C3,
+  at the start of the one pool, before the barrier; see 11);
 - each 4096-id page of the bitset is mapped by the thread that hands out that page's first id;
 - the region table ends at the largest region id, so the 13k unmatched records with larger ids
   read no untouched pages (that cost 2.1k zero-page faults per run);
@@ -151,8 +163,9 @@ copies it. Now:
 Page faults fell from 9.2k to 5.3k. Board: **36.82 ms** (run-f75d12327f2e), against 42.15-48.04 ms
 for the same parser before it.
 
-**8. Read the records instead of mapping them (variant P, step 23).** Each thread reads 64 KB pieces
-with `pread` into its own buffer: 64 bytes in front (a record looks back up to 32), the piece, then
+**8. Read the records instead of mapping them (variant P, step 23).** Each thread reads pieces
+with `pread` into its own buffer (64 KB pieces at first, 32 KB since C3: 8dfd66a lowered the
+local memory.peak median 12.26 → 11.73 MB at neutral time, while 16 KB cost +8% kernel cycles): 64 bytes in front (a record looks back up to 32), the piece, then
 zeros. The buffer stays in L2, and there are no page-table entries to fault in while parsing or to
 tear down at exit. A record cut by the end of a piece is read again at the start of the next. On
 the laptop, P had the lowest user cycles and the highest kernel cycles (the copy: `_copy_to_iter`
@@ -161,7 +174,7 @@ a second run (run-665e917d324d). An earlier P build mapped each thread's buffer 
 contended on the address-space lock; all buffers are now one allocation made before the threads
 start.
 
-**9. 2 MB pages where every byte is used (step 25).** Allocations are 2 MB-aligned, and the first
+**9. 2 MB pages where every byte is used (step 25; extended in 13).** Allocations are 2 MB-aligned, and the first
 2 MB of the dictionary (3.15 MB, all touched) and of the bitset (ids below 16,384, all touched at
 full scale) get `MADV_HUGEPAGE`. Both ranges are fully used, so resident memory does not change
 (RssAnon 8,952 kB either way; AnonHugePages 0 → 4,096 kB) while the TLB covers more. Locally:
@@ -176,6 +189,35 @@ that equals where job 1 started, job 1 also started at a true record start, and 
 induction. Any mismatch, or a full dictionary, reruns everything on one thread with a 4× larger
 dictionary and a warning on stderr. 48 jobs per thread balance the tail: 8 per thread was 51.6
 against 49.4 ms (local).
+
+**11. One thread pool, with a barrier (C3, 512ac07).** The region table is sized before any thread
+starts (region ids ascend, so the last line of `regions.csv` holds the largest id). Each thread
+then maps its share of the shared tables, runs regions jobs (dynamic, so threads that mapped more
+do fewer), waits at a `Barrier`, and parses records. Before, the regions phase and the records phase
+each spawned 12 threads, and starting a thread (a stack mapping under the address-space lock)
+competed with page faults. Startup-only builds, 30 interleaved rounds: kernel cycles 16.0M → 13.2M
+(better in 29 of 30), task-clock 8.4 → 7.0 ms, about 390 fewer page faults per run (the second
+round of spawns got fresh stacks because the first round's were not yet back in glibc's cache).
+Threads also add their aggregates into one shared `Mutex`-guarded table at the end instead of
+returning 12 packets (36c909f: memory.peak −0.13 to −0.26 MB, 114 fewer faults).
+
+**12. The record carries its bucket (C3, efac31d).** `record` computes `bucket << 32 | tag` once,
+for its prefetch, and `id` and `insert` reuse it instead of the hash; a bounds check on the shared
+table went too. 394 → 383 instructions per record (more than the multiply and shift alone), cycles
+flat on 1 thread, user cycles −1.3% at 12 threads (weak: 12 of 20 rounds).
+
+**13. 2 MB pages by one thread each, in one mapping (C3 ce783b0, C4 4b5a3b2).**
+`MADV_POPULATE_WRITE` on a 2 MB page allocates, charges and clears the whole folio before it takes
+the page-table lock, and frees it if another thread installed one first. With 8 threads populating
+the first 2 MB of the dictionary together, each racer cost a 2 MB clear and a transient 2 MB
+charge in memory.peak. Now exactly one thread maps each huge page before the barrier (the regions
+jobs balance the load), and the other slices are rounded to 4 KB (an unaligned slice makes the
+call fail silently with EINVAL: +527 faults). Memory.peak median 13.03 → 12.52 MB, runs over 14 MB
+6 of 20 → 1 of 20. C4 then put the dictionary and the bitset in one 2 MB-aligned mapping and
+advised its first 6 MB (the whole dictionary and the bits of ids below 98,304, all used at full
+scale): three huge pages, three mapping threads. RssAnon is unchanged (8,504 vs 8,508 kB),
+AnonHugePages 4,096 → 6,144 kB; 12 threads user cycles −0.9% to −3.7%, kernel −2.6% to −9%,
+task-clock −3.5% to −4.8%; board 30.89 → 29.12 ms (run-b1d4224ea8b9).
 
 ## Findings specific to the scoring box
 
@@ -200,7 +242,8 @@ against 49.4 ms (local).
   down.
 - **Thread start contends with page faults.** Run alone, the regions phase takes 2.4-2.8 ms, of
   which user cycles are only 7.6-9.4M. The kernel time is the address-space lock (`rwsem`,
-  `osq_lock`) between thread-stack mappings and page faults. The shipped code does not fix this.
+  `osq_lock`) between thread-stack mappings and page faults. The single thread pool of C3
+  (mechanism 11) removed one of the two rounds of spawns.
 
 ## Board runs
 
@@ -236,6 +279,12 @@ against 49.4 ms (local).
 | 23 | 65ff880 | 34f8892, variant P: records read with `pread` in 64 KB pieces into a per-thread buffer | run-6c8cfb2db4cb | 32.68 | 12.21 | 399 | 76.66 |
 | 24 | 477f874 | Same code | run-665e917d324d | 32.07 | 12.43 | 399 | 76.79 |
 | 25 | bbee872 | C2 final (5c8dd35): first 2 MB of the dictionary and of the bitset on 2 MB pages; 399 → 378 lines | run-be0296de8c66 | 30.44 | 12.04 | 378 | 77.67 |
+| 26 | 8a67e30 | Same C code as step 25 (documentation change) | run-5bea9473e1b6 | 31.40 | 12.84 | 378 | 77.06 |
+| 27 | 48198af | C3: one thread pool for regions and records with a `Barrier`; popcount after the barrier; bucket index in the record; one thread maps each 2 MB page; 32 KB pieces; one shared aggregate table; 378 → 374 lines | run-2ba4c7084215 | 30.89 | 11.76 | 374 | 77.65 |
+| 28 | b5f8df8 | C4 (4b5a3b2): dictionary and bitset in one mapping, its first 6 MB on 2 MB pages, one mapping thread per page | run-b1d4224ea8b9 | 29.12 | 11.61 | 373 | 78.35 |
+| 29 | a8fb336 | Same C code as step 28, on a slow stretch of the box (the same push ran D at 140 ms instead of 133) | run-97705ac8c0bf | 31.77 | 11.50 | 373 | 77.45 |
+| 30 | 96c67ed | Same C code as step 28 | run-5feec0fbae92 | 28.38 | 11.82 | 373 | 78.56 |
+| 31 | d9663e9 | Same C code as step 28 (the shipped commit) | run-53e6d6a5450b | 30.78 | 11.80 | 373 | 77.68 |
 
 **What steps 4 to 16 taught.** The 02:56 code (step 4) ran 43.3-43.7 ms four times. Every later
 version ran 46.5-50.9 ms, even with fewer instructions locally. Steps 15 and 16 bisected that on the
@@ -267,13 +316,68 @@ lines was worth more points than the time it lost. Steps 22 and 23 then removed 
 | One malloc arena (step 13) | less memory | board 48.88 ms / 11.64 MB against 48.30 / 11.46 for the same code | no change beyond noise: the big tables are not malloc'd |
 | 256 KB pieces instead of 64 KB (ca99495) | fewer `pread` calls | about +2.4 MB locally (~14.8 MB) | +2.4 MB costs about 0.8 points, which would need 7% less time; not run on the board |
 | Mapping the region table writable before the regions phase | fewer faults | no measurable change | dropped |
+| 16 KB pieces instead of 32 KB (C3) | less memory | kernel cycles +8% (better in 3 of 20) | more `pread` calls |
+| Dictionary of 40,960 buckets (C3) | −0.5 MB | +2.6% instructions, +0.55M branch misses, user cycles +2.9% (2 of 16) | a fuller table has longer probe chains |
+| Static build, `+crt-static` (C3) | faster start | startup user+kernel −0.7M cycles, −45 faults, but full runs and memory neutral | never sent to the board |
+| Tab lookup and the numeric aggregates at parse time; the batch record keeps only key, start, length, bucket/tag and group (C4) | smaller records, fewer instructions | 384 vs 383 instructions per record; cycles +26% on 1 thread, +18% at 12 | the unprefetched `tab` load stalls each aggregate update: the record traffic was not the cost |
+| Long-name prefetch pass in `flush` (C4) | fewer stalls | +9 instructions per record, +0.48M branch misses, user cycles +1-2% | |
+| SIMD full-key lookup, no tags (C4) | fewer instructions | −7 instructions per record, cycles ±0 at 12 threads, +0.5M branch misses | |
+| Owner-computes bitset, no locks (C4) | no cross-core RMW | what-if with a read-only bitset and no lock: 0-3% | not worth ~40 lines |
+| `tab` or the bitset confined to 16 KB (C4, a what-if only) | show whether their misses matter | no change | their misses do not matter |
+| `tab` and all bits on 2 MB pages (C4) | ~−5% user cycles | measured | +0.9 MB |
+| Private per-thread bitsets (C4) | no sharing | +18% cycles | 36 MB does not fit in L3 |
+| Trim `record` with a `KEEP[n]` digit-mask table, `pext` for the dot, an `EDGE` table for the name mask (C5, v2/v3) | −10 instructions per record | 383 → 373-375 instructions; 12-thread user cycles 0.905G / 0.892G against 0.90G (−1%, noise) | the parse is stalled, not instruction-bound |
+| The record loop in a call-free `fill()` returning each full batch (C5, v4) | fewer spills | +5 instructions per record (388) | LLVM still spills around ~10 live scalars; the state load and store per batch cost more than they save |
+| Single-round AES, CRC32 hash, block-level comma queues (C5) | fewer instructions | not built | judged poorer mixing / the same instruction count after the extractions / branchy extraction that mispredicts |
 
 ## Measured but not in the shipped build
 
 - **Profile-guided optimisation**, with a profile from generator seeds 21 and 22 at full scale and
   atomic counters (plain counters lost 15-40% of the updates at 12 threads, and that profile made C
   5% slower). On the C2 code: instructions −4.2%, branch misses −2.4% / −6.2%, cycles −0.8% on
-  1 thread (16 of 25 rounds won) and −1.1% at 12 threads (18 of 25). Not in bbee872.
+  1 thread (16 of 25 rounds won) and −1.1% at 12 threads (18 of 25). Not in the shipped build.
+
+## What is left: the floor, and why we stopped (C4, C5)
+
+C is stall-bound, not instruction-bound. At 12 threads the parse runs at IPC about 1.5. Perf
+annotate (12 threads, bbee872) put about 36% of the parse's samples on its two prefetch
+instructions, about 16% of `flush` on the bucket line, about 12% of `flush` on the unprefetched
+long-name side store, and the rest in read-for-ownership bursts in `apply`. Cutting 10 instructions
+per record (2.6%, C5) moved user cycles by 0 to −1%, which is why the instruction targets of −15%
+instructions and −8% cycles are out of reach by trimming. The roughly 190 instructions in `record`
+itself: numbers ~40, key, hash and bucket ~30, name scan ~22, quote accounting ~25, spills ~30, the
+rest the 32-byte name window, the backward comma search and the 80-byte `Rec` stores.
+
+Where the 12 threads' user cycles go (bbee872, local, knobs that skip parts of the work):
+
+| Part | User cycles | Instructions per record |
+|---|---|---|
+| `pread` only | 0.013G (kernel: 65 ms CPU for the copy, ~37 GB/s aggregate) | |
+| Block scan | 0.05G | +26 |
+| Record parse | 0.46G | 235 |
+| Dictionary lookup | +0.35G | +93 |
+| Aggregates | ~0 | +23 |
+| Bit queue and apply | +0.2G | +46 |
+| Total | 1.0G | 399 |
+
+Speed-of-light floor for this box (6 P-cores with HT, 2.5 GHz), against the estimated time at
+bbee872:
+
+| Phase | Floor | bbee872 (est.) |
+|---|---|---|
+| exec → main | 0.3 ms (static) | ~0.5 |
+| regions and spawns | 0.3 | 2-3 (two spawn rounds, mmap-lock contention) |
+| thread ramp | ~0 | 1.5-2.5 |
+| input, 202 MB at ~45 GB/s | ~4.5, overlapped with compute | copy ~5 ms per thread |
+| per-record work, ~170 instructions at ~3.5 IPC | ~11 | 399 instructions, ~22 |
+| merge, output, exit | 0.5 | ~1-1.5 |
+| **Total** | **~12-13 ms** | 30.4 |
+
+The gap was about half per-record instructions and about 15% startup; C3 and C4 took the startup
+part (the single pool, the 2 MB pages). Getting to the floor needs about 200 instructions per
+record, and restructuring the pipeline around the same parse cannot reach that. It needs a new parse
+kernel, more than the hours we had. The design we would try: tab lookup and the numeric aggregates
+at parse time, the name lookup alone deferred through a small ring, a full-key SIMD bucket compare.
 
 ## Correctness
 

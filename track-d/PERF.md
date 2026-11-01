@@ -13,10 +13,12 @@ Local box: i5-11400H laptop (6 cores, 12 MB L3) running Docker; the scoring box 
 |---|---|---|---|---|---|---|
 | Reference (Python) | | | 72.69 s | 893 MB | 43 | 0 |
 | First correct entry | run-811fef4b3870 | 941a1e3 | 1.340 s | 230.6 MB | 141 | 45.37 |
-| **Best, and the shipped code** | **run-3e0a39c47769** | **b1046aa** | **0.1337 s** | **64.07 MB** | **454** | **72.15** |
-| The same code, later runs | run-2e5b37934e90, run-74ad01ee4c63 | 477f874, bbee872 | 0.1337 s, 0.1432 s | 64.66, 64.91 MB | 454 | 72.11, 71.35 |
+| Before the final rounds (b1046aa) | run-3e0a39c47769 | b1046aa | 0.1337 s | 64.07 MB | 454 | 72.15 |
+| **Best** | **run-b28ea11afb16** | **96c67ed** | **0.1253 s** | **62.50 MB** | **458** | **72.93** |
+| **The shipped code** | **run-14368b934a65** | **d9663e9** | **0.1270 s** | **62.40 MB** | **440** | **72.92** |
+| The same build code, other runs | run-665c3b98b9ee, run-1a26c84a5351, run-29a3a688b9e1 | 48198af, b5f8df8, a8fb336 | 0.1331, 0.1361, 0.1402 s | 63.28, 62.68, 62.52 MB | 430 | 72.43, 72.23, 71.92 |
 
-The best run is 544 times faster than the reference with 13.9 times less memory. Points are the
+The best run is 580 times faster than the reference with 14.3 times less memory; the shipped code, 572 times and 14.3 times. Points are the
 board's: `50·log10(K)` with K = (T_ref/T)^0.5 × min(50, M_ref/M)^0.2 × min(1, S_ref/S)^0.15. At this
 operating point 1% of T is worth about 0.11 points, 1% of M about 0.04, and 10 lines about 0.07.
 
@@ -71,25 +73,46 @@ operating point 1% of T is worth about 0.11 points, 1% of M about 0.04, and 10 l
 | 40 | b1046aa | Text and both graphs released on all threads before exit; queries from sources without in-edges first; one label directory per side; the reverse graph reuses g0's edge array; the search loop steps inside its condition | run-3e0a39c47769 | 0.1337 | 64.1 | 454 | 72.15 |
 | 41 | 477f874 | Same D code as step 40 | run-2e5b37934e90 | 0.1337 | 64.7 | 454 | 72.11 |
 | 42 | bbee872 | Same D code as step 40 (the shipped commit) | run-74ad01ee4c63 | 0.1432 | 64.9 | 454 | 71.35 |
+| 43 | 8a67e30 | Same D code as step 40 (documentation change) | run-8b3afbc8368f | 0.1344 | 64.4 | 454 | 72.07 |
+| 44 | 48198af | Build rework (a9974c9): per-bucket offsets in the builder's finish, relabelled graph built by the same builder (no copy, no degree arrays, no 65k degree limit), builder split so the ids are freed first | run-665c3b98b9ee | 0.1331 | 63.3 | 430 | 72.43 |
+| 45 | 9477275 | Same D code as step 44 (another track changed), re-run at 10:29 UTC | TODO: run ID not in the board JSON (only the best and latest runs are listed) | 0.1327 | 62.5 | 430 | 72.51 |
+| 46 | b5f8df8 | Same D code as step 44 | run-1a26c84a5351 | 0.1361 | 62.7 | 430 | 72.23 |
+| 47 | a8fb336 | Same D code as step 44, on a slow stretch of the box (unchanged C code ran 31.8 ms instead of 29-30 ms in the same push) | run-29a3a688b9e1 | 0.1402 | 62.5 | 430 | 71.92 |
+| 48 | 96c67ed | Text parsed once with overflow restart; BFS claims in a bitset; helper inlining (7f21d9f) + far pairs first and the capped `via` fallback (D4) | run-b28ea11afb16 | 0.1253 | 62.5 | 458 | 72.93 |
+| 49 | d9663e9 | 18 fewer lines (b764d34): `store`, `Dial::min`/`clear`, `Pages::clear` inlined into their one caller, the query loop a while-let; behaviour unchanged | run-14368b934a65 | 0.1270 | 62.4 | 440 | 72.92 |
 
 ## How it works now
 
-1. **Parse** `graph.txt` from a read-only `mmap` (the page cache is not charged to us). The text is
-   split into 48 byte ranges; each work item parses the lines that start inside its range, numbers
-   8 bytes at a time (SWAR). The CSR is built in buckets of 8,192 nodes in two passes over the
-   items: count slots per bucket, then append each slot to its bucket's region with the node's
-   place in the bucket in a u16 side array. Each bucket is then reordered by node through a 94 KB
-   scratch copy. No atomics, and no store outside the bucket being worked on.
+1. **Parse once** `graph.txt` from a read-only `mmap` (the page cache is not charged to us). The
+   text is split into 48 byte ranges (threads x 4); each work item parses the lines that start
+   inside its range, numbers 8 bytes at a time (SWAR), and appends each slot to its bucket's region
+   (buckets of 8,192 nodes) with the node's place in the bucket in a u16 side array. The text is
+   read once: each (item, bucket) segment gets room for its share of the header's m plus 6 standard
+   deviations, the unused room is holes (place 0), and a segment that would overflow restarts the
+   build with an exact counting pass. No atomics, and no store outside the bucket being worked on.
+   Then each bucket is finished on its own: count its nodes' slots from the u16s, lay the offsets
+   out from the bucket's first slot (blocks of 16 nodes, falling back to smaller blocks if an
+   in-block offset does not fit in a byte) and reorder the slots through a 94 KB scratch copy,
+   packing in place and waiting only for earlier buckets whose staged slots it overwrites. There is
+   no degree array and no separate layout pass.
 2. **Relabel** nodes in breadth-first order: each thread grows its own region from a seed and
-   claims nodes with a CAS. The BFS prefetches offsets 16 nodes ahead, edge lists 8 ahead and the
-   claim words of the targets 4 ahead. The graph is then copied into the new order, prefetching
-   where node u + 8 goes. Neighbours in the road network become neighbours in memory.
-3. **Reverse graph**, built from the relabelled one with the same bucketed builder, written into
-   the first graph's already-mapped edge array (it has exactly as many slots).
-4. **Queries**, 12 threads pulling from an atomic counter, those from sources without in-edges
-   first: two-ended Dijkstra, forward from s and backward from t, expanding the side with fewer
-   queued entries, stopping when the two queue minimums together reach the best meeting length mu.
-   The 10 queries whose answer could need more than 31 bits fall back to a one-ended u64 Dijkstra.
+   claims nodes with one bit in a 218 KB bitset (the 7 MB id array is written once, at the end, so
+   the walk no longer faults it in with a CAS per node). The BFS prefetches offsets 16 nodes ahead
+   and edge lists 8 ahead. The relabelled graph is not copied: it is built by the same bucketed
+   builder from g0, with edges read as `id[u] -> id[v]` (the id lookups are prefetched in the fill
+   pass only). Neighbours in the road network become neighbours in memory.
+3. **Reverse graph**, built from the relabelled one with the same builder, written into g0's
+   already-mapped edge array (it has exactly as many slots). The builder is split into count/fill
+   and finish so that the ids and g0's offsets are freed before the relabelled finish reuses that
+   heap.
+4. **Queries**, 12 threads pulling from an atomic counter, in order of |s - t| (BFS ids)
+   descending, so the long searches start early: two-ended Dijkstra, forward from s and backward
+   from t, expanding the side with fewer queued entries, stopping when the two queue minimums
+   together reach the best meeting length mu. A query that bidir gives up on (its answer could need
+   a skipped edge or more than 31 bits; a source without in-edges leaves through edges near 2^32)
+   goes to `via`: the minimum over the source's out-edges (s, v, w) of w + d(v, t), each by bidir
+   with a cap that grows round by round, so no sub-search grows past what the bound allows. A
+   one-ended u64 Dijkstra (`plain`) remains only for sub-searches that give up again.
 5. **Exit.** The answers are written, then every thread drops its share of the text mapping and of
    both edge arrays (`MADV_DONTNEED`), and the process exits without freeing anything else.
 
@@ -102,7 +125,7 @@ operating point 1% of T is worth about 0.11 points, 1% of M about 0.04, and 10 l
 | Forward + reverse graph | 2 x 22.2 MB | |
 | Labels, per thread | pages of 64 node ids per side from a pool, found through a u16 page number per 64 ids (one directory per side) | BFS order keeps a search inside few pages; measured pool over 12 threads: about 9 MB |
 | Queue, per thread and side | Dial queue: 8,192 bucket heads (32 KB) and a pool of 16-byte entries [label index, first edge slot, end slot, next] that reuses popped entries | a pop starts on the label and the edges without a lookup |
-| Build only | a u16 bucket position per slot (about 10 MB), u16 degrees, the 7 MB id array | freed before the queries |
+| Build only | a u16 bucket position per slot (about 10 MB, plus holes: the text staging is about 27% larger than the final slot count), the 7 MB id array | freed before the queries; the peak is in the text phase (about 41 MB) and the relabel finish |
 
 ### Where the time goes
 
@@ -114,6 +137,7 @@ Local, 12 threads, on the loaded laptop, from the commits that measured each pha
 | Relabel copy | 22.5 ms (median) | a68518e |
 | Reverse CSR | 10.8 ms (min of 30) | 1803e34 |
 | Whole build: parse, BFS, copy, reverse | 97.2 ms (median) | a68518e |
+| Whole build after steps 44-48 | about 65 ms (77 ms at a9974c9 minus 12.4 ms) of a 107.7 ms process; at step 42 it was 89 of 137 ms | 7f21d9f |
 | Queries | 56.0 ms (308.1 ms on one thread) | after step 30 |
 | From the write to process end | 3.6 ms (median; 8.5 ms before step 40) | f29f0fa |
 
@@ -213,9 +237,49 @@ locally as a whole-process A/B (12 threads, ABBA rounds in one container), shipp
 Board: 0.1337 s (run-3e0a39c47769), against 0.139-0.144 s for the step-34 code in four runs
 (steps 34, 35, 38, 39); the same code ran 0.1337 s again at step 41.
 
+**Steps 44-49: the build was two thirds of the run.** A phase budget of the step-42 code (laptop,
+12 threads, median of 8-12 interleaved runs, quiet machine) put the build at about 89 ms of 137,
+the queries at 42 ms, and kernel cycles at 14% of all cycles; 6-8% of all cycles sat in the
+page-table spinlock (`do_anonymous_page`), mostly from the BFS id array and the two u16 degree
+arrays, which two threads fault twice per page (read, then write). The changes, each decided on
+interleaved counters:
+- **Offsets per bucket, relabel through the builder (a9974c9, step 44).** The bucket's finish
+  counts slots from the u16s and lays offsets out from its first slot; the degree array, the
+  parallel layout pass and the serial prefix are gone. The relabelled graph comes from the same
+  builder (id[u] -> id[v], id lookups prefetched in the fill pass only: prefetching both passes made
+  the count pass +110M cycles, the fill pass -245M), so `relabel()` and the copy are deleted. The
+  builder is split into count/fill and finish so the ids and g0's offsets are freed before the
+  relabel's finish takes their memory. Process median 133.1 -> 121.8 ms (paired 0.924 for the
+  fused layout alone); kernel cycles -37%, faults 25.6k -> 22.4k, instructions +3% (the relabel
+  parses g0 twice). memory.peak 64.1 -> 63.0 MB; without the split it was 66.8 MB. Lines 447 -> 423.
+  Side effect: the 65k-degree limit is gone (the old code panicked at degree 70,000).
+- **BFS claims in a bitset (6ebced5).** Claiming nodes with a CAS on the 7 MB id array made every
+  first claim a page fault under the page-table lock. One bit per node (218 KB, cache-resident)
+  claims them, and the ids are written once at the end: BFS walk 24.6 -> 14-17 ms, user cycles
+  -17%, kernel -76%.
+- **Text parsed once (2df4a10, eae7387).** The same idea as the failed step 36, with the staging
+  made cheaper: holes are place 0 (places are 1-based), the finish packs in place and waits only for
+  earlier buckets whose staged slots it overwrites, and the overflow check runs only when room was
+  estimated. Text build 25.6-27.3 -> 19.5-21 ms. Over a9974c9: process median 120.1 -> 107.7 ms
+  (paired 0.899), user cycles -8.3%, kernel -17%; memory.peak unchanged (the text phase peaks at
+  about 41 MB).
+- **Far pairs first, `via` (D4, e79006f, 5903b96).** Queries are pulled by |s - t| in BFS ids,
+  descending (the correlation with query time is 0.48): 40 alternating in-process pairs per seed,
+  paired 0.981, 0.989, 0.978 on seeds 1, 11 and 12. This replaced the "sources without in-edges
+  first" order of step 40, using the same two lines. `via` replaces the fallback to a one-ended
+  search for those sources (step 40's failure-museum row said splitting was a loss; the capped
+  rounds fix why): seed 11's fallback CPU 21.6 -> 2.5 ms, and it removes a tail risk (a rank-131k
+  no-in query took 25-90 ms one-ended). Neutral on seed 1. Board, steps 44-48: 0.1253 s at 96c67ed.
+- **Line cuts (b764d34, step 49).** 451 -> 433 lines, S 458 -> 440 (worth about 0.1 point), by
+  inlining helpers with one caller; user cycles 0.998, instructions 1.006, query cycles 0.997.
+Gates for each: the worked example, tiny, sample and full seeds at 1/2/7/12 threads, holdout seeds 11
+and 12, and 12 adversarial graphs (fallback to smaller blocks and to the counting pass, degree
+70,000, n = 8192/8193/16385, weights near W and above 2^31, a wrong header m, n = 1, an empty
+graph) at 1/3/12 threads; D4 also passed a 300-graph, 120,000-query randomized self-test of `via`.
+
 **Board noise.** Identical D code gave 0.1447 / 0.1405 s (steps 28-29), 0.1364 / 0.1381 s
 (30-31), 0.1368 / 0.1378 s (32-33), 0.1394 / 0.1441 / 0.1402 / 0.1409 s (34, 35, 38, 39) and
-0.1337 / 0.1337 / 0.1432 s (40-42). A single run cannot resolve changes under about 4%, and one in
+0.1337 / 0.1337 / 0.1432 s (40-42) and 0.1344 s (43); the step-44 build code gave 0.1331 / 0.1327 / 0.1361 / 0.1402 s (44-47), the last while unchanged C code also ran 8% slow. A single run cannot resolve changes under about 4%, and one in
 three runs is off by 7%. So query-side changes were decided on hardware counters (perf user-space
 cycles, instructions and branch misses in docker, interleaved A/B), which reproduce within a few
 percent on a loaded machine, and then confirmed on the board.
@@ -267,7 +331,7 @@ with fewer queued entries instead of the smaller key, 7.15M.
   on all threads first (step 40) took the rest from 8.45 to 3.62 ms.
 - **Page-table lock on first touch.** Track C lost 11.7% of its cycles there. For D, faulting in
   each random-write array one slice per thread first (step 37) was neutral on the board, so D does
-  not do it.
+  not do it. The BFS id array was the worse case: claiming with a bitset instead (step 48) cut kernel cycles in the walk by 76%.
 
 ## Failure museum (measured, then rejected)
 
@@ -298,12 +362,21 @@ with fewer queued entries instead of the smaller key, 7.15M.
 | Dial window W = 4096 | smaller bucket array | cycles -1.2% (noise) | kept 8192 as margin for unseen weights 4096-8191 |
 | PGO (profile from generator seeds 21 and 22, atomic counters) | -3..7% | instructions +0.1%, branch misses +6%, cycles -0.2..+2.4% | the hot loops are memory-bound and already inlined |
 | Reverse graph through atomic countdown cursors (step 16) | 5 MB less than the bucketed builder's u16 side array | board 0.208 s vs 0.178 s, 72.2 vs 77.0 MB | on the scoring box the locked updates cost far more than the memory saved |
-| Parse graph.txt once (step 36): each (item, bucket) segment gets room for its expected share plus 6 standard deviations, with an exact retry on overflow | skip the counting pass | in-process text build min 22.1 -> 15.9 ms but reverse 10.8 -> 11.7 ms; whole runs: build min 111.9 -> 98.0 ms, median 129.9 -> 130.2 ms; board 0.149 s vs 0.139-0.144 s for the same code without it | best guess: the 27% larger staging area, the hole filters, the waits and the slower reverse count ate the saving on a quiet box |
+| Parse graph.txt once (step 36): each (item, bucket) segment gets room for its expected share plus 6 standard deviations, with an exact retry on overflow | skip the counting pass | in-process text build min 22.1 -> 15.9 ms but reverse 10.8 -> 11.7 ms; whole runs: build min 111.9 -> 98.0 ms, median 129.9 -> 130.2 ms; board 0.149 s vs 0.139-0.144 s for the same code without it | best guess: the 27% larger staging area, the hole filters, the waits and the slower reverse count ate the saving on a quiet box. **Retried in step 48 on top of the faster builder** (packing in place, estimate checked only with room): text build 25.6-27.3 -> 19.5-21 ms and it shipped |
 | Fault in each random-write array one slice per thread first (step 37) | no page-table lock contention on random first touches | board 0.140 s vs 0.139-0.144 s, +14 lines | neutral |
 | Release g0's pages on all threads before relabel drops it | parallel unmap | copy phase x1.024 | |
 | Release the text mapping at the start of the query phase | earlier unmap | queries slower | |
 | Split a fallback through s's out-neighbours, on top of the slow-queries-first order | faster fallbacks | seed 11's worst query 3-4x faster, but no gain on top of the order; +8 lines | the order already hides the slow queries |
 | Relabel copy prefetch distance 16 or 12 instead of 8 | | in-process min 25.2 / 25.3 / 25.7 ms; perf cycles equal | no signal |
+| Persistent spin-wait thread pool instead of spawning per `par()` (round 3) | spawn latency is 0.4-8 ms per phase | 1.6-2.8x slower in median on WSL2 (pause-loop exits, vCPU preemption) | too risky without box evidence; not committed |
+| Thread pool on a Barrier (futex) (round 3) | skip the spawns | neutral | wake latency is still 2-5 ms on WSL2 |
+| Base + offsets in one 32-byte record (round 3) | one miss instead of two for off(v) | query cycles +4.7%, instructions +6.6% | base[] is cache-resident, so the extra address arithmetic costs more |
+| One-line offset record, malloc mmap threshold 64 MB, deeper BFS prefetch (32/16) or none at 16 ahead, k = threads x 8 or x 16 items, text staging in a separate packed array | each a small build win | +1.2k faults and 65.7 MB peak (mmap threshold); worse (prefetch depth); no signal (item count); +4.9k faults and +3 MB (separate staging array) | measured on counters, not committed |
+| Prefetch in both passes of the relabel stream | | count pass +110M cycles, fill pass -245M | limited to the fill pass |
+| Pre-pass prefetching the neighbours' `rel` lines before relaxing (D4) | overlap the offset misses | instructions 1.203, cycles 1.050 | the loads cost more than the overlap saves |
+| Prefetch the last edge slot too when queueing (D4) | lists that straddle lines | instructions 1.040, cycles 1.042 | |
+| Drop `#[inline(always)]` from `off`/`adj`/`slots`/`ix` (b764d34, -4 lines) | | BFS walk cycles +6%, reverse fill +6% | LLVM does not inline them |
+| Reverse counts collected in the relabel finish; text u16 places reused for the relabel | -2 ms and -1 ms | not built | +10 and +6 lines for those gains; the text munmap only moves, and keeping the buffer would put a 10 MB array in the query-phase peak |
 | Relabel copy in new-id order (sequential writes through the inverse permutation, three prefetch stages) | sequential stores | 12 threads min 23.4 -> 22.6 ms but q1 27.1 -> 27.2 ms; 1 thread +20% cycles, +9% instructions | each node now costs three random line reads instead of two reads and one random write |
 
 ## Correctness
@@ -318,7 +391,7 @@ with fewer queued entries instead of the smaller key, 7.15M.
 - Distances above 31 bits (from a no-in-edge node, the max-weight and over-uint32 island queries)
   go through a one-ended u64 Dijkstra.
 - Nothing depends on the seed: the bit split comes from the header n, the offset block size
-  shrinks if a block ever needs more than 255 slots, and degrees above 65k stop with a message.
+  shrinks if a block ever needs more than 255 slots, and there is no degree limit (the old u16 degree array, which panicked above 65k, is gone).
 
 ## How to reproduce
 
