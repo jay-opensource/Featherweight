@@ -480,10 +480,8 @@ fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: [&Graph; 2], s: usize, t: usize)
             step::<0>(pg, &mut hs[0], g[0], &mut m)
         };
     }
-    match m {
-        [mu, skip] if skip < mu || skip < u64::MAX && mu >= INF as u64 => None,
-        [mu, _] => Some(mu as i64), // u64::MAX, no path, casts to -1
-    }
+    let [mu, skip] = m; // mu = u64::MAX (no path) casts to -1
+    (skip >= mu && (skip == u64::MAX || mu < INF as u64)).then_some(mu as i64)
 }
 
 /// One step of side S (0: forward, 1: backward, so the side is a constant in the code): pop its
@@ -521,21 +519,18 @@ fn step<const S: usize>(pg: &mut Pages, h: &mut Dial, gr: &Graph, m: &mut [u64; 
 /// 31 bits (edges of weight near 2^32 at the special nodes). Speed does not matter here: a stale
 /// heap entry is simply expanded again (it cannot improve anything).
 fn plain(g: &Graph, s: usize, t: usize) -> i64 {
-    let mut dist = std::collections::HashMap::from([(s, 0)]);
-    let mut heap = std::collections::BinaryHeap::from([std::cmp::Reverse((0, s))]);
-    while let Some(std::cmp::Reverse((d, u))) = heap.pop() {
-        if u == t {
-            return d as i64;
-        }
+    use std::collections::{BTreeSet, HashMap};
+    let (mut dist, mut q) = (HashMap::from([(s, 0)]), BTreeSet::from([(0, s)]));
+    while let Some((d, u)) = q.pop_first().filter(|&(_, u)| u != t) {
         g.adj(u, |v, w| {
             let (e, nd) = (dist.entry(v as usize).or_insert(u64::MAX), d + w as u64);
             if nd < *e {
                 *e = nd;
-                heap.push(std::cmp::Reverse((nd, v as usize)));
+                q.insert((nd, v as usize));
             }
         });
     }
-    -1
+    dist.get(&t).map_or(-1, |&d| d as i64) // t is popped at its distance, or never labelled
 }
 
 fn main() {
@@ -580,8 +575,8 @@ fn main() {
             ans[k].store(a.unwrap_or_else(|| plain(&g, s, t)), Relaxed);
         }
     });
-    let out: Vec<String> = ans.iter().map(|a| a.load(Relaxed).to_string()).collect();
-    std::fs::write("/out/distances.txt", out.join("\n") + "\n").unwrap();
+    let out: String = ans.iter().map(|a| format!("{a:?}\n")).collect(); // Debug: the value
+    std::fs::write("/out/distances.txt", out).unwrap();
     eprintln!("build {t1:?} total {:?}", t0.elapsed());
     std::process::exit(0); // the kernel reclaims everything; do not free the big arrays one by one
 }
