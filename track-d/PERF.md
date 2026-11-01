@@ -35,6 +35,9 @@ Local box: i5-11400H laptop (6 cores, 12 MB L3) running Docker; the scoring box 
 | 21 | 303ba88 | 626 formatted lines (leaner pages, Dial by Default); escaped edges carry the node's u16 so the bucket finish never reads edges | run-9341674210a3 | 0.161 | 74.1 | 627 | 68.4 |
 | 22 | 8cba48c | Search step generic over the side (constants in the hot loop); x86-64-v3 + static binary; exit right after writing | run-efed718978e5 | 0.148 | 70.0 | 631 | 69.6 |
 | 23 | cc9faa7 | Edge streams through a trait, so the builder's emitter is inlined into the parse loop | run-910e201fd701 | 0.145 | 76.5 | 633 | 69.4 |
+| 24 | a7961c3 | No 2 MB pages for the graph arrays either (only the NOHUGEPAGE advice left) | run-4f9060930961 | 0.142 | 64.3 | 623 | 70.5 |
+| 25 | bd5f56e | One prctl(PR_SET_THP_DISABLE) + one malloc arena instead of the custom allocator (-25 lines) | run-39e2f47ac593 | 0.142 | 64.2 | 598 | 70.6 |
+| 26 | cdf5158 | Branch-free label check (one signed compare); query side -40 lines; BFS prefetches claim words 4 ahead; calloc'd id/degree arrays | run-f73ce8bfc7b4 | 0.134 | 64.1 | 562 | 71.4 |
 
 ## How it works now
 
@@ -109,6 +112,17 @@ lines. Making one search step generic over the side (forward/backward are compil
 cut instructions per query by 13%. Process exit was 13 ms of the local wall time: the kernel unmaps
 everything on one core after the last write, and freeing the big arrays one by one came before
 that; `std::process::exit(0)` right after writing the answers removed about 5 ms of it.
+
+**Step 24: 2 MB pages stopped paying.** Step 4 measured +17% time without 2 MB pages, when the
+search jumped across 22 MB of randomly numbered nodes. After BFS relabelling the searches are
+local, and without 2 MB pages the board ran faster (0.145 -> 0.142 s) and 12 MB lighter (76.5 ->
+64.3 MB). With nothing left that wants them, a 25-line allocator became one prctl call; per-thread
+malloc arenas still cost ~10 MB locally, so one arena stays.
+
+**Pull-transpose for the reverse graph (rejected).** In-edges of u can be found by scanning the
+out-edges of u's neighbours (97% of edge pairs are two-way), with no atomics and no u16 side
+array: exact, and 5 MB lighter, but the reverse phase took 128 ms instead of 33 ms on 12 threads,
+because every pulled edge reads a neighbour's adjacency (88% of edges span 64 or more ids).
 
 **Locality does not depend on the number of BFS regions.** Label pages touched over all queries,
 counted deterministically: 1 region 362,199; 4 regions 362,355; 12 regions 363,088; 24 regions
