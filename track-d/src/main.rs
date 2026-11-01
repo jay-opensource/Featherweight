@@ -53,13 +53,11 @@ fn prefetch<T>(x: *const T) {
 }
 
 /// s[i] without a bounds check, for the hot lookups (their indices come from the graph).
-#[inline(always)]
 fn ld<T: Copy>(s: &[T], i: usize) -> T {
     unsafe { *s.get_unchecked(i) }
 }
 
 /// &mut s[i] without a bounds check.
-#[inline(always)]
 fn mt<T>(s: &mut [T], i: usize) -> &mut T {
     unsafe { s.get_unchecked_mut(i) }
 }
@@ -83,14 +81,6 @@ fn par<T: Sync>(threads: usize, items: &[T], f: impl Fn(&T) + Sync) {
 /// Shared mutable array written at disjoint indices by several threads.
 struct Slots<T>(*mut T);
 unsafe impl<T> Sync for Slots<T> {}
-
-/// Write edge (v, w) at slot p: one slot `v | w << vb`, or, when w does not fit, the escape
-/// value in that slot and the full weight in the next. Returns the slots used.
-fn store(out: &Slots<u32>, p: usize, v: u32, w: u32, vb: u32, esc: u32) -> usize {
-    let k = 1 + (w >= esc) as usize; // the weight goes first, so that without an escape it is overwritten
-    unsafe { (*out.0.add(p + k - 1), *out.0.add(p)) = (w, v | w.min(esc) << vb) };
-    k
-}
 
 /// Compact CSR. Node k's slots start at base[k >> sh] + rel[k] (see `store` for a slot).
 #[derive(Default)]
@@ -219,7 +209,11 @@ fn csr(n: usize, t: usize, vb: u32, items: &[impl Edges], buf: Result<Vec<u32>, 
             if est > 0 && c[b] as usize + 1 + (w >= esc) as usize > end[i * nb + b] {
                 return ok.store(false, Relaxed);
             }
-            let (p, k) = (c[b] as usize, store(&ep, c[b] as usize, v, w, vb, esc));
+            // Edge (v, w) at slot p: one slot `v | w << vb`, or, when w does not fit, the escape
+            // value in that slot and the full weight in the next (written first, so that without
+            // an escape it is overwritten).
+            let (p, k) = (c[b] as usize, 1 + (w >= esc) as usize);
+            unsafe { (*(&ep).0.add(p + k - 1), *(&ep).0.add(p)) = (w, v | w.min(esc) << vb) };
             c[b] += k as u32;
             unsafe { (*(&lp).0.add(p), *(&lp).0.add(p + k - 1)) = (l, l) };
         });
@@ -368,16 +362,7 @@ impl Dial {
         self.len += 1;
     }
 
-    /// Move cur to the smallest key; false if the queue is empty.
-    #[inline(always)]
-    fn min(&mut self) -> bool {
-        while self.len > 0 && ld(&self.head, self.cur as usize % W) == 0 {
-            self.cur += 1;
-        }
-        self.len > 0
-    }
-
-    /// Take an item of key cur; min() must have returned true since the last pop.
+    /// Take an item of key cur (`step` moves cur to the smallest key after each pop).
     #[inline(always)]
     fn pop(&mut self) -> [u32; 3] {
         let b = self.cur as usize % W;
@@ -387,13 +372,6 @@ impl Dial {
         mt(&mut self.pool, k)[3] = std::mem::replace(&mut self.free, k as u32);
         self.len -= 1;
         [i, a, e]
-    }
-
-    /// Empty the queue (the first time, size it).
-    fn clear(&mut self) {
-        (self.free, self.cur, self.len) = (0, 0, 0);
-        self.head = vec![0; W];
-        self.pool.resize(1, [0; 4]);
     }
 }
 
@@ -441,11 +419,6 @@ impl Pages {
         let d = (v >> self.pb) as usize;
         (ld(&self.dir[side], d) as usize) << self.pb | v as usize & ((1 << self.pb) - 1)
     }
-
-    fn clear(&mut self) {
-        self.own.drain(..).for_each(|(s, d)| self.dir[s][d] = 0);
-        self.pool.truncate(1 << self.pb);
-    }
 }
 
 /// Two-ended Dijkstra: forward from s on g[0], backward from t on the reverse graph g[1], always
@@ -462,13 +435,16 @@ impl Pages {
 /// unless skip < mu, or something was skipped and mu does not fit 31 bits: then return None and
 /// the caller runs via().
 fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: [&Graph; 2], [s, t, c]: [usize; 3]) -> Option<u64> {
-    pg.clear();
+    pg.own.drain(..).for_each(|(s, d)| pg.dir[s][d] = 0); // free the pages
+    pg.pool.truncate(1 << pg.pb);
     let mut m = [if s == t { 0 } else { c as u64 }, u64::MAX]; // mu, skip
     for (side, x, gr) in [(0, s, g[0]), (1, t, g[1])] {
         let i = pg.at(x as u32, side);
         pg.pool[i] = 0;
-        hs[side].clear();
-        hs[side].put(0, [i as u32, gr.off(x) as u32, gr.off(x + 1) as u32]);
+        let h = &mut hs[side]; // emptied (the first time, sized)
+        (h.free, h.cur, h.len, h.head) = (0, 0, 0, vec![0; W]);
+        h.pool.resize(1, [0; 4]);
+        h.put(0, [i as u32, gr.off(x) as u32, gr.off(x + 1) as u32]);
     }
     // Step the chosen side while the minimums are below mu; a step that empties its queue ends it.
     while (hs[0].cur as u64 + hs[1].cur as u64) < m[0]
@@ -509,7 +485,10 @@ fn step<const S: usize>(pg: &mut Pages, h: &mut Dial, gr: &Graph, m: &mut [u64; 
             m[0] = m[0].min(nd + o as u64 | (o == INF) as u64 * u64::MAX);
         });
     }
-    h.min()
+    while h.len > 0 && ld(&h.head, h.cur as usize % W) == 0 {
+        h.cur += 1; // to the smallest key
+    }
+    h.len > 0
 }
 
 /// d(s, t) for a query that bidir gave up on: the minimum over the out-edges (s, v, w) of
@@ -589,9 +568,7 @@ fn main() {
     o.sort_by_key(|&(_, &(s, t))| std::cmp::Reverse(s.abs_diff(t)));
     par(threads, &vec![(); threads], |_| {
         let (mut pg, mut hs) = (Pages::new(n), <[Dial; 2]>::default());
-        loop {
-            let k = next.fetch_add(1, Relaxed);
-            let Some(&(k, &(s, t))) = o.get(k) else { break };
+        while let Some(&(k, &(s, t))) = o.get(next.fetch_add(1, Relaxed)) {
             let a = bidir(&mut pg, &mut hs, [&g, &r], [s, t, usize::MAX]);
             let a = a.unwrap_or_else(|| via(&mut pg, &mut hs, [&g, &r], s, t));
             ans[k].store(a as i64, Relaxed); // u64::MAX (no path) is -1
