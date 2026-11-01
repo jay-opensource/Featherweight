@@ -474,10 +474,9 @@ fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: [&Graph; 2], s: usize, t: usize)
     }
     let mut go = true;
     while go && (hs[0].cur as u64 + hs[1].cur as u64) < m[0] {
-        go = if hs[0].len > hs[1].len {
-            step::<1>(pg, &mut hs[1], g[1], &mut m)
-        } else {
-            step::<0>(pg, &mut hs[0], g[0], &mut m)
+        go = match hs[0].len > hs[1].len {
+            true => step::<1>(pg, &mut hs[1], g[1], &mut m),
+            false => step::<0>(pg, &mut hs[0], g[0], &mut m),
         };
     }
     let [mu, skip] = m; // mu = u64::MAX (no path) casts to -1
