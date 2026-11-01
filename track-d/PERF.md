@@ -28,6 +28,13 @@ Local box: i5-11400H laptop (6 cores, 12 MB L3) running Docker; the scoring box 
 | 14 | c697a6e | Experiment: prefetch the offsets of the next node a side will settle | run-1266ccbcec18 | 0.180 | 78.5 | | 66.9 |
 | 15 | fe25faa | Prefetch reverted; u16 page numbers in the label directory | run-07372c236cf8 | 0.185 | 72.1 | 649 | 67.0 |
 | 16 | e3964b4 | Experiment: reverse graph through atomic countdown cursors instead of the bucketed builder | run-cc347453b71c | 0.208 | 72.2 | 677 | 65.5 |
+| 17 | 090bbfd | Dial bucket queue (radix heap replaced; bucket per distance mod W, heap for heavier keys) | run-0f4e0e3ee631 | 0.172 | 77.1 | 726 | 67.1 |
+| 18 | 018ba3b | Prefetch a node's edge list when it is queued | run-82974c9e960f | 0.168 | 74.6 | 727 | 67.5 |
+| 19 | 2ddf225 | Experiment: the BFS writes the relabelled graph (no separate copy) | run-326de33ed648 | 0.167 | 77.0 | 808 | 67.1 |
+| 20 | 2d45234 | Compact Dial queue: 16-byte entries, no overflow heap, edges >= W skipped exactly; step 19 reverted | run-45e743567e28 | 0.166 | 77.8 | 669 | 67.7 |
+| 21 | 303ba88 | 626 formatted lines (leaner pages, Dial by Default); escaped edges carry the node's u16 so the bucket finish never reads edges | run-9341674210a3 | 0.161 | 74.1 | 627 | 68.4 |
+| 22 | 8cba48c | Search step generic over the side (constants in the hot loop); x86-64-v3 + static binary; exit right after writing | run-efed718978e5 | 0.148 | 70.0 | 631 | 69.6 |
+| 23 | cc9faa7 | Edge streams through a trait, so the builder's emitter is inlined into the parse loop | run-910e201fd701 | 0.145 | 76.5 | 633 | 69.4 |
 
 ## How it works now
 
@@ -94,6 +101,19 @@ streams per thread, with the node's place in the bucket in a u16 side array), an
 then sorted by node through a 94 KB scratch copy. Local build 133-152 -> 108-114 ms, board
 0.200 -> 0.178 s. The u16 side array costs about 5 MB while building.
 
+**Steps 17-23: the queue and the last microseconds.** A Dial queue (one bucket per distance
+modulo W = 4096, weights in the main body are below ~8,100) beat the radix heap by 3.5% on the
+board but added 82 lines, which cost exactly what it gained; the compact version (16-byte entries,
+heavy edges skipped with a recorded lower bound, see the proof in `bidir`) kept the speed at 626
+lines. Making one search step generic over the side (forward/backward are compile-time constants)
+cut instructions per query by 13%. Process exit was 13 ms of the local wall time: the kernel unmaps
+everything on one core after the last write, and freeing the big arrays one by one came before
+that; `std::process::exit(0)` right after writing the answers removed about 5 ms of it.
+
+**Locality does not depend on the number of BFS regions.** Label pages touched over all queries,
+counted deterministically: 1 region 362,199; 4 regions 362,355; 12 regions 363,088; 24 regions
+370,259; 48 regions 366,506. The parallel BFS costs no locality.
+
 **Settled nodes over all 2,000 queries:** one-ended 23.2M; two-ended 7.38M; expanding the side
 with fewer queued entries instead of the smaller key, 7.15M.
 
@@ -114,6 +134,7 @@ with fewer queued entries instead of the smaller key, 7.15M.
 | Both sides' directory entries interleaved in one cache line | one line for both lookups | single-thread queries 512-567 vs 493-610 ms | each side now gets half as many pages per line |
 | 6 or 8 threads instead of 12 | more L2 per search | 12 threads fastest | the search waits on memory, and hyper-threads hide that |
 | Prefetch the next node a side will settle (step 14) | overlap its offset miss with the current edge loop | board 0.180 s vs 0.178 s | the next pop is already likely in cache; the extra loads cost as much |
+| The BFS writes the relabelled graph directly (step 19) | skip the copy | -0.9% time, +2.4 MB, +81 lines: net loss | the copy is cheap once prefetched; the fused version needed more code than it saved |
 | Reverse graph through atomic countdown cursors (step 16) | 5 MB less than the bucketed builder's u16 side array | board 0.208 s vs 0.178 s, 72.2 vs 77.0 MB | on the scoring box the locked updates cost far more than the memory saved |
 
 ## Correctness
