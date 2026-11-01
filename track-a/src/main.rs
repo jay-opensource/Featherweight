@@ -3,11 +3,12 @@
 // One parse pass turns every line into a 4-byte record (endpoint id, 5xx bit, 20-bit latency; an
 // escape word follows the rare larger latency) and files it in a memory region of its own hour.
 // Then each hour on its own: count per endpoint, scatter the latencies by endpoint, select p50, p95
-// and p99, and keep six words per group where the records were, giving the rest back to the kernel.
-// Last, the output file is sized, mapped, and every thread formats whole hours straight into it.
+// and p99, and keep five words per endpoint where the records were, giving the rest back to the
+// kernel. Meanwhile one thread sorts the endpoint names. Last, the output file is sized, mapped,
+// and every thread formats whole hours straight into it, in name order.
 // /out is a tmpfs, so the output is charged as memory: records, statistics and output are never
 // all alive at once. One pool of threads runs the three phases, with a barrier between them.
-use std::arch::x86_64::*;
+use std::arch::x86_64::{_mm256_loadu_si256 as ld, *};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
@@ -56,8 +57,9 @@ fn map(path: &str) -> &'static [u8] {
     }
 }
 
-/// Split `b` into `k` byte ranges that start and end on line boundaries.
-fn chunks(b: &[u8], k: usize) -> Vec<(usize, usize)> {
+/// Split `b` into `k` (even) byte ranges that start and end on line boundaries, returned as
+/// adjacent pairs (lo, mid, hi).
+fn chunks(b: &[u8], k: usize) -> Vec<(usize, usize, usize)> {
     let mut cut = vec![0];
     for j in 1..k {
         let mut p = (b.len() * j / k).max(*cut.last().unwrap());
@@ -67,7 +69,8 @@ fn chunks(b: &[u8], k: usize) -> Vec<(usize, usize)> {
         cut.push(p);
     }
     cut.push(b.len());
-    cut.windows(2).map(|w| (w[0], w[1])).collect()
+    let pairs = cut.windows(3).step_by(2);
+    pairs.map(|w| (w[0], w[1], w[2])).collect()
 }
 
 #[inline(always)]
@@ -81,7 +84,7 @@ fn ld8(b: &[u8], i: usize) -> u64 {
 fn seps(b: &[u8], i: usize) -> u64 {
     unsafe {
         let (p, v) = (b.as_ptr().add(i) as *const __m256i, _mm256_set1_epi8(0x21));
-        let m = |k| _mm256_movemask_epi8(_mm256_cmpgt_epi8(v, _mm256_loadu_si256(p.add(k)))) as u32;
+        let m = |k| _mm256_movemask_epi8(_mm256_cmpgt_epi8(v, ld(p.add(k)))) as u32;
         m(0) as u64 | (m(1) as u64) << 32
     }
 }
@@ -93,7 +96,7 @@ fn same(p: *const u8, q: *const u8, n: usize) -> bool {
     loop {
         let ne = unsafe {
             let (p, q) = (p.add(i) as *const __m256i, q.add(i) as *const __m256i);
-            let e = |k| _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(p.add(k)), _mm256_loadu_si256(q.add(k)))) as u32;
+            let e = |k| _mm256_movemask_epi8(_mm256_cmpeq_epi8(ld(p.add(k)), ld(q.add(k)))) as u32;
             !(e(0) as u64 | (e(1) as u64) << 32)
         };
         if n - i <= 64 {
@@ -118,9 +121,12 @@ fn swar(v: u64) -> u32 {
 
 /// A number of 8 or more digits at b[i..], and its length.
 #[cold]
-fn long(b: &[u8], i: usize) -> (u32, usize) {
-    let k = b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
-    (b[i..i + k].iter().fold(0, |x, &c| x * 10 + (c - b'0') as u32), k)
+fn long(b: &[u8], mut i: usize) -> (u32, usize) {
+    let (mut x, s) = (0, i);
+    while b[i].is_ascii_digit() {
+        (x, i) = (x * 10 + (b[i] - b'0') as u32, i + 1);
+    }
+    (x, i - s)
 }
 
 /// Endpoint interner shared by all threads. A slot is 0 or crc << 32 | len << 24 | id << 12 | at,
@@ -144,7 +150,8 @@ impl Names {
         let (want, mut i) = ((crc as u64) << 32 | (n as u64) << 24, crc as usize);
         loop {
             let v = self.slots[i % SLOTS].load(Acquire);
-            if v & !0xFF_FFFF == want && same(unsafe { self.text.add((v as usize & 4095) << 6) }, q, n) {
+            let at = unsafe { self.text.add((v as usize & 4095) << 6) };
+            if v & !0xFF_FFFF == want && same(at, q, n) {
                 return (v >> 12) as u32 & 2047;
             }
             if v == 0 {
@@ -167,7 +174,8 @@ impl Names {
                 self.slots[i % SLOTS].store(want | (keys.len() << 12 | at >> 6) as u64, Release);
                 return keys.len() as u32;
             }
-            if v & !0xFF_FFFF == want && same(unsafe { self.text.add((v as usize & 4095) << 6) }, q, n) {
+            let at = unsafe { self.text.add((v as usize & 4095) << 6) };
+            if v & !0xFF_FFFF == want && same(at, q, n) {
                 return (v >> 12) as u32 & 2047;
             }
             i += 1;
@@ -184,49 +192,56 @@ struct Pool {
 unsafe impl Sync for Pool {}
 
 impl Pool {
+    /// Hour h's region.
+    fn at(&self, h: usize) -> *mut u32 {
+        unsafe { self.base.add(h * self.region) }
+    }
+
     fn block(&self, h: usize) -> *mut u32 {
         let k = self.used[h].fetch_add(1, Relaxed);
         assert!((k + 1) * B <= self.region);
-        unsafe { self.base.add(h * self.region + k * B) }
+        unsafe { self.at(h).add(k * B) }
     }
 
     fn words(&self, h: usize) -> &[u32] {
-        unsafe { std::slice::from_raw_parts(self.base.add(h * self.region), self.used[h].load(Relaxed) * B) }
+        unsafe { std::slice::from_raw_parts(self.at(h), self.used[h].load(Relaxed) * B) }
     }
 
     /// Hour h's region seen as group statistics by endpoint id: count, p50, p95, p99, errors
     /// (it holds them once its records are consumed).
     fn stats(&self, h: usize) -> &mut [[u32; 5]] {
-        unsafe { std::slice::from_raw_parts_mut(self.base.add(h * self.region) as *mut [u32; 5], 2048) }
-    }
-
-    /// Give bytes [lo, hi) of hour h's region, widened to whole pages at the top, back to the kernel.
-    fn free(&self, h: usize, lo: usize, hi: usize) {
-        let (lo, hi) = ((lo + 4095) & !4095, (hi + 4095) & !4095);
-        if hi > lo {
-            unsafe { madvise((self.base.add(h * self.region) as *mut u8).add(lo), hi - lo, 4) };
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.at(h) as *mut [u32; 5], 2048) }
     }
 }
 
-/// Parse the lines in b[lo..hi] into records. cur[h] is where hour h's next record goes; it sits
-/// in a B-word block, and a new block is taken when fewer than two words are left.
-fn parse(b: &[u8], lo: usize, hi: usize, names: &Names, pool: &Pool, cur: &mut [*mut u32; HOURS]) {
-    // Lines come in long runs of one hour: keep that hour's cursor in `c` while "MM-DDTHH" repeats.
-    let (mut p, mut last, mut h) = (lo, 0, 0);
-    let mut c = cur[0];
-    while p < hi {
+/// A parsing cursor: its position and end, and the current hour run. Lines come in long runs of
+/// one hour, so the hour and its record cursor `c` change only when "MM-DDTHH" does. cur[h] is
+/// where hour h's next record goes; it sits in a B-word block, and a new block is taken when fewer
+/// than two words are left. Each thread runs two cursors over a pair of adjacent chunks, line by
+/// line in turn, so the two lines' dependency chains overlap.
+#[derive(Clone, Copy)]
+struct Cursor {
+    p: usize,
+    hi: usize,
+    last: u64,
+    h: usize,
+    c: *mut u32,
+    cur: [*mut u32; HOURS],
+}
+
+impl Cursor {
+    /// Parse the line at self.p into a record.
+    #[inline(always)]
+    fn line(&mut self, b: &[u8], names: &Names, pool: &Pool) {
+        let p = self.p;
         let w = ld8(b, p + 5);
-        if w != last {
+        if w != self.last {
             // The digit pairs combine in one multiply (byte k + 10 * byte k-1).
             let x = (w >> 24 & 0xF_0F00_0F0F).wrapping_mul(2561);
-            (cur[h], last) = (c, w);
-            h = (24 * (x >> 8 & 0xFF) + (x >> 32 & 0xFF) + 744 * (w >> 8 & 1) - 738) as usize;
-            c = cur[h];
+            (self.cur[self.h], self.last) = (self.c, w);
+            self.h = (24 * (x >> 8 & 0xFF) + (x >> 32 & 0xFF) + 744 * (w >> 8 & 1) - 738) as usize;
+            self.c = self.cur[self.h];
         }
-        // The hardware prefetcher stops at every 4 KB page (page cache pages are scattered), so ask
-        // for the bytes 1 KB ahead now. A prefetch never faults, even past the end of the mapping.
-        unsafe { _mm_prefetch::<_MM_HINT_T0>(b.as_ptr().wrapping_add(p + 1024) as *const i8) };
         // Separators from the method's third byte on: the method ends at the first, the endpoint
         // at the second.
         let (mut q, mut m) = (p + 31, seps(b, p + 31));
@@ -242,26 +257,25 @@ fn parse(b: &[u8], lo: usize, hi: usize, names: &Names, pool: &Pool, cur: &mut [
         let d = ld8(b, e + 5) ^ 0x3030_3030_3030_3030;
         let k = (d.wrapping_add(0x7676_7676_7676_7676) & 0x8080_8080_8080_8080).trailing_zeros() as usize / 8;
         let (lat, k) = if k < 8 { (swar(d << (64 - 8 * k)), k) } else { long(b, e + 5) };
-        p = e + 6 + k;
+        self.p = e + 6 + k;
         // Hash the first 16 and last 8 bytes of the endpoint (all of it when shorter).
         let (a, z) = if n >= 8 { (ld8(b, s), ld8(b, e - 8)) } else { (ld8(b, s) & ((1 << (8 * n)) - 1), 0) };
         let y = if n >= 16 { ld8(b, s + 8) } else { 0 };
         let crc = unsafe { _mm_crc32_u64(_mm_crc32_u64(_mm_crc32_u64(n as u64, a), y), z) };
         let id = names.id(b.as_ptr().wrapping_add(s), n, crc as u32);
         let err = (ld8(b, e + 1) as u8 == b'5') as u32;
-        if c as usize % (4 * B) >= 4 * B - 8 {
-            c = pool.block(h);
+        if self.c as usize % (4 * B) >= 4 * B - 8 {
+            self.c = pool.block(self.h);
         }
         unsafe {
-            *c = id | err << 11 | lat.min(ESC) << 12;
-            c = c.add(1);
+            *self.c = id | err << 11 | lat.min(ESC) << 12;
+            self.c = self.c.add(1);
             if lat >= ESC {
-                *c = lat;
-                c = c.add(1);
+                *self.c = lat;
+                self.c = self.c.add(1);
             }
         }
     }
-    cur[h] = c;
 }
 
 fn ppm(e: u32, n: u32) -> u32 {
@@ -335,7 +349,8 @@ fn main() {
     // and later five words for each of up to 2,048 endpoint ids.
     let region = (b.len() / 19 + (threads + 1) * B + 6 * 2048 + 1023) & !1023;
     let pool = Pool { base: anon(HOURS * region * 4), region, used: (0..HOURS).map(|_| AtomicUsize::new(0)).collect() };
-    let parts = chunks(b, threads * 16);
+    let parts = chunks(b, threads * 32); // a thread's two cursors take one pair
+
     let next: [AtomicUsize; 3] = Default::default();
     let bytes: Vec<AtomicUsize> = (0..HOURS).map(|_| Default::default()).collect();
     let (bar, order, out) = (Barrier::new(threads), OnceLock::new(), OnceLock::new());
@@ -343,9 +358,21 @@ fn main() {
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| {
-                let mut cur = [(4 * B - 4) as *mut u32; HOURS];
-                while let Some(&(lo, hi)) = parts.get(next[0].fetch_add(1, Relaxed)) {
-                    parse(b, lo, hi, &names, &pool, &mut cur);
+                // Cursors start with every hour's block "full", so the first record takes one.
+                let (mut x, s): (Cursor, _) = (unsafe { std::mem::zeroed() }, (4 * B - 4) as *mut u32);
+                (x.c, x.cur) = (s, [s; HOURS]);
+                let mut y = x;
+                while let Some(&(lo, mid, hi)) = parts.get(next[0].fetch_add(1, Relaxed)) {
+                    (x.p, x.hi, y.p, y.hi) = (lo, mid, mid, hi);
+                    while x.p < x.hi && y.p < y.hi {
+                        x.line(b, &names, &pool);
+                        y.line(b, &names, &pool);
+                    }
+                    for c in [&mut x, &mut y] {
+                        while c.p < c.hi {
+                            c.line(b, &names, &pool);
+                        }
+                    }
                     // Unmap the chunk's whole pages now, on this thread, not all at exit on one.
                     zap(b[lo..].as_ptr(), hi - lo);
                 }
@@ -403,7 +430,8 @@ fn main() {
                         let line = [n, p50, p95, p99, e, ppm(e, n)].map(digits);
                         size += 28 + keys[id - 1].1 + line.iter().sum::<usize>();
                     }
-                    pool.free(h, (nk + 1) * 20, nw * 4);
+                    let st_end = unsafe { (pool.at(h) as *const u8).add((nk + 1) * 20) };
+                    zap(st_end, (nw * 4).saturating_sub((nk + 1) * 20));
                     bytes[h].store(size, Relaxed);
                 }
                 unsafe { madvise(lat.as_mut_ptr() as *mut u8, most * 4, 4) };
@@ -450,7 +478,7 @@ fn main() {
                         o[i] = b'\n';
                         i += 1;
                     }
-                    pool.free(h, 0, (nk + 1) * 20);
+                    zap(pool.at(h) as *const u8, (nk + 1) * 20);
                     // Drop this hour's whole output pages from our page tables now, in parallel; the
                     // data stays in the file. Exit would otherwise unmap them all on one core.
                     if *shared {
@@ -464,6 +492,8 @@ fn main() {
     if !shared {
         f.write_all(unsafe { std::slice::from_raw_parts(o.0, off[HOURS]) }).expect("write summary.txt");
     }
-    // The output is complete; the kernel releases everything else at exit.
+    // A mapped file on a filesystem with write-back (not tmpfs, where this is a no-op) must reach it
+    // before we exit. Then the output is complete; the kernel releases everything else at exit.
+    f.sync_data().expect("sync summary.txt");
     std::process::exit(0);
 }

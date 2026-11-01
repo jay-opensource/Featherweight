@@ -27,6 +27,8 @@ Every step from the reference to the final version. Each row has the live-board 
 | 6 | **r7, exit work moved into the parallel phase.** Each thread `MADV_DONTNEED`s the input pages it has parsed, with `MADV_SEQUENTIAL` on the input. Also B = 128, largest hours first, `+crt-static` | | | | 444 | r6 59.9 → +B128/LPT 57.6 → +zap 48.1 → +static 46.8 | 18.0 | 761 |
 | 7 | **r8.** Each hour's output pages are dropped from our page table after formatting (the data stays in the file); `process::exit(0)` once the output is complete; rustfmt-friendly trims | | | | 426 | r7 30.6 → r8 28.3 (medians 38.6 / 38.0) | 18.0 | 758 |
 | 8 | **r9.** The parser keeps the current hour and its record cursor in registers while the timestamp's "MM-DDTHH" repeats. Lines come in long single-hour runs, so both are recomputed only when it changes | | | | 431 | r7 30.7, r8 28.9, r9 26.3 (medians 39.3 / 37.7 / 32.3) | 17.8 | 715 |
+| 9 | **r10.** The name sort leaves the critical path. Statistics are kept by endpoint id; the leader sorts the 1,842 names while the other threads already start on the hours, and the formatting walks the sorted ids. The sort itself takes 170-220 µs with 11 threads idle | | | | 434 | removes a measured 0.2 ms serial section | 17.8 | 717 |
+| 10 | **r11.** Two parse cursors per thread (a claim is a pair of adjacent chunks; each loop step parses one line of each, so two dependency chains overlap); line trims; `fdatasync` before exit (see the failure museum, entry 17) | | | | 432 | 1 thread: median 156 vs 177 ms. 12 threads, 16 alternations: wall equal (min 28.1 vs 28.7), user CPU −15% | 17.8 | 711 |
 
 ### Inside step 4: parse instructions
 
@@ -42,13 +44,17 @@ On the full file, step 4 went 1,035M (v2) → 820M (long endpoints continue the 
 
 ## Where the time goes
 
-r7, inside the process. The laptop was loaded, so read these as proportions:
-- parse: 55-60%;
-- stats (count, scatter, select): 25-30%;
-- formatting into the mapped output: 8-10%;
-- exec and exit: the rest.
+r11, inside the process, on the quietest of several runs.
 
-Instructions per input line: about 150 in the parse, about 70 per record in the stats phase, about 15 per record in formatting.
+At 12 threads the run took 25.4 ms:
+- parse: 17.1 ms;
+- stats (count, scatter, select): 5.5 ms;
+- formatting into the mapped output: 2.8 ms;
+- plus about 1.5 ms of exec and exit outside the process.
+
+At 1 thread the run took 143-146 ms: parse 97 ms, stats 34-37 ms, formatting 11 ms. The parse scales 5.7x over 12 hardware threads (6 cores with HT).
+
+Instructions per input line: about 135 in the parse, about 65 per record in the stats phase, about 15 per record in formatting.
 
 ## Where the memory is
 
@@ -97,6 +103,12 @@ These are rejected or reverted experiments, with the numbers that decided them.
 14. **Escaped latencies in one shared side list (x11)**, so the count and scatter loops have a fixed stride.
     - The loops saved 17M instructions, but each hour scanning the list cost 10M back: −1% net, for +145 KB and +4 lines. Rejected.
 15. **Without the per-hour output zap (x12).** r9 minus that one call: wall median 38.4 vs 32.3 ms. The zap stays.
+16. **Unmapping the whole input after the parse (x17), to drop its page tables.** Page tables are 0.9-1.2 MB after the parse, but M did not move: median 19.43 vs 19.46 MB over 8 runs. Rejected.
+17. **Exiting without `fdatasync` (r8-r10).** A bug, found and fixed in r11.
+    - With the read-write open, the `MAP_SHARED` output also works on a write-back filesystem (9p in the original local bench).
+    - There, dropping the output's pages and calling `process::exit` lost dirty pages: 4 of 9 small sets failed.
+    - On tmpfs (the board) the pages are the file, so board results were unaffected.
+    - r11 calls `fdatasync` before exiting, which is a no-op on tmpfs.
 
 ## Correctness notes
 
@@ -108,6 +120,11 @@ These are checked on every candidate:
   - the 177-byte longest line (OPTIONS, the 125-byte template, status 599, latency 4294967295);
   - one hour holding 60,000 lines over 1,513 endpoints of awkward lengths (1, 8, 16, 17, 63, 64, 65, 125), with every method, escapes, 0 and u32::MAX, and statuses 499/500/599;
   - all 72 hours fully shuffled, with duplicates, both span ends, and both sides of every hour boundary.
+
+Since r10 we also check:
+- holdout seed 7 (full) against the reference's `summary.txt`;
+- seeds 11 and 12, which give byte-identical output to v1, an implementation with independent parse, stats and format code;
+- the write-back path, through the original bench with `/out` on 9p.
 
 Design points that carry correctness:
 - **Endpoint identity.** Exact byte compare of the whole name; the CRC only picks the slot.
