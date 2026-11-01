@@ -219,56 +219,68 @@ fn layout(n: usize, threads: usize, slots: impl Fn(usize) -> u32 + Sync) -> (Vec
 }
 
 /// Build a CSR over n nodes from an edge stream: `each(item, emit)` calls emit(u, v, w) for the
-/// edges of one work item. It runs twice, to count each node's slots and then to fill them
-/// through per-node countdown cursors, so threads write disjoint slots. The locked updates go in
-/// batches of 16: a locked op waits for every earlier store, so one at a time the scattered stores
-/// would not overlap their cache misses.
+/// edges of one work item, and runs twice. Every random access stays inside a small region:
+/// 1. count each item's slots per bucket of 8192 nodes (213 counters per item, no atomics);
+/// 2. append each slot to its bucket's region through the item's own cursor, with the node's
+///    place inside the bucket in a parallel u16 array (213 sequential streams per thread);
+/// 3. per bucket, count each node's slots; once the layout is known, reorder the bucket's
+///    ~94 KB of slots by node through a scratch copy.
+/// Nothing is locked, and no store lands outside the bucket being worked on.
 fn csr<T: Sync>(n: usize, threads: usize, vb: u32, esc: u32, items: &[T], each: impl Fn(&T, &mut dyn FnMut(usize, u32, u32)) + Sync) -> Graph {
-    let deg: Vec<AtomicU16> = (0..n + 1).map(|_| AtomicU16::new(0)).collect();
-    par(threads, items, |it| {
-        let (mut b, mut k) = ([(0usize, 0u16); 16], 0);
-        let add = |b: &[(usize, u16)]| {
-            for &(u, c) in b {
-                assert!(deg[u].fetch_add(c, Relaxed) < u16::MAX - 2, "out-degree above 65k");
-            }
-        };
-        each(it, &mut |u, _, w| {
-            prefetch(&deg[u]);
-            b[k] = (u, 1 + (w >= esc) as u16);
-            k += 1;
-            if k == 16 {
-                add(&b);
-                k = 0;
-            }
-        });
-        add(&b[..k]);
+    const BS: u32 = 13;
+    let (nb, ni) = ((n >> BS) + 1, items.len());
+    let idx: Vec<usize> = (0..ni).collect();
+    let mut cur = vec![0u32; ni * nb];
+    let cp = Slots(cur.as_mut_ptr());
+    par(threads, &idx, |&i| {
+        let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
+        each(&items[i], &mut |u, _, w| c[u >> BS] += 1 + (w >= esc) as u32);
     });
-    let (base, rel, sh) = layout(n, threads, |k| deg[k].load(Relaxed) as u32);
-    let mut edges = vec![0u32; *base.last().unwrap() as usize];
+    let (mut start, mut acc) = (vec![0usize; nb + 1], 0u32);
+    for b in 0..nb {
+        start[b] = acc as usize;
+        for i in 0..ni {
+            (cur[i * nb + b], acc) = (acc, acc + cur[i * nb + b]);
+        }
+    }
+    start[nb] = acc as usize;
+    let (mut edges, mut loc) = (vec![0u32; acc as usize], vec![0u16; acc as usize]);
     huge(&mut edges);
-    let out = Slots(edges.as_mut_ptr());
-    par(threads, items, |it| {
-        let out = &out;
-        let (mut b, mut k) = ([(0usize, 0u32, 0u32); 16], 0);
-        let fill = |b: &mut [(usize, u32, u32)]| {
-            for e in b.iter_mut() {
-                let c = 1 + (e.2 >= esc) as u16;
-                e.0 = base[e.0 >> sh] as usize + rel[e.0] as usize + (deg[e.0].fetch_sub(c, Relaxed) - c) as usize;
-            }
-            for &(p, v, w) in b.iter() {
-                store(out, p, v, w, vb, esc);
-            }
-        };
-        each(it, &mut |u, v, w| {
-            prefetch(&deg[u]);
-            b[k] = (u, v, w);
-            k += 1;
-            if k == 16 {
-                fill(&mut b);
-                k = 0;
-            }
+    let (ep, lp) = (Slots(edges.as_mut_ptr()), Slots(loc.as_mut_ptr()));
+    par(threads, &idx, |&i| {
+        let (ep, lp) = (&ep, &lp);
+        let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
+        each(&items[i], &mut |u, v, w| {
+            let p = c[u >> BS] as usize;
+            c[u >> BS] += store(ep, p, v, w, vb, esc) as u32;
+            unsafe { *lp.0.add(p) = (u & ((1 << BS) - 1)) as u16 };
         });
-        fill(&mut b[..k]);
+    });
+    let mut deg = vec![0u16; n + 1];
+    let dp = Slots(deg.as_mut_ptr());
+    let buckets: Vec<usize> = (0..nb).collect();
+    par(threads, &buckets, |&b| {
+        let mut p = start[b];
+        while p < start[b + 1] {
+            let k = 1 + (edges[p] >> vb == esc) as u16;
+            let d = unsafe { &mut *(&dp).0.add(b << BS | loc[p] as usize) };
+            *d = d.checked_add(k).expect("out-degree above 65k");
+            p += k as usize;
+        }
+    });
+    let (base, rel, sh) = layout(n, threads, |k| deg[k] as u32);
+    par(threads, &buckets, |&b| {
+        let (lo, hi) = (start[b], start[b + 1]);
+        let e = unsafe { std::slice::from_raw_parts((&ep).0.add(lo), hi - lo) }.to_vec();
+        let l = &loc[lo..hi];
+        let mut at: Vec<usize> = (b << BS..((b + 1) << BS).min(n + 1)).map(|k| base[k >> sh] as usize + rel[k] as usize).collect();
+        let mut q = 0;
+        while q < e.len() {
+            let k = 1 + (e[q] >> vb == esc) as usize;
+            let p = &mut at[l[q] as usize];
+            unsafe { std::ptr::copy_nonoverlapping(e.as_ptr().add(q), (&ep).0.add(*p), k) };
+            (*p, q) = (*p + k, q + k);
+        }
     });
     Graph { edges, base, rel, sh, vb, esc }
 }
