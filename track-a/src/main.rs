@@ -548,9 +548,9 @@ fn main() {
         };
         // Hours below `fin` are complete; `pre` chunks from the start are parsed. `prog`: for each
         // chunk its first and last hour once parsed; `pre`; one past the last hour in those; whether
-        // a line came too late for its hour.
+        // a line came too late for its hour; the chunk count whose input pages are given back.
         let (next, fin, pre): ([AtomicUsize; 3], AtomicUsize, AtomicUsize) = Default::default();
-        let prog = Mutex::new((vec![None; chunks], 0, 0, false));
+        let prog = Mutex::new((vec![None; chunks], 0, 0, false, 0));
         // Each hour's output size, usize::MAX until it is summarised.
         let sz: Vec<AtomicUsize> = (0..HOURS).map(|_| AtomicUsize::new(usize::MAX)).collect();
         // Endpoint ids in name order; set once by the thread whose chunk completes the parse, and
@@ -597,8 +597,6 @@ fn main() {
                 } else if next[0].compare_exchange(j, j + 1, Relaxed, Relaxed).is_ok() {
                     let (lo, hi) = (edge(j), edge(j + 1));
                     let span = parse(&b[..hi], lo, &names, &pool, &mut cur);
-                    // Unmap the chunk's whole pages now, on this thread, not all at exit on one.
-                    zap(b[lo..].as_ptr(), hi - lo);
                     let mut g = prog.lock().unwrap();
                     g.0[j] = Some(span);
                     while let Some(&Some([a, z])) = g.0.get(g.1) {
@@ -607,6 +605,10 @@ fn main() {
                         g.3 |= a < fin.load(Relaxed);
                         (g.1, g.2) = (g.1 + 1, g.2.max(z + 1));
                     }
+                    // The parsed prefix's whole input pages go back 8 or more chunks at a time (fewer TLB
+                    // shootdowns), on the threads, not all at exit on one; the zap runs after the unlock.
+                    let z = (g.4, g.1);
+                    g.4 = if g.1 >= g.4 + 8 { g.1 } else { g.4 };
                     pre.store(g.1, Relaxed);
                     let f = g.2.max(wait) - wait;
                     fin.store(if g.1 < chunks { f } else { HOURS }, Release);
@@ -620,6 +622,10 @@ fn main() {
                         let mut ids: Vec<usize> = (1..=names.next.lock().unwrap().0).collect();
                         ids.sort_unstable_by_key(|&id| names.key(id));
                         assert!(order.set(ids).is_ok());
+                    }
+                    if g.4 != z.0 && g.1 < chunks {
+                        drop(g);
+                        zap(b[edge(z.0)..].as_ptr(), edge(z.1) - edge(z.0));
                     }
                 }
             }
