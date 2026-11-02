@@ -14,9 +14,9 @@
 //! 3. Distinct names: one bit per (country, name id) in a shared bitset; every thread then popcounts
 //!    its share. Then the per-thread aggregates are merged, sorted by code, and written (6).
 //!
-//! Data structures: `Shared` is the name dictionary (64-byte buckets, three slots each, names
-//! inline up to 16 bytes, hashed with two AES rounds) plus the bitset; `Agg` is one group's running
-//! sums; `Rec` is a parsed record waiting for its lookups.
+//! Data structures: `Shared` is the name dictionary (64-byte buckets of eight entries, each a
+//! fingerprint of a name's AES hash and its id; names are not stored) plus the bitset; `Agg` is one
+//! group's running sums; `Rec` is a parsed record waiting for its lookups.
 //!
 //! Correctness of the split: a range starts at a guessed record boundary ("LF followed by a digit
 //! or a byte order mark") and the guess is proved afterwards: each range must stop exactly where
@@ -30,7 +30,7 @@
 //!   exactly one thread; the bitset is updated by queued plain stores under region locks, not by
 //!   locked ORs (6, 7, 13).
 //! - THP: all memory is MADV_NOHUGEPAGE (a 2 MB page is charged whole to memory.peak) except the
-//!   first 6 MB of the dictionary and bitset, which are fully used anyway (9; run-be0296de8c66).
+//!   first 4 MB of the dictionary and bitset, which are fully used anyway (9; run-be0296de8c66).
 //! - One thread pool, no second round of thread starts (11). The process ends without freeing.
 //! - Build flags are in .cargo/config.toml (x86-64-v3 plus PCLMULQDQ and AES; the unsafe intrinsics
 //!   below rely on them).
@@ -138,13 +138,6 @@ fn numbers(w: [u64; 3], n: [usize; 3]) -> [i64; 4] {
     }
 }
 
-/// Word j of the name b[s..s + n], zero-padded past its end.
-fn kw(b: &[u8], s: usize, n: usize, j: usize) -> u64 {
-    let len = (8 * n.saturating_sub(8 * j)).min(64) as u32;
-    // SAFETY: BMI2 (build flags); bzhi with len = 64 keeps all bits.
-    unsafe { _bzhi_u64(word(b, s + 8 * j), len) }
-}
-
 /// The end of the text field that starts at p (the first comma outside quotes) and the number of
 /// quotes in the field. This works for quoted and unquoted fields alike; a name nearly always fits
 /// in the first 32-byte window.
@@ -170,17 +163,15 @@ const NEW: Agg = [0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0];
 type Words = &'static [AtomicU64];
 
 /// The state threads share in one run: tab (region id -> group: 0 is _UNMATCHED, countries are
-/// 1..); the name dictionary (buckets; words of names over 16 bytes, with the next free word; the
-/// next free block of 64 ids); and one bit per (group, name id), with a lock per region of it.
+/// 1..); the name dictionary (buckets, and the next free block of 64 ids); and one bit per
+/// (group, name id), with a lock per region of it.
 ///
-/// A dictionary bucket is one cache line with three slots: three 32-bit headers `tag | (id + 1)
-/// << 14` (0 = empty, BUSY while being filled; tag = 13 bits of the name's hash and a set bit 13)
-/// and three 16-byte keys. A key is the name's first 16 bytes, zero-padded; a name over 16 bytes
-/// keeps its length and the rest of its words in `long`, and its key's second word is LONG plus
-/// their offset (a name byte is ASCII, so bit 63 is never set by one). A lookup reads one line
-/// (prefetched by the parser) and finds its slot with one compare of the three headers; one name
-/// in seven has to go on to the next bucket. The raw (still escaped) name is the key: escaping is
-/// a bijection, and `""` and an empty unquoted field both give the empty key.
+/// A dictionary bucket is one cache line of eight entries `fingerprint | (id + 1)` (0 = empty): the
+/// fingerprint is 44 bits of the name's hash (`hash`), and the bucket is chosen by other bits of it.
+/// Names are not stored: two names are taken as equal when their 128-bit hashes agree in those 57 or
+/// so bits (1e5 names: a collision has probability about 1e10 / 2^58, 3e-8). A lookup reads one line
+/// (prefetched by the parser) and compares all eight entries at once; a full bucket goes on to the
+/// next. Slots fill in order and never change once filled.
 ///
 /// The bits live in pages of 4096 names: [page][group][64 words], so a group's bits for one page
 /// are contiguous and pages past the last id are never touched. No locked instruction per bit: a
@@ -188,19 +179,14 @@ type Words = &'static [AtomicU64];
 /// later load meanwhile. Each thread queues (word, bit) pairs per region of the array (64 regions)
 /// and applies a full queue with plain loads and stores under that region's lock. A word always
 /// maps to the same lock, so no bit is lost. When all are on, the threads count them by page share.
-struct Shared<'a>(&'a [AtomicU8], &'a [Bucket], Words, Ids, Words, Locks);
-type Ids = (AtomicUsize, AtomicU32);
+struct Shared<'a>(&'a [AtomicU8], &'a [Bucket], AtomicU32, Words, Locks);
 type Locks = Vec<Mutex<()>>;
 
-/// Headers in two words (slots 0 and 1, then slot 2 and an always-empty fourth), then the keys.
 #[repr(C, align(64))]
-struct Bucket([AtomicU64; 2], [[AtomicU64; 2]; 3]);
+struct Bucket([AtomicU64; 8]);
 
-// A header whose tag bit 13 is clear never occurs for a real name (tags always set it), so this
-// value marks a slot being filled by another thread; 0 marks an empty slot.
-const BUSY: u32 = 0xFFFF_C000;
-// Bit 63 of a key's second word: the name is over 16 bytes and the low bits hold its offset in `long`.
-const LONG: u64 = 1 << 63;
+// The id + 1 bits of a dictionary entry; the others are the fingerprint, whose bit 63 is always set.
+const IDS: u64 = (1 << 20) - 1;
 
 /// One thread's state: aggregates per group, its block of free ids, its bit queues (64 regions x 64
 /// pairs `word << 6 | bit`, and their lengths), and its read buffer.
@@ -208,109 +194,120 @@ type Local = ([Agg; 256], (u32, u32), Pend, *mut u8);
 type Pend = ([[u32; 64]; 64], [usize; 64]);
 
 impl Shared<'_> {
-    /// Dense id of the name of r (raw bytes b[r.1..r.1 + r.2]). An overfull dictionary sets the id
+    /// Dense id of the name of r (fingerprint r.0, bucket r.1). An overfull dictionary sets the id
     /// counter past every limit, and the run is redone.
-    fn id(&self, b: &[u8], r: &Rec, ids: &mut (u32, u32)) -> u32 {
-        let (buckets, tag, mut i) = (self.1, r.3 as u32, (r.3 >> 32) as usize);
+    fn id(&self, r: &Rec, ids: &mut (u32, u32)) -> u32 {
+        let (buckets, mut i) = (self.1, r.1);
         loop {
             let k = &buckets[i];
-            let h = [k.0[0].load(Acquire), k.0[1].load(Acquire)];
-            let [mut hit, busy, empty] = lanes(h, tag);
-            while hit != 0 {
-                let j = hit.trailing_zeros() as usize;
-                if self.same(b, r, &k.1[j]) {
-                    return ((h[j / 2] >> (32 * (j % 2))) as u32 >> 14) - 1;
-                }
-                hit &= hit - 1;
+            let hit = scan(k, r.0, !IDS);
+            if hit != 0 {
+                return (k.0[hit.trailing_zeros() as usize].load(Relaxed) & IDS) as u32 - 1;
             }
-            if busy != 0 {
-                std::hint::spin_loop(); // another thread is filling a slot here: look again
-            } else if empty == 0 {
+            let empty = scan(k, 0, !0);
+            if empty == 0 {
                 i = if i + 1 < buckets.len() { i + 1 } else { 0 };
-            } else if let Some(id) = self.insert(b, r, k, empty.trailing_zeros() as usize, ids) {
+            } else if let Some(id) = self.insert(k, empty.trailing_zeros() as usize, r.0, ids) {
                 return id;
             }
         }
     }
 
-    /// Whether the key at k is the name of r.
-    fn same(&self, b: &[u8], r: &Rec, k: &[AtomicU64; 2]) -> bool {
-        let (k0, k1, n) = (k[0].load(Relaxed), k[1].load(Relaxed), r.2);
-        if n <= 16 {
-            return k0 == r.0[0] && k1 == r.0[1];
-        }
-        let o = (k1 & !LONG) as usize;
-        let at = |j: usize| self.2.get(o + j).map(|x| x.load(Relaxed));
-        let rest = (1..(n + 7) / 8).all(|j| at(j) == Some(kw(b, r.1, n, j)));
-        k0 == r.0[0] && k1 & LONG != 0 && at(0) == Some(n as u64) && rest
-    }
-
-    /// Claim empty slot j of bucket k for the name of r and give it the next id; None if another
-    /// thread changed the bucket first.
+    /// Fill slot j of bucket k, seen empty, with fingerprint `fp` and the next id; the id of the
+    /// name already there if another thread filled it with the same name; None if with another one.
     #[cold]
-    fn insert(&self, b: &[u8], r: &Rec, k: &Bucket, j: usize, ids: &mut (u32, u32)) -> Option<u32> {
-        let Shared(_, buckets, long, (top, next), ..) = self;
-        let (w, shift, n, nw) = (&k.0[j / 2], 32 * (j % 2), r.2, (r.2 + 7) / 8);
-        let old = w.load(Relaxed) & !(0xFFFF_FFFF << shift); // slot j empty, or the exchange fails
-        let busy = old | (BUSY as u64) << shift;
-        w.compare_exchange(old, busy, Acquire, Relaxed).ok()?;
+    fn insert(&self, k: &Bucket, j: usize, fp: u64, ids: &mut (u32, u32)) -> Option<u32> {
+        let Shared(_, buckets, next, bits, _) = self;
         if ids.0 == ids.1 {
             let first = next.fetch_add(64, Relaxed);
             *ids = (first, first + 64);
-            let page = self.4.chunks(1 << 14).nth(first as usize >> 12); // bits of 4096 ids
+            let page = bits.chunks(1 << 14).nth(first as usize >> 12); // bits of 4096 ids
             page.filter(|_| first % 4096 == 0).map(populate); // mapped by its first id's owner
         }
-        let o = (n > 16).then(|| top.fetch_add(nw, Relaxed)).unwrap_or(0);
-        if ids.0 as usize >= buckets.len() * 3 / 8 * 7 || o + nw > long.len() {
+        if ids.0 as usize >= limit(buckets.len()) {
             next.store(u32::MAX / 2, Relaxed);
-            w.fetch_xor((BUSY as u64) << shift, Release);
             return Some(0);
         }
-        k.1[j][0].store(r.0[0], Relaxed);
-        k.1[j][1].store(if n > 16 { LONG | o as u64 } else { r.0[1] }, Relaxed);
-        if n > 16 {
-            long[o].store(n as u64, Relaxed);
-            (1..nw).for_each(|i| long[o + i].store(kw(b, r.1, n, i), Relaxed));
+        match k.0[j].compare_exchange(0, fp | (ids.0 + 1) as u64, AcqRel, Acquire) {
+            Ok(_) => (ids.0 += 1, Some(ids.0 - 1)).1,
+            Err(x) => (x & !IDS == fp).then(|| (x & IDS) as u32 - 1),
         }
-        let hdr = r.3 as u32 | (ids.0 + 1) << 14;
-        w.fetch_xor(((BUSY ^ hdr) as u64) << shift, Release);
-        ids.0 += 1;
-        Some(ids.0 - 1)
     }
 
     /// The queued words are fetched for writing first, so their cache misses overlap.
     fn apply(&self, q: &[u32; 64], len: &mut usize, r: usize) {
         for &x in &q[..*len] {
-            let p = self.4.as_ptr().wrapping_add(x as usize >> 6) as *const i8;
+            let p = self.3.as_ptr().wrapping_add(x as usize >> 6) as *const i8;
             // SAFETY: a prefetch for write is only a hint and never faults.
             unsafe { _mm_prefetch(p, _MM_HINT_ET0) };
         }
-        let _lock = self.5[r].lock().unwrap();
+        let _lock = self.4[r].lock().unwrap();
         for &x in &q[..*len] {
-            let a = &self.4[(x >> 6) as usize];
+            let a = &self.3[(x >> 6) as usize];
             a.store(a.load(Relaxed) | 1 << (x & 63), Relaxed);
         }
         *len = 0;
     }
 }
 
-/// The slots of a bucket with headers h whose tag is `tag`, that are BUSY, and that are empty, as
-/// 3-bit masks (the fourth 32-bit lane of the two header words is not a slot and is masked off).
-fn lanes(h: [u64; 2], tag: u32) -> [u32; 3] {
-// SAFETY: register-only SSE2.
+/// Ids a dictionary of n buckets gives out before it counts as full (7 of every 8 slots).
+fn limit(n: usize) -> usize {
+    (n * 7).min(IDS as usize - 64)
+}
+
+/// The entries e of bucket k with e & mask == v, as an 8-bit mask.
+fn scan(k: &Bucket, v: u64, mask: u64) -> u32 {
+    // SAFETY: two aligned 32-byte loads of the 64-byte bucket; the rest is register-only AVX2. Another
+    // thread may be filling a slot meanwhile: each aligned 8-byte lane is read whole, and a slot
+    // only goes from 0 to its final value. A stale 0 can only send a lookup to `insert`, whose
+    // compare-exchange then sees the slot's real value.
     unsafe {
-        let h = _mm_set_epi64x(h[1] as i64, h[0] as i64); // the fourth header is always 0
-        let is = |x, v: u32| _mm_cmpeq_epi32(x, _mm_set1_epi32(v as i32));
-        let mask = |m| _mm_movemask_ps(_mm_castsi128_ps(m)) as u32 & 7;
-        let tags = _mm_and_si128(h, _mm_set1_epi32(0x3FFF));
-        [mask(is(tags, tag)), mask(is(h, BUSY)), mask(is(h, 0))]
+        let p = k.0.as_ptr() as *const __m256i;
+        let (m, v) = (_mm256_set1_epi64x(mask as i64), _mm256_set1_epi64x(v as i64));
+        let is = |x| {
+            let e = _mm256_cmpeq_epi64(_mm256_and_si256(x, m), v);
+            _mm256_movemask_pd(_mm256_castsi256_pd(e))
+        };
+        (is(_mm256_load_si256(p)) | is(_mm256_load_si256(p.add(1))) << 4) as u32
     }
 }
 
-/// A parsed record waiting for its lookups: the name's first 16 bytes (zero-padded), start, length,
-/// and bucket << 32 | tag; the region, id and amount; the name's and the note's bytes unescaped.
+/// Fingerprint (bits 20.. of the dictionary entry, bit 63 set) and bucket (of n) of the name
+/// b[s..s + len]: AES rounds over len and the name's bytes, 32 at a time and zero-padded past its
+/// end. The raw (still escaped) name is hashed: escaping is a bijection, and `""` and an empty
+/// unquoted field both give the empty name.
+fn hash(b: &[u8], s: usize, len: usize, n: usize) -> (u64, usize) {
+// SAFETY: 32-byte loads from s stay in the padded buffer (a name ends before its record's LF, and at
+// least 128 zero bytes follow a piece); the rest is register-only AVX2/AES. The round keys are the
+// first hex digits of pi.
+    unsafe {
+        let iota = _mm256_setr_epi8(
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31,
+        );
+        let r = _mm_set_epi64x(0x243F_6A88_85A3_08D3, 0x1319_8A2E_0370_7344);
+        let (mut h, mut i) = (_mm_cvtsi64_si128(len as i64), 0);
+        loop {
+            let v = _mm256_loadu_si256(b.as_ptr().add(s + i) as *const __m256i);
+            let keep = _mm256_cmpgt_epi8(_mm256_set1_epi8((len - i).min(32) as i8), iota);
+            let v = _mm256_and_si256(v, keep);
+            h = _mm_aesenc_si128(_mm_xor_si128(h, _mm256_castsi256_si128(v)), r);
+            h = _mm_aesenc_si128(_mm_xor_si128(h, _mm256_extracti128_si256(v, 1)), r);
+            i += 32;
+            if i >= len {
+                break;
+            }
+        }
+        let h = _mm_aesenc_si128(h, r);
+        let (lo, hi) = (_mm_cvtsi128_si64(h) as u64, _mm_extract_epi64(h, 1) as u64);
+        (lo & !IDS | 1 << 63, ((hi >> 32) * n as u64 >> 32) as usize)
+    }
+}
+
+/// A parsed record waiting for its lookups: the name's fingerprint and bucket; the region, id and
+/// amount; the name's and the note's bytes unescaped.
 #[derive(Clone, Copy, Default)]
-struct Rec([u64; 2], usize, usize, u64, usize, i64, i64, i64, i64);
+struct Rec(u64, usize, usize, i64, i64, i64, i64);
 
 /// The record b[rs..=lf] (lf is its terminating LF; `quotes` quotes lie in between). Its fields
 /// are found by the shape of a record, `[BOM] id , name , note , region , amount [CR] LF`:
@@ -341,31 +338,20 @@ fn record(b: &[u8], rs: usize, lf: usize, quotes: u32, sh: &Shared) -> Rec {
     let quoted = (at(b, c0 + 1) == b'"') as usize;
     let s = c0 + 1 + quoted;
     let (n, tq) = (c1 - s - quoted, (quotes - nq) as usize); // tq: the note's quotes
-    // The name's first 16 bytes, zero-padded, and a hash of them and n (two AES rounds).
-// SAFETY: a 16-byte load at s stays in the padded buffer; the rest is register-only AES/SSE2.
-// The AES round keys are the first hex digits of pi. Bytes past n are masked to zero.
-    let (key, h) = unsafe {
-        let iota = _mm_set_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
-        let v = _mm_loadu_si128(b.as_ptr().add(s) as *const __m128i);
-        let k = _mm_and_si128(v, _mm_cmpgt_epi8(_mm_set1_epi8(n.min(16) as i8), iota));
-        let r = _mm_set_epi64x(0x243F_6A88_85A3_08D3, 0x1319_8A2E_0370_7344);
-        let h = _mm_aesenc_si128(_mm_xor_si128(k, _mm_cvtsi64_si128(n as i64)), r);
-        let h = _mm_cvtsi128_si64(_mm_aesenc_si128(h, r)) as u64;
-        (std::mem::transmute(k), h)
-    };
-    // bucket = (high 32 bits of the hash * bucket count) >> 32, kept in bits 32..; tag = 13 hash bits
-    // plus a set bit 13, so that no header is 0 (empty) or BUSY.
-    let h = (h >> 32) * sh.1.len() as u64 & !0xFFFF_FFFF | h & 0x1FFF | 0x2000; // bucket, tag
-    let (k, region) = (h as usize >> 32, region as usize);
-    // SAFETY: k < sh.1.len() by the range reduction above, and a prefetch never faults anyway.
+    let (fp, k) = hash(b, s, n, sh.1.len());
+    let region = region as usize;
+    // SAFETY: k < sh.1.len() by the range reduction in `hash`, and a prefetch never faults anyway.
     unsafe { _mm_prefetch(sh.1.as_ptr().add(k) as *const i8, _MM_HINT_T0) }; // the name's bucket
     // SAFETY: a prefetch never faults, even for a region id past the table (wrapping_add).
     unsafe { _mm_prefetch(sh.0.as_ptr().wrapping_add(region) as *const i8, _MM_HINT_T0) };
     let nb = (n + quoted - nq as usize / 2) as i64;
     let tb = (c2 - c1 - 1 - tq / 2 - (tq > 0) as usize) as i64;
     let cents = if neg > 0 { -v } else { v };
-    Rec(key, s, n, h, region, id, cents, nb, tb)
+    Rec(fp, k, region, id, cents, nb, tb)
 }
+
+/// 2 MB pages at the start of the dictionary and bits mapping (see `run`).
+const HOT: usize = 2;
 
 /// Bytes of records.csv read at a time into a thread's buffer, which stays in its cache. The parse
 /// does not map the file: no page-table entries to fault in while reading, none to tear down at
@@ -431,7 +417,7 @@ fn read(f: &File, len: usize, from: usize, to: usize, sh: &Shared, me: &mut Loca
 fn flush(b: &[u8], batch: &[Rec], sh: &Shared, (agg, ids, (q, len), _): &mut Local) {
     for r @ &Rec(.., region, id, cents, nb, tb) in batch {
         let g = sh.0.get(region).map_or(0, |g| g.load(Relaxed)) as usize;
-        let name = sh.id(b, r, ids);
+        let name = sh.id(r, ids);
         let a = &mut agg[g];
         (a[0], a[1], a[2], a[3]) = (a[0] + 1, a[1] + id, a[2] + cents, a[3].min(cents));
         (a[4], a[5], a[6]) = (a[4].max(cents), a[5] + nb, a[6] + tb);
@@ -475,8 +461,8 @@ fn jobs(next: &AtomicUsize, n: usize) -> impl Iterator<Item = usize> + '_ {
 /// share of the dictionary, then wait for each other: one round of thread starts, not two.
 fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) -> Option<Vec<Agg>> {
     let threads = if round > 0 { 1 } else { threads };
-// cap buckets: 3 << 14 = 49,152 (3.1 MB) in the parallel round, 4 times larger in a redo.
-    let cap = 3 << (14 + 2 * round);
+// cap buckets: 1 << 14 = 16,384 (1 MB) in the parallel round, 4 times larger in a redo.
+    let cap = 1 << (14 + 2 * round);
     (round > 0).then(|| eprintln!("warning: parallel run rejected; attempt {round} on 1 thread"));
 // 48 ranges per thread balance the tail (PERF.md mechanism 10: 8 per thread cost 51.6 against 49.4 ms).
     let k = if threads > 1 { threads * 48 } else { 1 };
@@ -486,20 +472,19 @@ fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) ->
     let len = f.metadata().unwrap().len() as usize;
     let from = find(&head[..n], 0, b'\n') + 1;
     let cut = |j: usize| from + (len - from) * j / k; // job j's records start at or after cut(j)
-    // The dictionary, then the bits (a page per 4096 ids), in one mapping. Its first 6 MB are on 2 MB
-    // pages, so random reads there need no page walks; at full scale all of it is used (the
+    // The dictionary, then the bits (a page per 4096 ids), in one mapping. Its first HOT * 2 MB are
+    // on 2 MB pages, so random reads there need no page walks; at full scale all of it is used (the
     // dictionary, and the bits of the first 98,304 names), so they cost no memory.
-    let n = (cap * 3 / 8 * 7 / 4096 + 1) * 256 * 64;
+    let n = (limit(cap) / 4096 + 1) * 256 * 64;
     let hot = zeroed::<AtomicU64>(cap * 8 + n);
-    // SAFETY: the first 6 MB of `hot` (three 2 MB pages) are inside the mapping.
-    unsafe { madvise(hot.as_ptr() as *mut u8, 6 << 20, 14) }; // MADV_HUGEPAGE
+    // SAFETY: the first HOT * 2 MB of `hot` are inside the mapping (1 MB of buckets, then 3.6 MB of bits).
+    unsafe { madvise(hot.as_ptr() as *mut u8, HOT << 21, 14) }; // MADV_HUGEPAGE
     let (buckets, bits) = hot.split_at(cap * 8);
     // SAFETY: `Bucket` is 64 bytes of atomics (8 u64), cap * 8 words were split off above, the region
     // is 2 MB aligned (so 64-byte aligned), and zero is a valid (empty) bucket.
     let buckets = unsafe { std::slice::from_raw_parts(buckets.as_ptr() as *const Bucket, cap) };
     let locks = (0..64).map(|_| Mutex::new(())).collect();
-    let dict = (buckets, zeroed(1 << 23), (0.into(), 0.into()));
-    let sh = Shared(tab, dict.0, dict.1, dict.2, bits, locks);
+    let sh = Shared(tab, buckets, 0.into(), bits, locks);
     let ends: Vec<[AtomicUsize; 2]> = (0..k).map(|_| Default::default()).collect();
     let bufs = zeroed::<u8>(threads * (PIECE + 192)); // one buffer per thread (see `read`)
     let (next, me) = (AtomicUsize::new(0), AtomicUsize::new(0));
@@ -508,8 +493,8 @@ fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) ->
         let t = me.fetch_add(1, Relaxed); // this thread's buffer, and 2 MB page to map
         // One thread maps each 2 MB page: threads racing to fault one in would each clear and charge
         // a 2 MB page, and all but one would then free theirs.
-// Threads 0, 1, 2 take one 2 MB page each (1 << 18 words); the others get an empty range.
-        populate(&hot[t.min(3) << 18..(t + 1).min(3) << 18]);
+// Threads 0..HOT take one 2 MB page each (1 << 18 words); the others get an empty range.
+        populate(&hot[t.min(HOT) << 18..(t + 1).min(HOT) << 18]);
         pre();
         wait.wait();
         // Disjoint per-thread slice of `bufs`, which only this thread reads or writes from here on.
@@ -522,7 +507,7 @@ fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) ->
         }
         (0..64).for_each(|r| sh.apply(&me.2 .0[r], &mut me.2 .1[r], r));
         wait.wait(); // all bits are on: each thread counts them in its share of the used pages
-        let w = (sh.3 .1.load(Relaxed) as usize + 4095 >> 12).min(bits.len() >> 14) << 14;
+        let w = (sh.2.load(Relaxed) as usize + 4095 >> 12).min(bits.len() >> 14) << 14;
         for i in w * t / threads..w * (t + 1) / threads {
             me.0[i >> 6 & 255][7] += bits[i].load(Relaxed).count_ones() as i64;
         }
@@ -531,7 +516,7 @@ fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) ->
             (s[4], s[5], s[6], s[7]) = (s[4].max(x[4]), s[5] + x[5], s[6] + x[6], s[7] + x[7]);
         }
     });
-    let overfull = sh.3 .1.load(Relaxed) as usize >= cap * 3 / 8 * 7;
+    let overfull = sh.2.load(Relaxed) as usize >= limit(cap);
     let proved = (1..k).all(|j| ends[j - 1][1].load(Relaxed) == ends[j][0].load(Relaxed));
     (proved && !overfull).then(|| total.into_inner().unwrap().to_vec())
 }
