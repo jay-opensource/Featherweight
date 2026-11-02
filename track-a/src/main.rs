@@ -146,13 +146,12 @@ fn same(p: *const u8, q: *const u8, n: usize) -> bool {
     }
 }
 
-/// The number whose decimal digits are the low nibbles of v's bytes, most significant digit in the
+/// The number whose decimal digits are v's bytes (each 0 to 9), most significant digit in the
 /// lowest byte (empty bytes at the bottom read as leading zeros). Each multiply joins neighbouring
 /// groups: 2561 = 10 << 8 | 1 pairs digits, 6553601 = 100 << 16 | 1 pairs the pairs, and
 /// 42949672960001 = 10000 << 32 | 1 joins the quads into the final value.
 #[inline(always)]
 fn swar(v: u64) -> u32 {
-    let v = v & 0x0F0F_0F0F_0F0F_0F0F;
     let v = v.wrapping_mul(2561) >> 8 & 0x00FF_00FF_00FF_00FF;
     let v = v.wrapping_mul(6553601) >> 16 & 0x0000_FFFF_0000_FFFF;
     (v.wrapping_mul(42949672960001) >> 32) as u32
@@ -171,8 +170,8 @@ fn long(b: &[u8], i: usize) -> (u32, usize) {
 /// whole lines, so a compare reads one line for most names, and never bytes another thread may be
 /// writing. Ids start at 1, so no record is 0.
 struct Names {
-    slots: Box<[AtomicU64; SLOTS]>,
-    keys: Box<[AtomicU64; 2048]>, // by id: the copy's offset in `text` << 8 | the name's length
+    slots: [AtomicU64; SLOTS], // inline, so a probe needs no pointer load first
+    keys: [AtomicU64; 2048], // by id: the copy's offset in `text` << 8 | the name's length
     next: Mutex<(usize, usize)>, // ids handed out, and where the next copy goes
     text: *mut u8,
 }
@@ -516,8 +515,8 @@ fn main() {
     let threads = std::thread::available_parallelism().map_or(1, |p| p.get());
     let threads = std::env::var("FW_THREADS").map_or(threads, |v| v.parse().unwrap());
     let b = map("/data/requests.log");
-    let slots = Box::new([const { AtomicU64::new(0) }; SLOTS]);
-    let keys = Box::new([const { AtomicU64::new(0) }; 2048]);
+    let slots = [const { AtomicU64::new(0) }; SLOTS];
+    let keys = [const { AtomicU64::new(0) }; 2048];
     // `text` holds the name copies: 128 bytes per possible id, the padded size of a 125-byte endpoint.
     let names = Names { slots, keys, next: Mutex::new((0, 0)), text: anon(2048 * 128) };
     // Any hour may hold every line (two words each at worst) plus a partly filled block per thread.

@@ -7,9 +7,10 @@
 //! Pipeline (`main`; every stage runs on a pool of scoped threads via `par`):
 //! 1. Parse + build (`csr`, `finish`): the text is parsed once, in byte ranges, into a compact CSR
 //!    built in buckets of 8,192 nodes, so every random access stays in a small region.
-//! 2. Relabel (`bfs_order`): nodes are renumbered in breadth-first order, so neighbours in the road
-//!    network are neighbours in memory; the graph is rebuilt with the new ids by the same builder,
-//!    then the reverse graph is built from it into the first graph's already-mapped edge array.
+//! 2. Relabel (`bfs_order`, `relabel`): nodes are renumbered in breadth-first order, so neighbours
+//!    in the road network are neighbours in memory. The BFS copies each node's slots as it visits
+//!    it; one pass then moves them into the first graph's already-mapped edge array with the new
+//!    ids, and the reverse graph is built from the result by the same builder as in step 1.
 //! 3. Queries (`bidir`, `step`): a two-ended Dijkstra per query, farthest pairs first, with labels
 //!    in small per-thread pages (`Pages`) and a Dial bucket queue (`Dial`) per side. Rare queries
 //!    that need edges of weight W or more or 32-bit overflow fall back to `via`, then `plain`.
@@ -160,18 +161,16 @@ impl Graph {
     }
 }
 
-/// A work item of an edge stream: `each(fill, emit)` calls emit(u, v, w) for each of its edges
-/// (`fill`: the caller uses v; if not, an item may instead call emit(u, MAX, slots) once per node
-/// u, with all of u's slots). A trait (not a closure taking a `dyn` emitter) so that the emitter
-/// is inlined into the parsing loop.
+/// A work item of an edge stream: `each(emit)` calls emit(u, v, w) for each of its edges. A trait
+/// (not a closure taking a `dyn` emitter) so that the emitter is inlined into the parsing loop.
 trait Edges: Sync {
-    fn each(&self, fill: bool, emit: impl FnMut(usize, u32, u32));
+    fn each(&self, emit: impl FnMut(usize, u32, u32));
 }
 
 /// The lines of the graph text that start at a byte in lo..hi (a line that starts before lo and
 /// ends inside it belongs to the item before).
 impl Edges for (&[u8], usize, usize) {
-    fn each(&self, _: bool, mut emit: impl FnMut(usize, u32, u32)) {
+    fn each(&self, mut emit: impl FnMut(usize, u32, u32)) {
         let (b, lo, hi) = *self;
         let mut i = (lo..hi).find(|&p| p == 0 || b[p - 1] == 10).unwrap_or(hi); // 10: LF
         while i < hi {
@@ -181,22 +180,11 @@ impl Edges for (&[u8], usize, usize) {
     }
 }
 
-/// The edges u -> v of nodes lo..hi of a graph: as id[u] -> id[v] (relabelled), or as v -> u
-/// (reversed) if `id` is empty. Relabelled, a count only needs node u's slot count: one per node.
-impl Edges for ((&Graph, &[u32]), usize, usize) {
-    fn each(&self, fill: bool, mut emit: impl FnMut(usize, u32, u32)) {
-        let ((g, id), lo, hi) = *self;
-        for u in lo..hi {
-            match id.get(u) {
-                Some(&x) if !fill => emit(x as usize, !0, (g.off(u + 1) - g.off(u)) as u32),
-                Some(&x) => {
-                    // the new ids of the targets of node u + 8 (random reads)
-                    g.adj((u + 8).min(hi - 1), |v, _| prefetch(&id[v as usize]));
-                    g.adj(u, |v, w| emit(x as usize, ld(id, v as usize), w))
-                }
-                None => g.adj(u, |v, w| emit(v as usize, u as u32, w)),
-            }
-        }
+/// The edges u -> v of nodes lo..hi of a graph, reversed: as v -> u.
+impl Edges for (&Graph, usize, usize) {
+    fn each(&self, mut emit: impl FnMut(usize, u32, u32)) {
+        let (g, lo, hi) = *self;
+        (lo..hi).for_each(|u| g.adj(u, |v, w| emit(v as usize, u as u32, w)));
     }
 }
 
@@ -210,9 +198,9 @@ impl Edges for ((&Graph, &[u32]), usize, usize) {
 ///    the bucket's first slot, and reorder the bucket's ~94 KB of slots by node through a scratch
 ///    copy. Offsets come in blocks of 16 nodes (a u32 base each, u8 offsets inside); if an
 ///    in-block offset does not fit, they are laid out again with smaller blocks (the slots stay).
-/// Nothing is locked, and no store lands outside the bucket being worked on. `bf` is Ok([the edge
-/// array of a graph dropped by the caller with exactly as many slots: its pages are already
-/// mapped, every slot is written; the counts of step 1, which is skipped]), or Err(est). If est > 0
+/// Nothing is locked, and no store lands outside the bucket being worked on. `bf` is Ok([an edge
+/// array with exactly as many slots, every one of them written; the counts of step 1, which is
+/// skipped]), or Err(est). If est > 0
 /// (the expected slot count), step 1 is skipped too: each item gets room for its share of est in
 /// each bucket plus 6 standard deviations (the text is parsed once), the unused room is holes
 /// (place 0), and the finish packs the slots (see there). A segment that would overflow starts it
@@ -231,10 +219,7 @@ fn csr(n: usize, t: usize, vb: u32, it: &[impl Edges], bf: Result<[Vec<u32>; 2],
             // SAFETY: item i owns the counters i * nb..(i + 1) * nb of `cur` and one thread runs each item,
             // so the slice is not aliased. `(&cp).0` borrows the whole `Slots` so the closure stays `Sync`.
             let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
-            // v = MAX: w is all of node u's slots (see `Edges`)
-            it[i].each(false, |u, v, w| {
-                c[u >> BS] += [1 + (w >= esc) as u32, w][(v == !0) as usize]
-            });
+            it[i].each(|u, _, w| c[u >> BS] += 1 + (w >= esc) as u32);
         });
     }
     let (mut st, mut acc, mut end) = (vec![[0, 0]; nb + 1], 0u32, vec![0; ni * nb]);
@@ -253,7 +238,7 @@ fn csr(n: usize, t: usize, vb: u32, it: &[impl Edges], bf: Result<[Vec<u32>; 2],
     par(t, &(0..ni).collect::<Vec<_>>(), |&i| {
         // SAFETY: as in step 1 (item i alone uses its own counters).
         let c = unsafe { std::slice::from_raw_parts_mut((&cp).0.add(i * nb), nb) };
-        it[i].each(true, |u, v, w| {
+        it[i].each(|u, v, w| {
             let (b, l) = (u >> BS, (u & ((1 << BS) - 1)) as u16 + 1);
             if est > 0 && c[b] as usize + 1 + (w >= esc) as usize > end[i * nb + b] {
                 return ok.store(false, Relaxed);
@@ -289,17 +274,14 @@ const BS: u32 = 13;
 /// a hole), the first slot of each bucket with and without holes, and n, threads, vb.
 type Staged = (Vec<u32>, Vec<u16>, Vec<[usize; 2]>, usize, usize, u32);
 
-/// Step 3 of `csr`; also counts the reverse graph's slots into rc, if rc is not empty: rc[b * nb +
-/// (v >> BS)] for each edge u -> v of bucket b (step 1 of a build of the reverse graph whose items
-/// are single buckets). With holes, a bucket's packed slots start at or before its staged ones, over
+/// Step 3 of `csr`. With holes, a bucket's packed slots start at or before its staged ones, over
 /// the staged slots of earlier buckets: it writes them only once those buckets have copied theirs
 /// (buckets are taken in order, so it waits only for ones being worked on).
-fn finish(rc: &mut [u32], (edges, loc, st, n, threads, vb): Staged) -> Graph {
+fn finish((edges, loc, st, n, threads, vb): Staged) -> Graph {
     let (nb, mut g) = ((n >> BS) + 1, Graph::default());
     (g.edges, g.vb, g.esc) = (edges, vb, u32::MAX >> vb);
     let ep = Slots(g.edges.as_mut_ptr());
     let copied = Vec::from_iter((0..nb).map(|_| AtomicBool::new(false)));
-    let cp = Slots(rc.as_mut_ptr());
 // Try blocks of 2^4 = 16 nodes first; if an in-block offset does not fit a u8, lay out again with
 // half-size blocks (the slots stay where they are).
     for sh in (0..=4).rev() {
@@ -312,14 +294,6 @@ fn finish(rc: &mut [u32], (edges, loc, st, n, threads, vb): Staged) -> Graph {
             // is set, and packed writes into any earlier bucket's staged range wait for that flag (below).
             let e = unsafe { std::slice::from_raw_parts((&ep).0.add(s0), s1 - s0) }.to_vec();
             copied[b].store(true, Release);
-            let (mut j, row, esc) = (0, (&cp).0.wrapping_add(b * nb), u32::MAX >> vb);
-            let end = if sh == 4 && rc.len() > 0 { e.len() } else { 0 };
-            while j < end {
-                let (x, k) = (ld(&e, j), 1 + (ld(&e, j) >> vb == esc) as usize);
-                // SAFETY: row b of `rc` (nb counters) is written only by bucket b's thread; the index is < nb.
-                unsafe { *row.add(((x & (1 << vb) - 1) >> BS) as usize) += k as u32 };
-                j += k;
-            }
             let mut at = vec![0u32; (n + 1 - k0).min(1 << BS)];
             for &l in &loc[s0..s1] {
                 at.get_mut(l as usize - 1).map(|a| *a += 1); // not a hole
@@ -357,50 +331,157 @@ fn finish(rc: &mut [u32], (edges, loc, st, n, threads, vb): Staged) -> Graph {
     unreachable!()
 }
 
-/// Breadth-first relabelling, in parallel: each thread grows its own region from a seed in its
-/// slice of the id range (claiming nodes with a CAS) and re-seeds from that slice when its region
-/// is enclosed. New ids follow one region's visit order, then the next region's, and so on.
-fn bfs_order(g: &Graph, n: usize, threads: usize) -> Vec<u32> {
-    // One claim bit per node (218 KB, cache-resident); the ids are written once, at the end.
-    // id: allocated below the lists (freed first, so the heap gives their pages back), written last.
-    let (mut id, lists) = (vec![0u32; n], std::sync::Mutex::new(Vec::new()));
+/// A query: source and target.
+type Q = (usize, usize);
+
+/// One BFS region: its node count, (index, slot count) for its nodes of 255 slots or more, and its
+/// slot total.
+type Region = (usize, Vec<(usize, u32)>, usize);
+
+/// Breadth-first relabelling, in parallel, fused with the copy of the graph: item j grows a
+/// region from a seed in its slice of the id range (claiming nodes with one bit each) and re-seeds
+/// from that slice when its region is enclosed. A node gets its id when it is claimed (item j's
+/// k-th claim: j << vb | k, made final by `relabel`). When it is dequeued, its slots, in cache from
+/// claiming its neighbours, are appended verbatim (old targets) to item j's segment, and their
+/// count to its counts. New ids follow one region's visit order, then the next region's (the
+/// regions replace the relabel builder's 30 MB of staging, the process's memory peak until then).
+/// All of it is in one scratch array, freed at once (only the pages written are charged): item
+/// j's segment at j * cap (cap: g's slot count + 8), the n ids at t * cap, then item j's counts, a
+/// byte per node, at t * cap + n + j * (n / 4 + 1).
+fn bfs_order(g: &Graph, n: usize, threads: usize) -> (Vec<u32>, Vec<Region>) {
+    let (cap, dn) = (g.edges.len() + 8, n / 4 + 1);
+    let regs = std::sync::Mutex::new(vec![Region::default(); threads]);
+    let mut seg = vec![0u32; threads * (cap + dn) + n];
+    let items = Vec::from_iter((0..threads).map(|j| (j, j * n / threads, (j + 1) * n / threads)));
+    // One claim bit per node (218 KB, cache-resident).
     let bits = Vec::from_iter((0..=n / 64).map(|_| AtomicU64::new(0)));
-    let claim = |&v: &usize| {
+    let claim = |v: usize| {
         let (b, m) = (&bits[v / 64], 1 << v % 64);
         b.load(Relaxed) & m == 0 && b.fetch_or(m, Relaxed) & m == 0
     };
-    par(threads, &spans((), n, threads), |&(_, mut sc, e)| {
-        let (mut list, mut head) = (Vec::with_capacity(n), 0); // only touched pages are charged
+    let (sp, ip) = (Slots(seg.as_mut_ptr()), Slots(seg[threads * cap..].as_mut_ptr()));
+    par(threads, &items, |&(j, mut sc, e)| {
+        let (mut q, mut k, mut r) = (std::collections::VecDeque::new(), 0, Region::default());
+        let dp = ((&sp).0 as *mut u8).wrapping_add(4 * (threads * cap + n + j * dn));
+        let mut push = |v: usize, q: &mut std::collections::VecDeque<u32>| {
+            // SAFETY: the claim bit makes this the only write to id[v].
+            unsafe { *(&ip).0.add(v) = (j << g.vb | k) as u32 };
+            (k, _) = (k + 1, q.push_back(v as u32));
+        };
         loop {
-            if head == list.len() {
-                let Some(s) = (sc..e).find(claim) else { break };
-                (sc, _) = (s + 1, list.push(s as u32));
-            }
             // Software pipeline over the queue: offsets 16 nodes ahead, edge lists 8 ahead, so
             // the misses of upcoming nodes overlap (the claim bits stay in cache).
-            if let Some(&w) = list.get(head + 16) {
+            if let Some(&w) = q.get(16) {
                 prefetch(&g.rel[w as usize]);
                 prefetch(&g.base[w as usize >> g.sh]);
             }
-            if let Some(&w) = list.get(head + 8) {
+            if let Some(&w) = q.get(8) {
                 prefetch(g.edges.as_ptr().wrapping_add(g.off(w as usize)));
             }
-            let u = list[head] as usize;
-            head += 1;
-            g.adj(u, |v, _| _ = claim(&(v as usize)).then(|| list.push(v)));
+            let Some(u) = q.pop_front().map(|u| u as usize) else {
+                let Some(s) = (sc..e).find(|&v| claim(v)) else { break };
+                (sc, _) = (s + 1, push(s, &mut q));
+                continue;
+            };
+            g.adj(u, |v, _| _ = claim(v as usize).then(|| push(v as usize, &mut q)));
+            let (a, b) = (g.off(u), g.off(u + 1));
+            // SAFETY: item j alone writes its segment (room for all of g's slots, plus 8: a list of up to 8
+            // slots is copied as 8) and its counts.
+            unsafe {
+                let (x, y) = (g.edges.as_ptr().add(a), (&sp).0.add(j * cap + r.2));
+                match b - a <= 8 && a + 8 <= g.edges.len() {
+                    true => y.cast::<[u32; 8]>().write_unaligned(x.cast::<[u32; 8]>().read_unaligned()),
+                    false => std::ptr::copy_nonoverlapping(x, y, b - a),
+                }
+                *dp.add(r.0) = (b - a).min(255) as u8;
+            }
+            (b - a >= 255).then(|| r.1.push((r.0, (b - a) as u32)));
+            (r.0, r.2) = (r.0 + 1, r.2 + b - a);
         }
-        lists.lock().unwrap().push(list);
+        regs.lock().unwrap()[j] = r;
     });
-    let (lists, ip) = (lists.into_inner().unwrap(), Slots(id.as_mut_ptr()));
-    par(threads, &(0..lists.len()).collect::<Vec<_>>(), |&j| {
-        let start = lists[..j].iter().map(|l| l.len()).sum::<usize>();
-        for (i, &v) in lists[j].iter().enumerate() {
-            // SAFETY: every node was claimed by exactly one thread (the bit set), so it is in exactly one
-            // list and this is the only write to id[v].
-            unsafe { *(&ip).0.add(v as usize) = (start + i) as u32 };
+    (seg, regs.into_inner().unwrap())
+}
+
+/// Offsets for nodes 0..=n with cnt(k) slots each, in the largest blocks (16 nodes on these
+/// graphs) whose in-block offsets fit a u8: blocks are laid out in parallel, then their bases summed.
+fn layout(n: usize, t: usize, vb: u32, cnt: impl Fn(usize) -> u32 + Sync) -> Graph {
+    for sh in (0..=4).rev() {
+        let (mut rel, mut base) = (vec![0u8; n + 1], vec![0u32; (n >> sh) + 2]);
+        let (rp, bp, ok) = (Slots(rel.as_mut_ptr()), Slots(base.as_mut_ptr()), AtomicBool::new(true));
+        par(t, &spans((), (n >> sh) + 1, t * 4), |&(_, lo, hi)| {
+            for b in lo..hi {
+                let mut acc = 0;
+                for k in b << sh..(b + 1 << sh).min(n + 1) {
+                    (acc > 255).then(|| ok.store(false, Relaxed));
+                    // SAFETY: block b (its rel entries and base[b + 1]) belongs to this item alone.
+                    unsafe { *(&rp).0.add(k) = acc as u8 };
+                    acc += cnt(k);
+                }
+                unsafe { *(&bp).0.add(b + 1) = acc };
+            }
+        });
+        if ok.into_inner() || sh == 0 {
+            (1..base.len()).for_each(|b| base[b] += base[b - 1]);
+            return Graph { edges: vec![], base, rel, sh, vb, esc: u32::MAX >> vb };
+        }
+    }
+    unreachable!()
+}
+
+/// The relabelled graph from the BFS scratch `seg` (see `bfs_order`), in `edges` (g's array, the
+/// same slot count): the final ids (region j's k-th node: the earlier regions' sizes plus k), with
+/// the queries mapped through them, offsets from the slot counts, then per bucket of 8192 nodes a
+/// copy of its slots from the segments with every target rewritten. The copy also counts the
+/// reverse graph's slots, rc[b * nb + (v >> BS)] for each edge u -> v of bucket b (step 1 of a
+/// build of the reverse graph whose items are buckets).
+fn relabel(edges: Vec<u32>, seg: &mut [u32], regs: &[Region], qs: &mut [Q], rc: &mut [u32], vb: u32) -> Graph {
+    let (t, cap, esc, mask) = (regs.len(), edges.len() + 8, u32::MAX >> vb, (1 << vb) - 1);
+    let (seg, rest) = seg.split_at_mut(t * cap);
+    let (n, mut rb, mut sb) = (regs.iter().map(|r| r.0).sum(), vec![0], vec![0]); // first id, slot
+    for r in regs {
+        (rb.push(rb.last().unwrap() + r.0), sb.push(sb.last().unwrap() + r.2));
+    }
+    let (id, deg) = rest.split_at_mut(n);
+    let (id, dn) = (&*id, n / 4 + 1);
+    let fin = |v: usize| rb[ld(id, v) as usize >> vb] + (ld(id, v) & mask) as usize; // v's final id
+    qs.iter_mut().for_each(|q| *q = (fin(q.0), fin(q.1)));
+    // SAFETY: u32 to u8 (the same bytes, no padding), so `align_to` gives the counts as bytes.
+    let deg = unsafe { deg.align_to::<u8>().1 };
+    let big: std::collections::HashMap<_, _> =
+        (regs.iter().zip(&rb)).flat_map(|(r, &b)| r.1.iter().map(move |&(k, c)| (b + k, c))).collect();
+    let mut g = layout(n, t, vb, |k| {
+        let j = rb.partition_point(|&b| b <= k) - 1; // k's region (k = n: the sentinel, 0 slots)
+        match (k < n).then(|| deg[4 * j * dn + k - rb[j]]) {
+            Some(255) => big[&k],
+            d => d.unwrap_or(0) as u32,
         }
     });
-    id
+    g.edges = edges;
+    let (ep, cp, nb) = (Slots(g.edges.as_mut_ptr()), Slots(rc.as_mut_ptr()), (n >> BS) + 1);
+    par(t, &(0..nb).collect::<Vec<_>>(), |&b| {
+        let (lo, hi, row) = (b << BS, n.min(b + 1 << BS), (&cp).0.wrapping_add(b * nb));
+        for j in 0..t {
+            let (a, z) = (lo.max(rb[j]), hi.min(rb[j + 1]));
+            // region j's nodes a..z: slots g.off(a).. of the graph, at d + those in the segments
+            let (mut s, e, d) = (g.off(a), g.off(z.max(a)), j * cap - sb[j]);
+            while s < e {
+                if let Some(&x) = seg.get(s + d + 16) {
+                    prefetch(id.as_ptr().wrapping_add((x & mask) as usize)); // random reads
+                }
+                let (x, k) = (ld(seg, s + d), 1 + (ld(seg, s + d) >> vb == esc) as usize);
+                let y = fin((x & mask) as usize) as u32;
+                // SAFETY: bucket b alone writes its nodes' slots, and row b of `rc` (nb counters).
+                unsafe {
+                    *(&ep).0.add(s + k - 1) = ld(seg, s + d + k - 1); // the full weight, if escaped
+                    *(&ep).0.add(s) = y | x & !mask;
+                    *row.add((y >> BS) as usize) += k as u32;
+                }
+                s += k;
+            }
+        }
+    });
+    g
 }
 
 /// Buckets per queue: the search relaxes only edges lighter than W (see `bidir`). 8,192 is above
@@ -630,18 +711,15 @@ fn main() {
     let vb = (usize::BITS - (n.max(2) - 1).leading_zeros()).max(1);
     let k = threads * 4; // work items per pass
     let est = Err(m.min(tx.len() / 6)); // a line has at least 6 bytes
-    let g0 = finish(&mut [], csr(n, threads, vb, &spans(tx, tx.len(), k), est));
-    let newid = bfs_order(&g0, n, threads);
-    qs.iter_mut().for_each(|q| *q = (newid[q.0] as usize, newid[q.1] as usize));
-    let g = csr(n, threads, vb, &spans((&g0, &newid[..]), n, k), Err(0));
-    // Free the ids and g0's offsets first: the finish takes its memory from them. The reverse
-    // graph has exactly g0's slot count: it takes over g0's mapped edge pages.
-    let (buf, _) = ({ g0 }.edges, drop(newid));
-    // The relabelled finish counts the reverse graph's slots, for items of one bucket each.
+    let g0 = finish(csr(n, threads, vb, &spans(tx, tx.len(), k), est));
+    let (mut seg, regs) = bfs_order(&g0, n, threads);
+    // The relabelled graph takes over g0's mapped edge array (g0's offsets are freed first, for its
+    // own), maps the queries and counts the reverse graph's slots, for items of one bucket each.
     let mut rc = vec![0; ((n >> BS) + 1).pow(2)];
-    let g = finish(&mut rc, g);
-    let rev = Vec::from_iter((0..=n >> BS).map(|b| ((&g, &[][..]), b << BS, n.min(b + 1 << BS))));
-    let r = finish(&mut [], csr(n, threads, vb, &rev, Ok([buf, rc])));
+    let g = relabel({ g0 }.edges, &mut seg, &regs, &mut qs, &mut rc, vb);
+    drop(seg); // the BFS scratch goes back in one piece (one munmap)
+    let rev = Vec::from_iter((0..=n >> BS).map(|b| (&g, b << BS, n.min(b + 1 << BS))));
+    let r = finish(csr(n, threads, vb, &rev, Ok([vec![0; g.edges.len()], rc])));
 
     let ans: Vec<AtomicI64> = qs.iter().map(|_| AtomicI64::new(-1)).collect();
     let next = AtomicUsize::new(0);
