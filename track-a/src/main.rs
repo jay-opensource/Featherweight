@@ -77,11 +77,9 @@ fn anon<T>(len: usize) -> *mut T {
 /// MADV_DONTNEED the whole pages inside [p, p + len): unmapped now by this thread, not at exit.
 fn zap(p: *const u8, len: usize) {
     let (x, y) = ((p as usize + 4095) & !4095, (p as usize + len) & !4095);
-    if y > x {
-        // SAFETY: x..y lies inside the caller's range and is whole pages. 4 = MADV_DONTNEED; callers
-        // pass only data that nothing reads again (anonymous pages would read back as zeros).
-        unsafe { madvise(x as *mut u8, y - x, 4) };
-    }
+    // SAFETY: x..y lies inside the caller's range and is whole pages (an empty range if y <= x). 4 =
+    // MADV_DONTNEED; callers pass only data that nothing reads again (anonymous pages would read back as zeros).
+    unsafe { madvise(x as *mut u8, y.saturating_sub(x), 4) };
 }
 
 /// The input, mapped read-only (the page cache is not charged to us), followed by at least 4 KB of
@@ -165,8 +163,7 @@ fn swar(v: u64) -> u32 {
 #[cold]
 fn long(b: &[u8], i: usize) -> (u32, usize) {
     let k = b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
-    let x = b[i..i + k].iter().fold(0, |x, c| x * 10 + (c & 15) as u32);
-    (x, k)
+    (b[i..i + k].iter().fold(0, |x, c| x * 10 + (c & 15) as u32), k)
 }
 
 /// Endpoint interner shared by all threads. A slot is 0 or crc << 32 | len << 24 | id << 12 | at,
@@ -195,11 +192,10 @@ impl Names {
     /// A sort key in the byte order of the names: the first 32 bytes of the zero-padded copy (zero
     /// is below every endpoint byte, so a proper prefix still sorts first), then the whole name.
     fn key(&self, id: usize) -> (u128, u128, &[u8]) {
-        let k = self.keys[id].load(Acquire) as usize;
-        // SAFETY: as in `name`; a copy is padded to whole 64-byte lines, so 32 bytes are in bounds.
-        let p = unsafe { self.text.add(k >> 8) as *const [u8; 16] };
-        let be = |i| u128::from_be_bytes(unsafe { *p.add(i) });
-        (be(0), be(1), self.name(id))
+        let n = self.name(id);
+        // SAFETY: a copy is padded to whole 64-byte lines, so 32 bytes from its start are in bounds.
+        let be = |i| u128::from_be_bytes(unsafe { *(n.as_ptr() as *const [u8; 16]).add(i) });
+        (be(0), be(1), n)
     }
 
     /// Id (1..2047) of the endpoint name q[..n] with CRC32 `crc`, adding it if new. Linear probing
@@ -261,7 +257,7 @@ struct Pool {
 }
 // SAFETY: `base` and `stats` point into mappings that live for the whole run. Blocks are handed
 // out disjointly by an atomic counter, so each has one writer; an hour's stats table has one
-// writer (its summariser) and is read only after that hour's `bytes` entry is published.
+// writer (its summariser) and is read only after that hour's `sz` entry is published.
 unsafe impl Sync for Pool {}
 
 impl Pool {
@@ -273,13 +269,6 @@ impl Pool {
         unsafe { self.base.add(h * self.region + k * B) }
     }
 
-    /// All words of hour h's blocks, including the zeroed (id 0) tails of partly used ones. Call it
-    /// only when no thread is still writing hour h.
-    fn words(&self, h: usize) -> &[u32] {
-        let n = self.used[h].load(Relaxed) * B;
-        // SAFETY: n words are exactly the blocks handed out, all inside the region (see `block`).
-        unsafe { std::slice::from_raw_parts(self.base.add(h * self.region), n) }
-    }
 }
 
 /// Parse the lines in b[p..] into records (b ends with a chunk; the bytes after it stay mapped), and
@@ -364,15 +353,8 @@ fn digits(v: u32) -> usize {
     v.checked_ilog10().map_or(1, |l| l as usize + 1)
 }
 
-/// "00" to "99", as the two bytes of a little-endian u16.
-const PAIRS: [u16; 100] = {
-    let (mut t, mut i) = ([0; 100], 0);
-    while i < 100 {
-        t[i] = (b'0' as usize + i / 10 | (b'0' as usize + i % 10) << 8) as u16;
-        i += 1;
-    }
-    t
-};
+/// "00" to "99" as byte pairs.
+const PAIRS: &[u8; 200] = b"00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
 
 /// Write " v" at o + i, two digits at a time from the right, and return where it ends.
 /// SAFETY: the caller sized o's range for exactly these lines (`summarise` counts the same `digits`).
@@ -382,7 +364,7 @@ unsafe fn put(o: *mut u8, i: usize, mut v: u32) -> usize {
     *o.add(i) = b' ';
     while v >= 10 {
         j -= 2;
-        (o.add(j) as *mut u16).write_unaligned(PAIRS[(v % 100) as usize]);
+        o.add(j).copy_from_nonoverlapping(PAIRS.as_ptr().add((v % 100 * 2) as usize), 2);
         v /= 100;
     }
     if j > i + 1 {
@@ -408,8 +390,8 @@ fn pct(v: &mut [u32]) -> [u32; 3] {
 }
 
 /// The values at 0-based ranks r of v (at most 8K values) with no branch on the data: in AVX2
-/// lanes each value counts the values below (lt) and above (gt) it, and the value at rank r is one
-/// with lt <= r and gt <= n - 1 - r. Padding is u32::MAX, which can only match a maximum.
+/// lanes each value counts the values below (l) and above (g) it, and the value at rank r is one
+/// with l <= r and g <= n - 1 - r. Padding is u32::MAX, which can only match a maximum.
 #[inline(always)]
 fn ranks<const K: usize>(v: &[u32], r: [usize; 3]) -> [u32; 3] {
     let mut x = [i32::MAX; 32]; // values with the sign bit flipped: signed compares order them
@@ -421,19 +403,19 @@ fn ranks<const K: usize>(v: &[u32], r: [usize; 3]) -> [u32; 3] {
     unsafe {
         let (z, y) = (_mm256_setzero_si256(), x.as_ptr() as *const __m256i);
         let y: [__m256i; K] = std::array::from_fn(|q| _mm256_loadu_si256(y.add(q)));
-        let (mut lt, mut gt) = ([z; K], [z; K]);
+        let (mut l, mut g) = ([z; K], [z; K]);
         for &a in &x[..v.len()] {
             let a = _mm256_set1_epi32(a);
             for q in 0..K {
-                lt[q] = _mm256_sub_epi32(lt[q], _mm256_cmpgt_epi32(y[q], a));
-                gt[q] = _mm256_sub_epi32(gt[q], _mm256_cmpgt_epi32(a, y[q]));
+                l[q] = _mm256_sub_epi32(l[q], _mm256_cmpgt_epi32(y[q], a));
+                g[q] = _mm256_sub_epi32(g[q], _mm256_cmpgt_epi32(a, y[q]));
             }
         }
         r.map(|r| {
             let a = _mm256_set1_epi32(r as i32);
             let b = _mm256_set1_epi32((v.len() - 1 - r) as i32);
-            let miss = |q: usize| _mm256_or_si256(_mm256_cmpgt_epi32(lt[q], a), _mm256_cmpgt_epi32(gt[q], b));
-            let m = (0..K).fold(0, |m, q| m | (_mm256_movemask_ps(_mm256_castsi256_ps(miss(q))) as u32) << 8 * q);
+            let mi = |q| _mm256_or_si256(_mm256_cmpgt_epi32(l[q], a), _mm256_cmpgt_epi32(g[q], b));
+            let m = (0..K).fold(0, |m, q| m | (_mm256_movemask_ps(_mm256_castsi256_ps(mi(q))) as u32) << 8 * q);
             x[(!m).trailing_zeros() as usize] as u32 ^ 1 << 31
         })
     }
@@ -443,9 +425,13 @@ fn ranks<const K: usize>(v: &[u32], r: [usize; 3]) -> [u32; 3] {
 /// by endpoint, select p50, p95 and p99 per group, and give the records back to the kernel. Returns
 /// the size of the hour's output lines.
 fn summarise(pool: &Pool, names: &Names, h: usize, lat: &mut [u32]) -> usize {
-    // SAFETY: h < HOURS, and each hour is summarised by exactly one thread, which is the only writer
-    // of its stats table.
-    let (words, st) = (pool.words(h), unsafe { &mut *pool.stats.add(h) });
+    // All words of hour h's blocks, including the zeroed (id 0) tails of partly used ones; no thread
+    // is still writing hour h. SAFETY: n words are exactly the blocks handed out, all inside the
+    // region (see `Pool::block`); and h < HOURS, and each hour is summarised by exactly one thread,
+    // which is the only writer of its stats table.
+    let n = pool.used[h].load(Relaxed) * B;
+    let words = unsafe { std::slice::from_raw_parts(pool.base.add(h * pool.region), n) };
+    let st = unsafe { &mut *pool.stats.add(h) };
     // Per endpoint: count | errors << 32, and the next slot. They sit in front of `lat`, not on the
     // thread's stack, so they are unmapped with it before the output grows. 6144 words: cnt is
     // 2048 u64 (4096 words) and at is 2048 u32. SAFETY (the two casts below): cnt covers words
@@ -457,12 +443,11 @@ fn summarise(pool: &Pool, names: &Names, h: usize, lat: &mut [u32]) -> usize {
     for &w in words {
         cnt[(w & 2047) as usize] += 1 + ((w as u64 & 0x800) << 21);
     }
-    for id in 1..2048 {
+    for id in 0..2048 {
         at[id] = total;
         total += cnt[id] as u32;
     }
-    // Words of id 0 (escape words, the unused tails of blocks) land after the groups.
-    at[0] = total;
+    // Words of id 0 (escape words, the unused tails of blocks) land first, ahead of the groups.
     for (i, &w) in words.iter().enumerate() {
         // SAFETY: `Pool::block` keeps a spare word after the last block, so word i + 1 exists (it may
         // be a tail zero or the escape word of the next record).
@@ -473,7 +458,7 @@ fn summarise(pool: &Pool, names: &Names, h: usize, lat: &mut [u32]) -> usize {
         unsafe { *lat.get_unchecked_mut(*c as usize) = v };
         *c += 1;
     }
-    let (mut lo, mut size) = (0, 0);
+    let (mut lo, mut size) = (cnt[0] as u32 as usize, 0);
     for id in (1..2048).filter(|&id| cnt[id] > 0) {
         let (n, e) = (cnt[id] as u32, (cnt[id] >> 32) as u32);
         let [p50, p95, p99] = pct(&mut lat[lo..lo + n as usize]);
@@ -494,18 +479,16 @@ fn summarise(pool: &Pool, names: &Names, h: usize, lat: &mut [u32]) -> usize {
 /// Write hour h's lines, endpoints in byte order, at p.
 /// SAFETY: p has room for exactly these lines (their size came from `summarise`).
 unsafe fn write_hour(pool: &Pool, names: &Names, order: &[usize], h: usize, p: *mut u8) {
-    let (d, hh) = ((h + 18) / 24 + 30, (h + 18) % 24);
-    let (mo, d) = if d > 31 { (11, d - 31) } else { (10, d) };
+    // q = day of October minus 1 (hour 0 is Oct 30, 18:00): 31 days carry into November.
+    let (q, hh) = ((h + 18) / 24 + 29, (h + 18) % 24);
     let (st, mut i) = (&*pool.stats.add(h), 0);
-    let stamp = format!("2026-{mo}-{d:02}T{hh:02}:00:00Z ");
+    let stamp = format!("2026-{}-{:02}T{hh:02}:00:00Z ", 10 + q / 31, q % 31 + 1);
     for &id in order.iter().filter(|&&id| st[id][0] > 0) {
         let ([n, e, p50, p95, p99], k) = (st[id], names.name(id));
         p.add(i).copy_from_nonoverlapping(stamp.as_ptr(), 21);
         p.add(i + 21).copy_from_nonoverlapping(k.as_ptr(), k.len());
         i += 21 + k.len();
-        for v in [n, p50, p95, p99, e, ppm(e, n)] {
-            i = put(p, i, v);
-        }
+        [n, p50, p95, p99, e, ppm(e, n)].map(|v| i = put(p, i, v));
         *p.add(i) = b'\n';
         i += 1;
     }
@@ -519,10 +502,13 @@ fn main() {
     let threads = std::thread::available_parallelism().map_or(1, |p| p.get());
     let threads = std::env::var("FW_THREADS").map_or(threads, |v| v.parse().unwrap());
     let b = map("/data/requests.log");
-    let slots = [const { AtomicU64::new(0) }; SLOTS];
-    let keys = [const { AtomicU64::new(0) }; 2048];
     // `text` holds the name copies: 128 bytes per possible id, the padded size of a 125-byte endpoint.
-    let names = Names { slots, keys, next: Mutex::new((0, 0)), text: anon(2048 * 128) };
+    let names = Names {
+        slots: [const { AtomicU64::new(0) }; SLOTS],
+        keys: [const { AtomicU64::new(0) }; 2048],
+        next: Mutex::new((0, 0)),
+        text: anon(2048 * 128),
+    };
     // Any hour may hold every line (two words each at worst) plus a partly filled block per thread.
     let region = (b.len() / 19 + (threads + 1) * B + 1023) & !1023;
     // Chunks of 2 MB: threads working on neighbouring chunks then fault in different page-table
@@ -553,18 +539,23 @@ fn main() {
     // wait = 2 hours are summarised during the parse; if a line then turns up in an hour already
     // summarised, the run starts over with wait = HOURS: no hour is complete before the whole parse.
     for wait in [2, HOURS] {
-        let used = (0..=HOURS).map(|_| AtomicUsize::new(0)).collect(); // and hours summarised
         // 40960 = 2048 ids x 5 u32 words x 4 bytes: one stats table per hour.
-        let pool = Pool { base: anon(HOURS * region * 4), region, used, stats: anon(HOURS * 40960) };
+        let pool = Pool {
+            base: anon(HOURS * region * 4),
+            region,
+            used: (0..=HOURS).map(|_| AtomicUsize::new(0)).collect(), // and hours summarised
+            stats: anon(HOURS * 40960),
+        };
         // Hours below `fin` are complete; `pre` chunks from the start are parsed. `prog`: for each
         // chunk its first and last hour once parsed; `pre`; one past the last hour in those; whether
         // a line came too late for its hour.
         let (next, fin, pre): ([AtomicUsize; 3], AtomicUsize, AtomicUsize) = Default::default();
         let prog = Mutex::new((vec![None; chunks], 0, 0, false));
         // Each hour's output size, usize::MAX until it is summarised.
-        let bytes: Vec<AtomicUsize> = (0..HOURS).map(|_| AtomicUsize::new(usize::MAX)).collect();
+        let sz: Vec<AtomicUsize> = (0..HOURS).map(|_| AtomicUsize::new(usize::MAX)).collect();
         // Endpoint ids in name order; set once by the thread whose chunk completes the parse, and
         // formatting starts when it is set.
+        let total = |k: usize| sz[..k].iter().map(|x| x.load(Relaxed)).sum::<usize>();
         let order: OnceLock<Vec<usize>> = OnceLock::new();
         let work = || {
             let mut cur = [(4 * B - 4) as *mut u32; HOURS];
@@ -585,25 +576,23 @@ fn main() {
                 }
                 if h < fin.load(Acquire) {
                     if next[1].compare_exchange(h, h + 1, Relaxed, Relaxed).is_ok() {
-                        bytes[h].store(summarise(&pool, &names, h, lat), Release);
+                        sz[h].store(summarise(&pool, &names, h, lat), Release);
                     }
                 } else if k == HOURS {
                     break;
-                } else if order.get().is_some() && bytes[..=k].iter().all(|x| x.load(Acquire) != usize::MAX) {
+                } else if order.get().is_some() && sz[..=k].iter().all(|x| x.load(Acquire) != !0) {
                     if next[2].compare_exchange(k, k + 1, Relaxed, Relaxed).is_ok() {
-                        let off: usize = bytes[..k].iter().map(|x| x.load(Relaxed)).sum();
-                        let (p, order) = ((o + off) as *mut u8, order.get().unwrap());
-                        // SAFETY: bytes[k] is hour k's exact output size, and the range at offset
-                        // sum(bytes[..k]) lies inside the mapping (cap covers every hour at its worst).
+                        let (p, order) = ((o + total(k)) as *mut u8, order.get().unwrap());
+                        // SAFETY: sz[k] is hour k's exact output size, and the range at offset
+                        // total(k) lies inside the mapping (cap covers every hour at its worst).
                         unsafe { write_hour(&pool, &names, order, k, p) };
                         zap(pool.stats.wrapping_add(k) as *const u8, 40960);
                         // Drop this hour's whole output pages from our page tables now, in parallel;
                         // the data stays in the file. Exit would otherwise unmap them all on one core.
-                        zap(p, bytes[k].load(Relaxed));
+                        zap(p, sz[k].load(Relaxed));
                     }
-                } else if j == chunks {
-                    std::thread::sleep(std::time::Duration::from_micros(50)); // the last hours are being summarised
-                } else if j >= pre.load(Relaxed) + LAG {
+                } else if j == chunks || j >= pre.load(Relaxed) + LAG {
+                    // Every chunk is claimed (the last hours are being summarised), or the lag is full.
                     std::thread::sleep(std::time::Duration::from_micros(50));
                 } else if next[0].compare_exchange(j, j + 1, Relaxed, Relaxed).is_ok() {
                     let (lo, hi) = (edge(j), edge(j + 1));
@@ -618,15 +607,14 @@ fn main() {
                         g.3 |= a < fin.load(Relaxed);
                         (g.1, g.2) = (g.1 + 1, g.2.max(z + 1));
                     }
-                    let f = g.2.max(wait) - wait;
                     pre.store(g.1, Relaxed);
+                    let f = g.2.max(wait) - wait;
                     fin.store(if g.1 < chunks { f } else { HOURS }, Release);
                     if g.1 == chunks {
-                        if !g.3 {
-                            // SAFETY: every chunk is parsed and the run will not start over, so nothing
-                            // reads the input again; its page tables go before the output is complete.
-                            unsafe { munmap(b.as_ptr(), b.len() + 4096) };
-                        }
+                        // SAFETY: every chunk is parsed and, unless the run starts over (length 0 then,
+                        // which munmap rejects), nothing reads the input again; its page tables go
+                        // before the output is complete.
+                        unsafe { munmap(b.as_ptr(), (b.len() + 4096) * !g.3 as usize) };
                         // Every endpoint is named: endpoint ids in byte order of their names, while
                         // the last hours are summarised; hours are formatted once it is set.
                         let mut ids: Vec<usize> = (1..=names.next.lock().unwrap().0).collect();
@@ -638,8 +626,7 @@ fn main() {
         };
         std::thread::scope(|s| (0..threads).for_each(|_| drop(s.spawn(&work))));
         if !prog.into_inner().unwrap().3 {
-            let len: usize = bytes.iter().map(|x| x.load(Relaxed)).sum();
-            f.set_len(len as u64).expect("size summary.txt");
+            f.set_len(total(HOURS) as u64).expect("size summary.txt");
             std::process::exit(0); // the output is complete; the kernel releases everything else
         }
     }
