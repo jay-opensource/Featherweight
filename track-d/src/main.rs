@@ -28,9 +28,7 @@
 //! - Lock-free builders: atomic cursors saved 5 MB but ran 0.208 s against 0.178 s (step 16).
 //! - Exit: no frees, and every thread `MADV_DONTNEED`s its share of the big arrays first, taking
 //!   the exit teardown from 8.45 to 3.62 ms (steps 22, 40).
-use std::arch::x86_64::{
-    __m256i, _mm256_cmpgt_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
-};
+use std::arch::x86_64::*;
 use std::{fs::File, os::unix::io::AsRawFd};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering::*};
 
@@ -53,23 +51,10 @@ fn map(path: &str) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts(p, len) }
 }
 
-/// Parse the decimal number at b[i..] and step past the space or LF after it. Up to 7 digits in
-/// one go: load 8 bytes, find the first non-digit, shift the digits to the top (the empty low
-/// bytes act as leading zeros) and combine pairs, quads and octets with three multiplies.
+/// Parse the decimal number at b[i..] and step past the space or LF after it (the slow path: the
+/// text loop below handles nearly every line with `tail`).
 #[inline(always)]
 fn num(b: &[u8], i: &mut usize) -> u64 {
-    if let Some(w) = b.get(*i..*i + 8) {
-        let d = u64::from_le_bytes(w.try_into().unwrap()) ^ 0x3030_3030_3030_3030;
-        let stop = d.wrapping_add(0x7676_7676_7676_7676) & 0x8080_8080_8080_8080; // bytes >= 10: not a digit
-        let len = stop.trailing_zeros() as usize / 8;
-        if len < 8 {
-            *i += len + 1;
-            let v = d.checked_shl(64 - 8 * len as u32).unwrap_or(0) & 0x0F0F_0F0F_0F0F_0F0F;
-            let v = v.wrapping_mul(2561) >> 8 & 0x00FF_00FF_00FF_00FF;
-            let v = v.wrapping_mul(6553601) >> 16 & 0x0000_FFFF_0000_FFFF;
-            return v.wrapping_mul(42949672960001) >> 32;
-        }
-    }
     let mut x = 0u64;
     while let Some(&c) = b.get(*i).filter(|c| c.is_ascii_digit()) {
         x = x * 10 + (c - b'0') as u64;
@@ -83,14 +68,13 @@ fn num(b: &[u8], i: &mut usize) -> u64 {
 /// clear all but the last `len` (they are the previous bytes of the text) and combine as in `num`.
 /// Needs 8 <= end <= b.len().
 #[inline(always)]
-fn tail(b: &[u8], end: usize, len: usize) -> u64 {
+fn tail(b: &[u8], end: usize, len: usize) -> u32 {
     // SAFETY: 8 <= end <= b.len() (the caller's check), so the 8 bytes are inside the slice.
     let x = unsafe { (b.as_ptr().add(end - 8) as *const u64).read_unaligned() };
-    let k = 64 - 8 * len as u32;
-    let v = (x >> k << k) & 0x0F0F_0F0F_0F0F_0F0F;
+    let v = x & (!0 << 64 - 8 * len as u32) & 0x0F0F_0F0F_0F0F_0F0F;
     let v = v.wrapping_mul(2561) >> 8 & 0x00FF_00FF_00FF_00FF;
     let v = v.wrapping_mul(6553601) >> 16 & 0x0000_FFFF_0000_FFFF;
-    v.wrapping_mul(42949672960001) >> 32
+    (v.wrapping_mul(42949672960001) >> 32) as u32
 }
 
 /// Hint the cache to fetch the line holding `x`.
@@ -203,13 +187,12 @@ impl Edges for (&[u8], usize, usize) {
                 };
                 let (p1, nd) = (nd.trailing_zeros() as usize, nd & nd.wrapping_sub(1));
                 let (p2, nd) = (nd.trailing_zeros() as usize, nd & nd.wrapping_sub(1));
-                let p3 = nd.trailing_zeros() as usize; // 32 if there is no third
-                if p3 < 32 && (p1 | p2 - p1 - 1 | p3 - p2 - 1) < 8 {
+                let p3 = nd.trailing_zeros() as usize; // a missing separator is 32: too long below
+                if (p1 | p2 - p1 - 1 | p3 - p2 - 1) < 8 {
                     // every number has at most 7 digits; anything else takes the scalar path
-                    let (u, v) = (tail(b, i + p1, p1), tail(b, i + p2, p2 - p1 - 1));
-                    let w = tail(b, i + p3, p3 - p2 - 1);
+                    let t = |from, to| tail(b, i + to, to - from); // the digits i+from..i+to
+                    emit(t(0, p1) as usize, t(p1 + 1, p2), t(p2 + 1, p3));
                     i += p3 + 1;
-                    emit(u as usize, v as u32, w as u32);
                     continue;
                 }
             }
