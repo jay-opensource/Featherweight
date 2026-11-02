@@ -29,8 +29,8 @@
 //! - Lock-free builders: atomic cursors saved 5 MB but ran 0.208 s against 0.178 s (step 16).
 //! - Exit: no frees, and every thread `MADV_DONTNEED`s its share of the big arrays first, taking
 //!   the exit teardown from 8.45 to 3.62 ms (steps 22, 40).
-use std::{fs::File, os::unix::io::AsRawFd};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering::*};
+use std::{collections::*, fs::File, os::unix::io::AsRawFd};
+use std::sync::atomic::{Ordering::*, *};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -55,7 +55,7 @@ fn map(path: &str) -> &'static [u8] {
 /// one go: load 8 bytes, find the first non-digit, shift the digits to the top (the empty low
 /// bytes act as leading zeros) and combine pairs, quads and octets with three multiplies.
 #[inline(always)]
-fn num(b: &[u8], i: &mut usize) -> u64 {
+fn num(b: &[u8], i: &mut usize) -> u32 {
     if let Some(w) = b.get(*i..*i + 8) {
         let d = u64::from_le_bytes(w.try_into().unwrap()) ^ 0x3030_3030_3030_3030;
         let stop = d.wrapping_add(0x7676_7676_7676_7676) & 0x8080_8080_8080_8080; // bytes >= 10: not a digit
@@ -65,16 +65,13 @@ fn num(b: &[u8], i: &mut usize) -> u64 {
             let v = d.checked_shl(64 - 8 * len as u32).unwrap_or(0) & 0x0F0F_0F0F_0F0F_0F0F;
             let v = v.wrapping_mul(2561) >> 8 & 0x00FF_00FF_00FF_00FF;
             let v = v.wrapping_mul(6553601) >> 16 & 0x0000_FFFF_0000_FFFF;
-            return v.wrapping_mul(42949672960001) >> 32;
+            return (v.wrapping_mul(42949672960001) >> 32) as u32;
         }
     }
-    let mut x = 0u64;
-    while let Some(&c) = b.get(*i).filter(|c| c.is_ascii_digit()) {
-        x = x * 10 + (c - b'0') as u64;
-        *i += 1;
-    }
-    *i += 1; // the space or LF after the number
-    x
+    let s = &b[*i..];
+    let len = s.iter().take_while(|c| c.is_ascii_digit()).count();
+    *i += len + 1; // and the space or LF after the number
+    s[..len].iter().fold(0, |x, &c| x * 10 + (c - b'0') as u32)
 }
 
 /// Hint the cache to fetch the line holding `x`.
@@ -103,11 +100,7 @@ fn spans<T: Copy>(x: T, n: usize, k: usize) -> Vec<(T, usize, usize)> {
 /// Run `f` on `threads` threads, each pulling work items from `items` until they run out.
 fn par<T: Sync>(threads: usize, items: &[T], f: impl Fn(&T) + Sync) {
     let next = AtomicUsize::new(0);
-    let work = || {
-        while let Some(it) = items.get(next.fetch_add(1, Relaxed)) {
-            f(it)
-        }
-    };
+    let work = || std::iter::from_fn(|| items.get(next.fetch_add(1, Relaxed))).for_each(&f);
     std::thread::scope(|s| (0..threads).for_each(|_| _ = s.spawn(work)));
 }
 
@@ -134,13 +127,11 @@ struct Graph {
 
 impl Graph {
     /// First slot of node k (and, for k + 1, one past its last); defined for k <= n.
-    #[inline(always)]
     fn off(&self, k: usize) -> usize {
         ld(&self.base, k >> self.sh) as usize + ld(&self.rel, k) as usize
     }
 
     /// Call f(v, w) for every edge u -> v of weight w.
-    #[inline(always)]
     fn adj(&self, u: usize, f: impl FnMut(u32, u32)) {
         self.slots(self.off(u), self.off(u + 1), f)
     }
@@ -174,8 +165,7 @@ impl Edges for (&[u8], usize, usize) {
         let (b, lo, hi) = *self;
         let mut i = (lo..hi).find(|&p| p == 0 || b[p - 1] == 10).unwrap_or(hi); // 10: LF
         while i < hi {
-            let (u, v) = (num(b, &mut i) as usize, num(b, &mut i) as u32);
-            emit(u, v, num(b, &mut i) as u32);
+            emit(num(b, &mut i) as usize, num(b, &mut i), num(b, &mut i));
         }
     }
 }
@@ -345,7 +335,7 @@ fn relabel(g0: Graph, t: usize, qs: &mut [(usize, usize)], rc: &mut Vec<u32>) ->
     let items = Vec::from_iter((0..t).map(|j| [j, j * n / t, (j + 1) * n / t]));
     let sp = Slots(seg.as_mut_ptr());
     par(t, &items, |&[j, mut sc, e]| {
-        let (mut q, mut k, mut at, mut big) = (std::collections::VecDeque::new(), 0, n + j * cap, vec![]);
+        let (mut q, mut k, mut at, mut big) = (VecDeque::new(), 0, n + j * cap, vec![]);
         loop {
             // Software pipeline over the queue: offsets 16 nodes ahead, edge lists 8 ahead, so
             // the misses of upcoming nodes overlap (the claim bits stay in cache).
@@ -376,10 +366,7 @@ fn relabel(g0: Graph, t: usize, qs: &mut [(usize, usize)], rc: &mut Vec<u32>) ->
         regs.lock().unwrap()[j] = (k, at - n - j * cap, big);
     });
     let (regs, mut rb) = (regs.into_inner().unwrap(), vec![[0; 2]]); // each region's first id, slot
-    for r in &regs {
-        let l = rb[rb.len() - 1];
-        rb.push([l[0] + r.0, l[1] + r.1]);
-    }
+    regs.iter().enumerate().for_each(|(j, r)| rb.push([rb[j][0] + r.0, rb[j][1] + r.1]));
     let (mask, nb) = ((1 << vb) - 1, (n >> BS) + 1);
     let fin = |v: usize| rb[ld(&seg, v) as usize >> vb][0] + (ld(&seg, v) & mask) as usize;
     qs.iter_mut().for_each(|q| *q = (fin(q.0), fin(q.1)));
@@ -461,12 +448,8 @@ struct Dial {
 impl Dial {
     /// Queue a node with key d in [cur, cur + W): its label's index in the pages, then its first
     /// and end edge slot.
-    #[inline(always)]
     fn put(&mut self, d: u32, [i, a, e]: [u32; 3]) {
-        if self.free == 0 {
-            self.free = self.pool.len() as u32;
-            self.pool.push([0; 4]);
-        }
+        (self.free == 0).then(|| (self.free = self.pool.len() as u32, self.pool.push([0; 4])));
         let (k, b) = (self.free as usize, d as usize % W);
         self.free = ld(&self.pool, k)[3];
         *mt(&mut self.pool, k) = [i, a, e, ld(&self.head, b)];
@@ -475,7 +458,6 @@ impl Dial {
     }
 
     /// Take an item of key cur (`step` moves cur to the smallest key after each pop).
-    #[inline(always)]
     fn pop(&mut self) -> [u32; 3] {
         let b = self.cur as usize % W;
         let k = ld(&self.head, b) as usize;
@@ -528,7 +510,6 @@ impl Pages {
     }
 
     /// Index of v's label on `side`, in page 0 if v has none.
-    #[inline(always)]
     fn ix(&self, v: u32, side: usize) -> usize {
         let d = (v >> self.pb) as usize;
         (ld(&self.dir[side], d) as usize) << self.pb | v as usize & ((1 << self.pb) - 1)
@@ -567,8 +548,8 @@ fn bidir(pg: &mut Pages, hs: &mut [Dial; 2], g: [&Graph; 2], [s, t, c]: [usize; 
             false => step::<0>(pg, &mut hs[0], g[0], &mut m),
         }
     {}
-    let [mu, skip] = m;
-    (skip >= mu && (skip == u64::MAX || mu < INF as u64)).then_some(mu)
+    // m is [mu, skip]
+    (m[1] >= m[0] && (m[1] == u64::MAX || m[0] < INF as u64)).then_some(m[0])
 }
 
 /// One step of side S (0: forward, 1: backward, so the side is a constant in the code): pop its
@@ -630,15 +611,11 @@ fn via(pg: &mut Pages, hs: &mut [Dial; 2], g: [&Graph; 2], s: usize, t: usize) -
 /// (inside the islands, see via). A stale heap entry is simply expanded again (it cannot
 /// improve anything). u64::MAX if t is unreachable.
 fn plain(g: &Graph, s: usize, t: usize) -> u64 {
-    use std::collections::{BTreeSet, HashMap};
     let (mut dist, mut q) = (HashMap::from([(s, 0)]), BTreeSet::from([(0, s)]));
     while let Some((d, u)) = q.pop_first().filter(|&(_, u)| u != t) {
         g.adj(u, |v, w| {
             let (e, nd) = (dist.entry(v as usize).or_insert(u64::MAX), d + w as u64);
-            if nd < *e {
-                *e = nd;
-                q.insert((nd, v as usize));
-            }
+            (nd < *e).then(|| (*e = nd, q.insert((nd, v as usize))));
         });
     }
     *dist.get(&t).unwrap_or(&u64::MAX) // t is popped at its distance, or never labelled
@@ -663,9 +640,8 @@ fn main() {
     // n, m (the edge lines are simply read to the end) and the text after the header line
     let (n, m, tx) = (num(gt, &mut i) as usize, num(gt, &mut i) as usize, &gt[i..]);
     let vb = (usize::BITS - (n.max(2) - 1).leading_zeros()).max(1);
-    let k = threads * 4; // work items per pass
     let est = Err(m.min(tx.len() / 6)); // a line has at least 6 bytes
-    let g0 = csr(n, threads, vb, &spans(tx, tx.len(), k), est);
+    let g0 = csr(n, threads, vb, &spans(tx, tx.len(), threads * 4), est); // 4 work items per thread
     // g0 in BFS order (in g0's edge array), with the queries mapped and the reverse graph's counts
     // for items of one bucket each; then the reverse graph.
     let mut rc = vec![];
