@@ -6,18 +6,18 @@
 //! Pipeline (one pool of threads runs all of it, with no barrier; each takes the next task):
 //! 1. Parse (`parse`): the input is cut into line-aligned chunks claimed in file order (each thread
 //!    finds its chunk's line boundaries itself). Each line
-//!    becomes a 4-byte record `latency(20) | 5xx(1) | endpoint id(11)` filed in a block of its
-//!    hour in `Pool`; a latency of ESC or more adds an escape word (PERF.md mechanisms 1, 3, 6).
+//!    becomes a 4-byte record `latency(20) | 5xx(1) | endpoint id(11)` filed in its hour's region
+//!    of `Pool`; a latency of ESC or more adds an escape word (PERF.md mechanisms 1, 3, 6).
 //! 2. Summarise (`summarise`), during the parse: once the parsed prefix of the file holds a line of
 //!    hour h + 2, hour h is complete. Count per endpoint, scatter latencies by endpoint, select
-//!    p50/p95/p99 (`pct`), keep five words per endpoint, reuse the record blocks (mechanism 10).
+//!    p50/p95/p99 (`pct`), keep five words per endpoint, give the records back (mechanism 10).
 //! 3. Output (`write_hour`): `summary.txt` is mapped before the threads start, at a sparse upper
 //!    bound. The thread whose chunk completes the parse sorts the ids by name (`Names::key`); then
 //!    each hour is formatted straight into the file once it and all earlier hours are summarised.
 //!
 //! Data structures: `Names` is the endpoint interner shared by all threads (8,192 open-addressing
-//! slots, CRC32 hash, name copies padded to 64-byte lines); `Pool` holds the record blocks, listed
-//! per hour, and the per-hour statistics tables. Both are lock-free on the hot path; only a new name
+//! slots, CRC32 hash, name copies padded to 64-byte lines); `Pool` holds the per-hour record
+//! regions and the per-hour statistics tables. Both are lock-free on the hot path; only a new name
 //! takes a lock (1,842 times in all).
 //!
 //! Box-specific decisions (scoring box: i5-13500, THP "always", `/out` is a tmpfs charged as memory;
@@ -248,47 +248,34 @@ impl Names {
     }
 }
 
-/// Record words in blocks of B words, listed per hour and reused once their hour is summarised (no
-/// page is faulted in, cleared and given back per hour); and the statistics, one table per hour of
-/// five words per endpoint id: count, errors, p50, p95, p99.
+/// Record words, one region per hour, each handed out in blocks of B words; and the statistics,
+/// one table per hour of five words per endpoint id: count, errors, p50, p95, p99.
 struct Pool {
-    base: *mut u32, // cap blocks, then per hour a list of cap block indices (the blocks it was given)
-    cap: usize,
-    spare: Mutex<(usize, Vec<u32>)>, // blocks handed out so far, and blocks given back (zeroed)
-    used: Vec<AtomicUsize>,          // per hour, blocks in its list
+    base: *mut u32,
+    region: usize,
+    used: Vec<AtomicUsize>,
     stats: *mut [[u32; 5]; 2048],
 }
-// SAFETY: `base` and `stats` point into mappings that live until the last summary. A block has one
-// owner at a time (fresh and spare ones are handed out under the `spare` lock), so one writer; an hour's list entries and records are written before its chunks
-// join the parsed prefix and read by its summariser only after that; an hour's stats table has one
+// SAFETY: `base` and `stats` point into mappings that live for the whole run. Blocks are handed
+// out disjointly by an atomic counter, so each has one writer; an hour's stats table has one
 // writer (its summariser) and is read only after that hour's `bytes` entry is published.
 unsafe impl Sync for Pool {}
 
 impl Pool {
-    /// A zeroed block of B words, added to hour h's list.
-    #[cold]
+    /// The next free block of B words in hour h's region.
     fn block(&self, h: usize) -> *mut u32 {
-        let mut g = self.spare.lock().unwrap();
-        let i = g.1.pop().map_or(g.0, |i| i as usize); // spare blocks are all below g.0
-        g.0 += (i == g.0) as usize;
         let k = self.used[h].fetch_add(1, Relaxed);
-        assert!(i < self.cap && k < self.cap);
-        // SAFETY: i < cap blocks and k < cap list entries (asserted above); entry k is hour h's alone.
-        unsafe { *self.base.add((B + h) * self.cap + k) = i as u32 };
-        unsafe { self.base.add(i * B) }
+        assert!((k + 1) * B < self.region); // a spare word: the scatter reads one word ahead
+        // SAFETY: (k + 1) * B < region (asserted above), so the block lies inside hour h's region.
+        unsafe { self.base.add(h * self.region + k * B) }
     }
 
-    /// Hour h's blocks so far (indices into `base`); call it when no thread is still filing hour h.
-    fn list(&self, h: usize) -> &[u32] {
-        let n = self.used[h].load(Relaxed);
-        // SAFETY: entries below used[h] were written by `block` before the hour's summary.
-        unsafe { std::slice::from_raw_parts(self.base.add((B + h) * self.cap), n) }
-    }
-
-    /// The words of block i, used by one thread at a time (see the Sync note).
-    fn blk(&self, i: u32) -> &mut [u32] {
-        // SAFETY: i < cap, so the block lies inside `base`.
-        unsafe { std::slice::from_raw_parts_mut(self.base.add(i as usize * B), B) }
+    /// All words of hour h's blocks, including the zeroed (id 0) tails of partly used ones. Call it
+    /// only when no thread is still writing hour h.
+    fn words(&self, h: usize) -> &[u32] {
+        let n = self.used[h].load(Relaxed) * B;
+        // SAFETY: n words are exactly the blocks handed out, all inside the region (see `block`).
+        unsafe { std::slice::from_raw_parts(self.base.add(h * self.region), n) }
     }
 }
 
@@ -450,12 +437,12 @@ fn ranks<const K: usize>(v: &[u32], r: [usize; 3]) -> [u32; 3] {
 }
 
 /// Summarise hour h: count its records per endpoint, scatter their latencies into `lat` grouped
-/// by endpoint, select p50, p95 and p99 per group, and zero its blocks for reuse. Returns
+/// by endpoint, select p50, p95 and p99 per group, and give the records back to the kernel. Returns
 /// the size of the hour's output lines.
 fn summarise(pool: &Pool, names: &Names, h: usize, lat: &mut [u32]) -> usize {
     // SAFETY: h < HOURS, and each hour is summarised by exactly one thread, which is the only writer
     // of its stats table.
-    let (list, st) = (pool.list(h), unsafe { &mut *pool.stats.add(h) });
+    let (words, st) = (pool.words(h), unsafe { &mut *pool.stats.add(h) });
     // Per endpoint: count | errors << 32, and the next slot. They sit in front of `lat`, not on the
     // thread's stack, so they are unmapped with it before the output grows. 6144 words: cnt is
     // 2048 u64 (4096 words) and at is 2048 u32. SAFETY (the two casts below): cnt covers words
@@ -464,10 +451,8 @@ fn summarise(pool: &Pool, names: &Names, h: usize, lat: &mut [u32]) -> usize {
     let cnt = unsafe { &mut *(tmp.as_mut_ptr() as *mut [u64; 2048]) };
     let at = unsafe { &mut *(tmp.as_mut_ptr().add(4096) as *mut [u32; 2048]) };
     let (_, mut total) = (cnt.fill(0), 0);
-    for &i in list {
-        for &w in pool.blk(i).iter() {
-            cnt[(w & 2047) as usize] += 1 + ((w as u64 & 0x800) << 21);
-        }
+    for &w in words {
+        cnt[(w & 2047) as usize] += 1 + ((w as u64 & 0x800) << 21);
     }
     for id in 1..2048 {
         at[id] = total;
@@ -475,19 +460,15 @@ fn summarise(pool: &Pool, names: &Names, h: usize, lat: &mut [u32]) -> usize {
     }
     // Words of id 0 (escape words, the unused tails of blocks) land after the groups.
     at[0] = total;
-    for &k in list {
-        let w = pool.blk(k);
-        for i in 0..B {
-            // The escape word follows its record in its block: a record always has two words of
-            // room, so the last word of a block is never a big record and its x goes unused.
-            let (v, x) = (w[i] >> 12, w[(i + 1) % B]);
-            let c = &mut at[(w[i] & 2047) as usize];
-            let v = if v >= ESC { x | v & 2047 } else { v };
-            // SAFETY: c < list.len() * B <= lat.len(): each word has its own slot after the prefix sums.
-            unsafe { *lat.get_unchecked_mut(*c as usize) = v };
-            *c += 1;
-        }
-        w.fill(0); // ready for reuse
+    for (i, &w) in words.iter().enumerate() {
+        // SAFETY: `Pool::block` keeps a spare word after the last block, so word i + 1 exists (it may
+        // be a tail zero or the escape word of the next record).
+        let (v, x) = (w >> 12, unsafe { *words.as_ptr().add(i + 1) });
+        let c = &mut at[(w & 2047) as usize];
+        let v = if v >= ESC { x | v & 2047 } else { v };
+        // SAFETY: c < words.len() <= lat.len(): each word has its own slot after the prefix sums above.
+        unsafe { *lat.get_unchecked_mut(*c as usize) = v };
+        *c += 1;
     }
     let (mut lo, mut size) = (0, 0);
     for id in (1..2048).filter(|&id| cnt[id] > 0) {
@@ -498,11 +479,11 @@ fn summarise(pool: &Pool, names: &Names, h: usize, lat: &mut [u32]) -> usize {
         let line = [n, p50, p95, p99, e, ppm(e, n)].map(digits);
         size += 28 + names.name(id).len() + line.iter().sum::<usize>();
     }
-    pool.spare.lock().unwrap().1.extend_from_slice(list);
+    zap(words.as_ptr() as *const u8, words.len() * 4 + 4095); // regions are page-aligned
     if pool.used[HOURS].fetch_add(1, AcqRel) == HOURS - 1 {
         // The last summary: the records' page tables go too, before the output is complete.
         // SAFETY: the counter says all HOURS summaries are done, so nothing reads the records any more.
-        unsafe { munmap(pool.base as *const u8, (B + HOURS) * pool.cap * 4) };
+        unsafe { munmap(pool.base as *const u8, HOURS * pool.region * 4) };
     }
     size
 }
@@ -539,9 +520,8 @@ fn main() {
     let keys = Box::new([const { AtomicU64::new(0) }; 2048]);
     // `text` holds the name copies: 128 bytes per possible id, the padded size of a 125-byte endpoint.
     let names = Names { slots, keys, next: Mutex::new((0, 0)), text: anon(2048 * 128) };
-    // Blocks for every line (two words each at worst; a line has at least 40 bytes) plus a partly
-    // filled block per thread and hour; any one hour may hold them all.
-    let cap = b.len() / 19 / B + threads * HOURS + 2;
+    // Any hour may hold every line (two words each at worst) plus a partly filled block per thread.
+    let region = (b.len() / 19 + (threads + 1) * B + 1023) & !1023;
     // Chunks of 2 MB: threads working on neighbouring chunks then fault in different page-table
     // pages of the input. The last 24 MB go in 512 KB chunks, so threads finish together. Chunk k
     // starts at the first line start at or after edge k; the thread that parses a chunk finds its
@@ -572,24 +552,24 @@ fn main() {
     for wait in [2, HOURS] {
         let used = (0..=HOURS).map(|_| AtomicUsize::new(0)).collect(); // and hours summarised
         // 40960 = 2048 ids x 5 u32 words x 4 bytes: one stats table per hour.
-        let (base, stats) = (anon((B + HOURS) * cap * 4), anon(HOURS * 40960));
-        let pool = Pool { base, cap, spare: Default::default(), used, stats };
+        let pool = Pool { base: anon(HOURS * region * 4), region, used, stats: anon(HOURS * 40960) };
         // Hours below `fin` are complete; `pre` chunks from the start are parsed. `prog`: for each
         // chunk its first and last hour once parsed; `pre`; one past the last hour in those; whether
-        // a line came too late for its hour; chunks whose input pages are given back.
+        // a line came too late for its hour.
         let (next, fin, pre): ([AtomicUsize; 3], AtomicUsize, AtomicUsize) = Default::default();
-        let prog = Mutex::new((vec![None; chunks], 0, 0, false, 0));
+        let prog = Mutex::new((vec![None; chunks], 0, 0, false));
         // Each hour's output size, usize::MAX until it is summarised.
         let bytes: Vec<AtomicUsize> = (0..HOURS).map(|_| AtomicUsize::new(usize::MAX)).collect();
         let order: OnceLock<Vec<usize>> = OnceLock::new();
         let work = || {
             let mut cur = [(4 * B - 4) as *mut u32; HOURS];
-            // An hour's worst case, after `summarise`'s two tables.
-            let n = cap * B + 6144;
+            // Twice an hour's worst case (a line that comes too late may race a summary), after
+            // `summarise`'s two tables.
+            let n = region * 2 + 6144;
             // SAFETY: a private zeroed mapping of n u32, used only by this thread.
             let mut lat = unsafe { std::slice::from_raw_parts_mut(anon(n * 4), n) };
             loop {
-                // A complete hour first, to free its record blocks; then the next hour to format, once
+                // A complete hour first, to give its records back; then the next hour to format, once
                 // it and every hour before it are summarised; else the next chunk, but not far past the
                 // first one still in work: the records in between would pile up.
                 let [j, h, k] = next.each_ref().map(|x| x.load(Relaxed));
@@ -623,6 +603,8 @@ fn main() {
                 } else if next[0].compare_exchange(j, j + 1, Relaxed, Relaxed).is_ok() {
                     let (lo, hi) = (edge(j), edge(j + 1));
                     let span = parse(&b[..hi], lo, &names, &pool, &mut cur);
+                    // Unmap the chunk's whole pages now, on this thread, not all at exit on one.
+                    zap(b[lo..].as_ptr(), hi - lo);
                     let mut g = prog.lock().unwrap();
                     g.0[j] = Some(span);
                     while let Some(&Some([a, z])) = g.0.get(g.1) {
@@ -631,13 +613,7 @@ fn main() {
                         g.3 |= a < fin.load(Relaxed);
                         (g.1, g.2) = (g.1 + 1, g.2.max(z + 1));
                     }
-                    let (f, z) = (g.2.max(wait) - wait, g.4);
-                    // Unmap the parsed input's whole pages 8 chunks at a time (fewer TLB shootdowns),
-                    // on the threads, not all at exit on one.
-                    if g.1 >= z + 8 {
-                        zap(b[edge(z)..].as_ptr(), edge(g.1) - edge(z));
-                        g.4 = g.1;
-                    }
+                    let f = g.2.max(wait) - wait;
                     pre.store(g.1, Relaxed);
                     fin.store(if g.1 < chunks { f } else { HOURS }, Release);
                     if g.1 == chunks {

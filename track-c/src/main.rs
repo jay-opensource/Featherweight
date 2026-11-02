@@ -27,8 +27,8 @@
 //! - Records are `pread` into a per-thread buffer that stays in L2, not mapped: no page-table
 //!   entries to fault in while parsing or to tear down at exit (8; run-6c8cfb2db4cb, 32.68 ms).
 //! - Page-table lock: shared tables are mapped up front with MADV_POPULATE_WRITE, a 2 MB page by
-//!   exactly one thread; the bitset is updated by queued plain stores under region locks, not by
-//!   locked ORs (6, 7, 13).
+//!   exactly one thread; a bit is set by a locked OR on a word prefetched for writing while its
+//!   batch was looked up, so the OR rarely waits for another core (6, 7, 13).
 //! - THP: all memory is MADV_NOHUGEPAGE (a 2 MB page is charged whole to memory.peak) except the
 //!   first 4 MB of the dictionary and bitset, which are fully used anyway (9; run-be0296de8c66).
 //! - One thread pool, no second round of thread starts (11). The process ends without freeing.
@@ -174,13 +174,11 @@ type Words = &'static [AtomicU64];
 /// next. Slots fill in order and never change once filled.
 ///
 /// The bits live in pages of 4096 names: [page][group][64 words], so a group's bits for one page
-/// are contiguous and pages past the last id are never touched. No locked instruction per bit: a
-/// locked OR waits for its line, which another core has usually just written, and blocks every
-/// later load meanwhile. Each thread queues (word, bit) pairs per region of the array (64 regions)
-/// and applies a full queue with plain loads and stores under that region's lock. A word always
-/// maps to the same lock, so no bit is lost. When all are on, the threads count them by page share.
-struct Shared<'a>(&'a [AtomicU8], &'a [Bucket], AtomicU32, Words, Locks);
-type Locks = Vec<Mutex<()>>;
+/// are contiguous and pages past the last id are never touched. A locked OR whose line another core
+/// has just written waits for it and blocks every later load meanwhile, so `flush` first fetches a
+/// batch's 32 words for writing, then ORs the bits in. When all are on, the threads count them by
+/// page share.
+struct Shared<'a>(&'a [AtomicU8], &'a [Bucket], AtomicU32, Words);
 
 #[repr(C, align(64))]
 struct Bucket([AtomicU64; 8]);
@@ -188,10 +186,8 @@ struct Bucket([AtomicU64; 8]);
 // The id + 1 bits of a dictionary entry; the others are the fingerprint, whose bit 63 is always set.
 const IDS: u64 = (1 << 20) - 1;
 
-/// One thread's state: aggregates per group, its block of free ids, its bit queues (64 regions x 64
-/// pairs `word << 6 | bit`, and their lengths), and its read buffer.
-type Local = ([Agg; 256], (u32, u32), Pend, *mut u8);
-type Pend = ([[u32; 64]; 64], [usize; 64]);
+/// One thread's state: aggregates per group, its block of free ids, and its read buffer.
+type Local = ([Agg; 256], (u32, u32), *mut u8);
 
 impl Shared<'_> {
     /// Dense id of the name of r (fingerprint r.0, bucket r.1). An overfull dictionary sets the id
@@ -217,7 +213,7 @@ impl Shared<'_> {
     /// name already there if another thread filled it with the same name; None if with another one.
     #[cold]
     fn insert(&self, k: &Bucket, j: usize, fp: u64, ids: &mut (u32, u32)) -> Option<u32> {
-        let Shared(_, buckets, next, bits, _) = self;
+        let Shared(_, buckets, next, bits) = self;
         if ids.0 == ids.1 {
             let first = next.fetch_add(64, Relaxed);
             *ids = (first, first + 64);
@@ -234,20 +230,6 @@ impl Shared<'_> {
         }
     }
 
-    /// The queued words are fetched for writing first, so their cache misses overlap.
-    fn apply(&self, q: &[u32; 64], len: &mut usize, r: usize) {
-        for &x in &q[..*len] {
-            let p = self.3.as_ptr().wrapping_add(x as usize >> 6) as *const i8;
-            // SAFETY: a prefetch for write is only a hint and never faults.
-            unsafe { _mm_prefetch(p, _MM_HINT_ET0) };
-        }
-        let _lock = self.4[r].lock().unwrap();
-        for &x in &q[..*len] {
-            let a = &self.3[(x >> 6) as usize];
-            a.store(a.load(Relaxed) | 1 << (x & 63), Relaxed);
-        }
-        *len = 0;
-    }
 }
 
 /// Ids a dictionary of n buckets gives out before it counts as full (7 of every 8 slots).
@@ -368,7 +350,7 @@ const PIECE: usize = 1 << 15;
 /// quotes end the records. A record cut by the end of a piece is read again at the start of the
 /// next, and the batch is looked up before the buffer is reused.
 fn read(f: &File, len: usize, from: usize, to: usize, sh: &Shared, me: &mut Local) -> [usize; 2] {
-    let (mut pos, mut start, buf) = (from - 1, None, me.3);
+    let (mut pos, mut start, buf) = (from - 1, None, me.2);
     let (mut batch, mut nb) = ([Rec::default(); 32], 0);
     loop {
         let n = PIECE.min(len - pos);
@@ -397,13 +379,13 @@ fn read(f: &File, len: usize, from: usize, to: usize, sh: &Shared, me: &mut Loca
                 batch[nb] = record(b, rs, lf, qlf - qrs, sh);
                 (nb, qrs, rs, lfs) = (nb + 1, qlf, lf + 1, lfs & (lfs - 1));
                 if nb == batch.len() {
-                    flush(b, &batch, sh, me);
+                    flush(&batch, sh, me);
                     nb = 0;
                 }
             }
             (quotes, base) = (quotes + q.count_ones(), base + 64);
         }
-        flush(b, &batch[..nb], sh, me);
+        flush(&batch[..nb], sh, me);
         (nb, pos) = (0, pos + rs - 64);
         if pos >= to || n < PIECE {
             return [start.unwrap(), pos];
@@ -413,20 +395,23 @@ fn read(f: &File, len: usize, from: usize, to: usize, sh: &Shared, me: &mut Loca
 }
 
 /// Lookups for a batch: its region bytes and dictionary buckets were prefetched while it was parsed.
-/// The name's bit is queued for its region of the bitset, which is applied when its queue is full.
-fn flush(b: &[u8], batch: &[Rec], sh: &Shared, (agg, ids, (q, len), _): &mut Local) {
-    for r @ &Rec(.., region, id, cents, nb, tb) in batch {
+/// The names' bit words are fetched for writing as their ids are found, and set after the batch.
+fn flush(batch: &[Rec], sh: &Shared, (agg, ids, _): &mut Local) {
+    let mut bit = [0u32; 32];
+    for (r @ &Rec(.., region, id, cents, nb, tb), e) in batch.iter().zip(&mut bit) {
         let g = sh.0.get(region).map_or(0, |g| g.load(Relaxed)) as usize;
         let name = sh.id(r, ids);
         let a = &mut agg[g];
         (a[0], a[1], a[2], a[3]) = (a[0] + 1, a[1] + id, a[2] + cents, a[3].min(cents));
         (a[4], a[5], a[6]) = (a[4].max(cents), a[5] + nb, a[6] + tb);
 // word << 6 | bit of the bitset [page][group][64 words]: page << 20 | group << 12 | name & 0xFFF.
-// The region (lock) is a function of the word alone, so one word is always updated under one lock.
-        let r = (name as usize >> 6 ^ g) & 63; // the region of the name's word
-        q[r][len[r]] = (name >> 12) << 20 | (g as u32) << 12 | name & 0xFFF; // word << 6 | bit
-        len[r] += 1;
-        (len[r] == 64).then(|| sh.apply(&q[r], &mut len[r], r));
+        *e = (name >> 12) << 20 | (g as u32) << 12 | name & 0xFFF;
+        let p = sh.3.as_ptr().wrapping_add(*e as usize >> 6) as *const i8;
+        // SAFETY: a prefetch for write is only a hint and never faults.
+        unsafe { _mm_prefetch(p, _MM_HINT_ET0) };
+    }
+    for &e in &bit[..batch.len()] {
+        sh.3[e as usize >> 6].fetch_or(1 << (e & 63), Relaxed); // its line was fetched above
     }
 }
 
@@ -483,8 +468,7 @@ fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) ->
     // SAFETY: `Bucket` is 64 bytes of atomics (8 u64), cap * 8 words were split off above, the region
     // is 2 MB aligned (so 64-byte aligned), and zero is a valid (empty) bucket.
     let buckets = unsafe { std::slice::from_raw_parts(buckets.as_ptr() as *const Bucket, cap) };
-    let locks = (0..64).map(|_| Mutex::new(())).collect();
-    let sh = Shared(tab, buckets, 0.into(), bits, locks);
+    let sh = Shared(tab, buckets, 0.into(), bits);
     let ends: Vec<[AtomicUsize; 2]> = (0..k).map(|_| Default::default()).collect();
     let bufs = zeroed::<u8>(threads * (PIECE + 192)); // one buffer per thread (see `read`)
     let (next, me) = (AtomicUsize::new(0), AtomicUsize::new(0));
@@ -499,13 +483,12 @@ fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) ->
         wait.wait();
         // Disjoint per-thread slice of `bufs`, which only this thread reads or writes from here on.
         let buf = bufs[t * (PIECE + 192)..].as_ptr() as *mut u8;
-        let mut me: Local = ([NEW; 256], (0, 0), ([[0; 64]; 64], [0; 64]), buf);
+        let mut me: Local = ([NEW; 256], (0, 0), buf);
         for j in jobs(&next, k) {
             let [start, stop] = read(&f, len, cut(j), cut(j + 1), &sh, &mut me);
             ends[j][0].store(start, Relaxed);
             ends[j][1].store(stop, Relaxed);
         }
-        (0..64).for_each(|r| sh.apply(&me.2 .0[r], &mut me.2 .1[r], r));
         wait.wait(); // all bits are on: each thread counts them in its share of the used pages
         let w = (sh.2.load(Relaxed) as usize + 4095 >> 12).min(bits.len() >> 14) << 14;
         for i in w * t / threads..w * (t + 1) / threads {
