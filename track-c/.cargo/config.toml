@@ -1,8 +1,10 @@
-# Chosen configuration: x86-64-v3 (AVX2, BMI1/2, LZCNT, FMA) plus pclmulqdq and aes, which v3 does
-# not include. The scoring box is an i5-13500, which has all of them; the parser's carry-less multiply
-# (`inside`), pext/bzhi and AES hash (`record`) are compiled in directly by these flags.
+# Chosen configuration: x86-64-v3 (AVX2, BMI1/2, LZCNT, FMA) plus pclmulqdq, aes and prfchw, which v3
+# does not include. The scoring box is an i5-13500, which has all of them; the parser's carry-less
+# multiply (`inside`), pext/bzhi and AES hash (`record`) are compiled in directly by these flags.
+# Without prfchw, `apply`'s prefetch for write compiles to a read prefetch (prefetcht0), and each
+# bit's store then has to upgrade the line again: 12 threads, user cycles -2.3% with PREFETCHW.
 # Linked dynamically, not alderlake + crt-static: on the board the same parser ran 42.70-45.48 ms
 # (mean 44.2) with this build and 42.15-48.04 ms (mean 45.1) with the static one (PERF.md, "How we
 # measured" and step 19, run-6ff252fd014a).
 [build]
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+pclmulqdq,+aes"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+pclmulqdq,+aes,+prfchw"]

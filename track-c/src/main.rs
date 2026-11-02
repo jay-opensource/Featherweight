@@ -32,7 +32,7 @@
 //! - THP: all memory is MADV_NOHUGEPAGE (a 2 MB page is charged whole to memory.peak) except the
 //!   first 4 MB of the dictionary and bitset, which are fully used anyway (9; run-be0296de8c66).
 //! - One thread pool, no second round of thread starts (11). The process ends without freeing.
-//! - Build flags are in .cargo/config.toml (x86-64-v3 plus PCLMULQDQ and AES; the unsafe intrinsics
+//! - Build flags are in .cargo/config.toml (x86-64-v3 plus PCLMULQDQ, AES, PREFETCHW; the intrinsics
 //!   below rely on them).
 use std::arch::x86_64::*;
 use std::sync::{atomic::Ordering::*, atomic::*, Barrier, Mutex};
