@@ -327,14 +327,14 @@ const BS: u32 = 13;
 /// their count to its counts (a byte; 255: the count is in its list of (rank, count) pairs). This
 /// replaces a relabel builder whose 30 MB of staging were the process's memory peak. The scratch is
 /// one allocation, of which only the pages written are charged: the n ids, segment j at n + j * cap
-/// (cap: g0's slot count + 8), and the counts of item j at n + t * cap + j * (n / 4 + 1). Then the
+/// (cap: g0's slot count), and the counts of item j at n + t * cap + j * (n / 4 + 1). Then the
 /// offsets are laid out, in the largest blocks (16 nodes on these graphs) whose in-block offsets
 /// fit a u8, and per bucket of 8192 new ids the slots are moved into g0's edge array with every
 /// target rewritten and the reverse graph's slots counted into rc[b * nb + (v >> BS)] for each edge
 /// u -> v of bucket b (step 1 of a build of the reverse graph whose items are single buckets). The
 /// queries are mapped to the new ids.
 fn relabel(g0: Graph, t: usize, qs: &mut [(usize, usize)], rc: &mut Vec<u32>) -> Graph {
-    let (n, cap, vb, esc) = (g0.rel.len() - 1, g0.edges.len() + 8, g0.vb, g0.esc);
+    let (n, cap, vb, esc) = (g0.rel.len() - 1, g0.edges.len(), g0.vb, g0.esc);
     let (dn, regs) = (n / 4 + 1, std::sync::Mutex::new(vec![(0, 0, vec![]); t]));
     let mut seg = vec![0u32; n + t * (cap + dn)];
     let bits = Vec::from_iter((0..=n / 64).map(|_| AtomicU64::new(0)));
@@ -346,7 +346,6 @@ fn relabel(g0: Graph, t: usize, qs: &mut [(usize, usize)], rc: &mut Vec<u32>) ->
     let sp = Slots(seg.as_mut_ptr());
     par(t, &items, |&[j, mut sc, e]| {
         let (mut q, mut k, mut at, mut big) = (std::collections::VecDeque::new(), 0, n + j * cap, vec![]);
-        let dp = ((&sp).0 as *mut u8).wrapping_add(4 * (n + t * cap + j * dn));
         loop {
             // Software pipeline over the queue: offsets 16 nodes ahead, edge lists 8 ahead, so
             // the misses of upcoming nodes overlap (the claim bits stay in cache).
@@ -364,16 +363,12 @@ fn relabel(g0: Graph, t: usize, qs: &mut [(usize, usize)], rc: &mut Vec<u32>) ->
             };
             g0.adj(u, |v, _| _ = claim(&(v as usize)).then(|| q.push_back(v)));
             let (a, b) = (g0.off(u), g0.off(u + 1));
-            let (x, y) = (g0.edges.as_ptr(), (&sp).0.wrapping_add(at));
-            // SAFETY: only this item dequeues u, and its segment (room for all of g0's slots and 8 more:
-            // a list of up to 8 slots is copied as 8) and its counts are its own.
+            // SAFETY: only this item dequeues u, and its segment (room for all of g0's slots) and its
+            // counts are its own.
             unsafe {
                 *(&sp).0.add(u) = (j << vb | k) as u32;
-                match b - a <= 8 && a + 8 <= g0.edges.len() {
-                    true => *(y as *mut [u32; 8]) = *(x.add(a) as *const [u32; 8]), // (u32-aligned)
-                    false => std::ptr::copy_nonoverlapping(x.add(a), y, b - a),
-                }
-                *dp.add(k) = (b - a).min(255) as u8;
+                std::ptr::copy_nonoverlapping(g0.edges.as_ptr().add(a), (&sp).0.add(at), b - a);
+                *((&sp).0 as *mut u8).add(4 * (n + t * cap + j * dn) + k) = (b - a).min(255) as u8;
             }
             (b - a >= 255).then(|| big.push((k, b - a)));
             (k, at) = (k + 1, at + b - a);
