@@ -70,29 +70,11 @@ fn populate<T>(s: &[T]) {
     unsafe { madvise(s.as_ptr() as *mut u8, std::mem::size_of_val(s), 23) };
 }
 
-/// A file mapped read-only over zeroed memory, so loads may run up to 4 KB past its end. The page
-/// cache is not charged to us; a copy would be.
-fn map(path: &str) -> &'static [u8] {
-    let f = File::open(path).unwrap();
-    let len = f.metadata().unwrap().len() as usize;
-    let p = zeroed::<u8>(len + 8192).as_ptr() as *mut u8;
-    // SAFETY: p is our own zeroed mapping of len + 8192 bytes; MAP_FIXED replaces its first len bytes
-    // with the file, leaving the zero tail. The slice below covers only those len bytes.
-    let q = unsafe { mmap(p, len, 1, 0x12, f.as_raw_fd(), 0) }; // read-only, private, fixed
-    assert!(len == 0 || p == q);
-    unsafe { std::slice::from_raw_parts(p, len) }
-}
-
 /// Unaligned 8-byte load at b[i], not bounds-checked: the parser may look past a record, which is safe
 /// because buffers have zero padding (64 bytes in front in `read`, at least 4 KB behind in `map`).
 fn word(b: &[u8], i: usize) -> u64 {
     // SAFETY: callers stay within the padding described above (a record looks back at most 64 bytes).
     unsafe { (b.as_ptr().add(i) as *const u64).read_unaligned() }
-}
-
-/// The byte at b[i], read through `word` (so with the same padding rule).
-fn at(b: &[u8], i: usize) -> u8 {
-    word(b, i) as u8
 }
 
 /// Position of the first byte c in b[i..], or b.len().
@@ -162,7 +144,6 @@ fn text(b: &[u8], p: usize) -> (usize, u32) {
 /// distinct names (bits this thread counted at the end).
 type Agg = [i64; 8];
 const NEW: Agg = [0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0];
-type Words = &'static [AtomicU64];
 
 /// The state threads share in one run: tab (region id -> group: 0 is _UNMATCHED, countries are
 /// 1..); the name dictionary (buckets, and the next free block of 64 ids); and one bit per
@@ -180,10 +161,9 @@ type Words = &'static [AtomicU64];
 /// has just written waits for it and blocks every later load meanwhile, so `flush` first fetches a
 /// batch's 32 words for writing, then ORs the bits in. When all are on, the threads count them by
 /// page share.
-struct Shared<'a>(&'a [AtomicU8], &'a [Bucket], AtomicU32, Words);
+struct Shared<'a>(&'a [AtomicU8], &'a [Bucket], AtomicU32, &'a [AtomicU64]);
 
-#[repr(C, align(64))]
-struct Bucket([AtomicU64; 8]);
+type Bucket = [AtomicU64; 8]; // 64 bytes, and 64-byte aligned inside the 2 MB aligned mapping
 
 // The id + 1 bits of a dictionary entry; the others are the fingerprint, whose bit 63 is always set.
 const IDS: u64 = (1 << 20) - 1;
@@ -200,7 +180,7 @@ impl Shared<'_> {
             let k = &buckets[i];
             let hit = scan(k, r.0, !IDS);
             if hit != 0 {
-                return (k.0[hit.trailing_zeros() as usize].load(Relaxed) & IDS) as u32 - 1;
+                return (k[hit.trailing_zeros() as usize].load(Relaxed) & IDS) as u32 - 1;
             }
             let empty = scan(k, 0, !0);
             if empty == 0 {
@@ -226,7 +206,7 @@ impl Shared<'_> {
             next.store(u32::MAX / 2, Relaxed);
             return Some(0);
         }
-        match k.0[j].compare_exchange(0, fp | (ids.0 + 1) as u64, AcqRel, Acquire) {
+        match k[j].compare_exchange(0, fp | (ids.0 + 1) as u64, AcqRel, Acquire) {
             Ok(_) => (ids.0 += 1, Some(ids.0 - 1)).1,
             Err(x) => (x & !IDS == fp).then(|| (x & IDS) as u32 - 1),
         }
@@ -246,8 +226,9 @@ fn scan(k: &Bucket, v: u64, mask: u64) -> u32 {
     // only goes from 0 to its final value. A stale 0 can only send a lookup to `insert`, whose
     // compare-exchange then sees the slot's real value.
     unsafe {
-        let p = k.0.as_ptr() as *const __m256i;
-        let (m, v) = (_mm256_set1_epi64x(mask as i64), _mm256_set1_epi64x(v as i64));
+        let p = k.as_ptr() as *const __m256i;
+        let m = _mm256_set1_epi64x(mask as i64);
+        let v = _mm256_set1_epi64x(v as i64);
         let is = |x| {
             let e = _mm256_cmpeq_epi64(_mm256_and_si256(x, m), v);
             _mm256_movemask_pd(_mm256_castsi256_pd(e))
@@ -265,10 +246,8 @@ fn hash(b: &[u8], s: usize, len: usize, n: usize) -> (u64, usize) {
 // least 128 zero bytes follow a piece); the rest is register-only AVX2/AES. The round keys are the
 // first hex digits of pi.
     unsafe {
-        let iota = _mm256_setr_epi8(
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31,
-        );
+        let lo = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let iota = _mm256_set_m128i(_mm_add_epi8(lo, _mm_set1_epi8(16)), lo);
         let r = _mm_set_epi64x(0x243F_6A88_85A3_08D3, 0x1319_8A2E_0370_7344);
         let (mut h, mut i) = (_mm_cvtsi64_si128(len as i64), 0);
         loop {
@@ -301,12 +280,12 @@ struct Rec(u64, usize, usize, i64, i64, i64, i64);
 ///   commas before the terminator;
 /// - the note is what remains, and its quotes are the record's minus the name's.
 fn record(b: &[u8], rs: usize, lf: usize, quotes: u32, sh: &Shared) -> Rec {
-    let p = rs + 3 * (at(b, rs) == 0xEF) as usize; // a byte order mark
+    let p = rs + 3 * (word(b, rs) as u8 == 0xEF) as usize; // a byte order mark
 // 0xEF starts the 3-byte UTF-8 byte order mark. 0x1010...: a digit (0x30-0x39) has bit 4 set and
 // the comma (0x2C) does not, so the first clear bit marks the end of the id.
     let c0 = p + (!word(b, p) & 0x1010_1010_1010_1010).trailing_zeros() as usize / 8;
     let (c1, nq) = text(b, c0 + 1);
-    let e = lf - (at(b, lf - 1) == b'\r') as usize;
+    let e = lf - (word(b, lf - 1) as u8 == b'\r') as usize;
     let m = eq(load(b, e - 32), b',') as u32;
     let c3 = e - 1 - m.leading_zeros() as usize;
     // c3 is the last comma before the terminator, c2 the one before it (both within 32 bytes of e).
@@ -315,11 +294,11 @@ fn record(b: &[u8], rs: usize, lf: usize, quotes: u32, sh: &Shared) -> Rec {
 // The last 8 bytes before e end in ".dd": the integer digits move up one byte over the dot and
 // the two cents digits stay in bytes 6-7, so `numbers` reads one run of digits.
     // The amount `-?d+.dd` is read as cents, with its dot squeezed out.
-    let (neg, x) = ((at(b, c3 + 1) == b'-') as usize, word(b, e - 8));
+    let (neg, x) = ((word(b, c3 + 1) as u8 == b'-') as usize, word(b, e - 8));
     let x = (x & 0xFF_FFFF_FFFF) << 8 | x & 0xFFFF << 48;
     let w = [word(b, c0 - 8), word(b, c3 - 8), x];
     let [id, region, v, _] = numbers(w, [c0 - p, c3 - c2 - 1, e - c3 - 2 - neg]);
-    let quoted = (at(b, c0 + 1) == b'"') as usize;
+    let quoted = (word(b, c0 + 1) as u8 == b'"') as usize;
     let s = c0 + 1 + quoted;
     let (n, tq) = (c1 - s - quoted, (quotes - nq) as usize); // tq: the note's quotes
     let (fp, k) = hash(b, s, n, sh.1.len());
@@ -330,12 +309,8 @@ fn record(b: &[u8], rs: usize, lf: usize, quotes: u32, sh: &Shared) -> Rec {
     unsafe { _mm_prefetch(sh.0.as_ptr().wrapping_add(region) as *const i8, _MM_HINT_T0) };
     let nb = (n + quoted - nq as usize / 2) as i64;
     let tb = (c2 - c1 - 1 - tq / 2 - (tq > 0) as usize) as i64;
-    let cents = if neg > 0 { -v } else { v };
-    Rec(fp, k, region, id, cents, nb, tb)
+    Rec(fp, k, region, id, if neg > 0 { -v } else { v }, nb, tb)
 }
-
-/// 2 MB pages at the start of the dictionary and bits mapping (see `run`).
-const HOT: usize = 2;
 
 /// Bytes of records.csv read at a time into a thread's buffer, which stays in its cache. The parse
 /// does not map the file: no page-table entries to fault in while reading, none to tear down at
@@ -421,12 +396,7 @@ fn flush(batch: &[Rec], sh: &Shared, (agg, ids, _): &mut Local) {
 /// order mark. Inside quotes a LF is always followed by a letter or a quote (spec 2.2), and `run`
 /// still proves every record start found this way.
 fn line_start(b: &[u8], i: usize) -> bool {
-    at(b, i - 1) == b'\n' && (at(b, i).is_ascii_digit() || at(b, i) == 0xEF)
-}
-
-/// Run `f` on `threads` threads; the scope waits for them all.
-fn par(threads: usize, f: impl Fn() + Sync) {
-    std::thread::scope(|s| (0..threads).for_each(|_| drop(s.spawn(&f))));
+    word(b, i - 1) as u8 == b'\n' && matches!(word(b, i) as u8, b'0'..=b'9' | 0xEF)
 }
 
 /// Job numbers below n, handed out one at a time.
@@ -452,44 +422,38 @@ fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) ->
     let cap = 1 << (14 + 2 * round);
     (round > 0).then(|| eprintln!("warning: parallel run rejected; attempt {round} on 1 thread"));
 // 48 ranges per thread balance the tail (PERF.md mechanism 10: 8 per thread cost 51.6 against 49.4 ms).
-    let k = if threads > 1 { threads * 48 } else { 1 };
+    let k = threads * 48;
     // records.csv is read, not mapped (see `read`); its records start after the header line.
     let (f, mut head) = (File::open("/data/records.csv").unwrap(), [0; 64]);
     let n = f.read_at(&mut head, 0).unwrap();
     let len = f.metadata().unwrap().len() as usize;
     let from = find(&head[..n], 0, b'\n') + 1;
     let cut = |j: usize| from + (len - from) * j / k; // job j's records start at or after cut(j)
-    // The dictionary, then the bits (a page per 4096 ids), in one mapping. Its first HOT * 2 MB are
+    // The dictionary, then the bits (a page per 4096 ids), in one mapping. Its first 2 * 2 MB are
     // on 2 MB pages, so random reads there need no page walks; at full scale all of it is used (the
     // dictionary, and the bits of the first 98,304 names), so they cost no memory.
-    let n = (limit(cap) / 4096 + 1) * 256 * 64;
-    let hot = zeroed::<AtomicU64>(cap * 8 + n);
-    // SAFETY: the first HOT * 2 MB of `hot` are inside the mapping (1 MB of buckets, then 3.6 MB of bits).
-    unsafe { madvise(hot.as_ptr() as *mut u8, HOT << 21, 14) }; // MADV_HUGEPAGE
+    let hot = zeroed::<AtomicU64>(cap * 8 + (limit(cap) / 4096 + 1) * 256 * 64);
+    // SAFETY: the first 2 * 2 MB of `hot` are inside the mapping (1 MB of buckets, then 3.6 MB of bits).
+    unsafe { madvise(hot.as_ptr() as *mut u8, 2 << 21, 14) }; // MADV_HUGEPAGE: the first two 2 MB pages
     let (buckets, bits) = hot.split_at(cap * 8);
-    // SAFETY: `Bucket` is 64 bytes of atomics (8 u64), cap * 8 words were split off above, the region
-    // is 2 MB aligned (so 64-byte aligned), and zero is a valid (empty) bucket.
-    let buckets = unsafe { std::slice::from_raw_parts(buckets.as_ptr() as *const Bucket, cap) };
-    let sh = Shared(tab, buckets, 0.into(), bits);
-    let ends: Vec<[AtomicUsize; 2]> = (0..k).map(|_| Default::default()).collect();
+    let sh = Shared(tab, buckets.as_chunks().0, 0.into(), bits);
+    let ends = Mutex::new(vec![[0; 2]; k]);
     let bufs = zeroed::<u8>(threads * (PIECE + 192)); // one buffer per thread (see `read`)
     let (next, me) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let (wait, total) = (Barrier::new(threads), Mutex::new([NEW; 256])); // total: what threads add
-    par(threads, || {
+    let body = || {
         let t = me.fetch_add(1, Relaxed); // this thread's buffer, and 2 MB page to map
         // One thread maps each 2 MB page: threads racing to fault one in would each clear and charge
         // a 2 MB page, and all but one would then free theirs.
-// Threads 0..HOT take one 2 MB page each (1 << 18 words); the others get an empty range.
-        populate(&hot[t.min(HOT) << 18..(t + 1).min(HOT) << 18]);
+// Threads 0..2 (the huge pages) take one 2 MB page each (1 << 18 words); the others get an empty range.
+        populate(&hot[t.min(2) << 18..(t + 1).min(2) << 18]);
         pre();
         wait.wait();
         // Disjoint per-thread slice of `bufs`, which only this thread reads or writes from here on.
         let buf = bufs[t * (PIECE + 192)..].as_ptr() as *mut u8;
         let mut me: Local = ([NEW; 256], (0, 0), buf);
         for j in jobs(&next, k) {
-            let [start, stop] = read(&f, len, cut(j), cut(j + 1), &sh, &mut me);
-            ends[j][0].store(start, Relaxed);
-            ends[j][1].store(stop, Relaxed);
+            ends.lock().unwrap()[j] = read(&f, len, cut(j), cut(j + 1), &sh, &mut me);
         }
         wait.wait(); // all bits are on: each thread counts them in its share of the used pages
         let w = (sh.2.load(Relaxed) as usize + 4095 >> 12).min(bits.len() >> 14) << 14;
@@ -500,9 +464,10 @@ fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) ->
             (s[0], s[1], s[2], s[3]) = (s[0] + x[0], s[1] + x[1], s[2] + x[2], s[3].min(x[3]));
             (s[4], s[5], s[6], s[7]) = (s[4].max(x[4]), s[5] + x[5], s[6] + x[6], s[7] + x[7]);
         }
-    });
+    };
+    std::thread::scope(|s| (0..threads).for_each(|_| drop(s.spawn(&body))));
     let overfull = sh.2.load(Relaxed) as usize >= limit(cap);
-    let proved = (1..k).all(|j| ends[j - 1][1].load(Relaxed) == ends[j][0].load(Relaxed));
+    let proved = ends.lock().unwrap().windows(2).all(|w| w[0][1] == w[1][0]);
     (proved && !overfull).then(|| total.into_inner().unwrap().to_vec())
 }
 
@@ -520,7 +485,16 @@ fn main() {
     // regions.csv: a header, then "id,CCC" lines. tab maps a region id to its group: 0 is
     // _UNMATCHED, and countries are numbered 1.. in order of first sight (codes[g]). Ids ascend, so
     // the last line holds the largest, and ids above it are unknown without a lookup.
-    let rg = map("/data/regions.csv");
+    // regions.csv is mapped read-only over zeroed memory, so loads may run up to 4 KB past its end
+    // (the page cache is not charged to us; a copy would be).
+    let f = File::open("/data/regions.csv").unwrap();
+    let len = f.metadata().unwrap().len() as usize;
+    let p = zeroed::<u8>(len + 8192).as_ptr() as *mut u8;
+    // SAFETY: p is our own zeroed mapping of len + 8192 bytes; MAP_FIXED replaces its first len bytes
+    // with the file, leaving the zero tail. The slice covers only those len bytes.
+    // read-only, private, fixed
+    assert!(len == 0 || p == unsafe { mmap(p, len, 1, 0x12, f.as_raw_fd(), 0) });
+    let rg = unsafe { std::slice::from_raw_parts(p, len) };
 // The last line is "id,CCC\n": 5 bytes from the comma to the end (the spec ends it with an LF).
     let c = rg.len() - 5; // the comma of the last line
     let p = rg[..c].iter().rposition(|&x| x == b'\n').unwrap() + 1;
