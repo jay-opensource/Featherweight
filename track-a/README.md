@@ -60,11 +60,13 @@ This is exact. If a line turns up in an hour already summarised (not in the gene
 run starts over with no early release. At most one chunk in 32 is in work past the oldest unparsed
 one (a thread past that sleeps 50 µs), so the records of unfinished hours cannot pile up.
 
-**Writing the output.** When the last chunk is parsed, one thread sorts the endpoint ids by name,
-releases the input's page tables, and maps `summary.txt` (opened read-write, so the mapping can be
-shared) at an upper bound of its size; the file is cut to the exact size at the end. Each thread
-formats an hour straight into it, two digits at a time, as soon as that hour and all hours before
-it are summarised. Each hour's output pages are dropped from our page tables once written; the data
+**Writing the output.** Before the threads start, `summary.txt` is opened read-write (so the
+mapping can be shared), sized to a sparse upper bound (tmpfs allocates only what is written) and
+mapped; the file is cut to the exact size at the end. When the last chunk is parsed, its thread
+releases the input's page tables and sorts the endpoint ids by name, keyed on the first 32 bytes
+of each zero-padded name copy (ties fall back to the whole name), while other threads summarise
+the last hours. From then on each thread formats an hour straight into the file, two digits at a
+time, as soon as that hour and all hours before it are summarised. Each hour's output pages are dropped from our page tables once written; the data
 stays in the file. The process then exits without freeing anything.
 
 **Why memory stays low.** `/out` is a tmpfs, so the 10.1 MB answer counts as memory. Summarising
@@ -74,8 +76,10 @@ to 13.1 MB). Every big buffer is our own `mmap` marked `MADV_NOHUGEPAGE`: the sc
 memory with 2 MB pages, and `memory.peak` would charge a whole one for its first touched byte.
 Thread stacks are 256 KB and malloc keeps one arena.
 
-**Threads.** One pool of threads runs the parse, the statistics and the formatting, with one
-barrier between the parse and the output.
+**Threads.** One pool of threads runs the parse, the statistics and the formatting, with no
+barrier: each thread takes the next summary, hour to format or chunk, in that order. Each thread
+finds its own chunk's line boundaries, so nothing touches the input before the threads start.
+Each thread unmaps its summary scratch once every summary is taken, before the output grows.
 
 ## Build and run
 

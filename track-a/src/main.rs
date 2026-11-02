@@ -3,15 +3,17 @@
 //! request count, nearest-rank p50/p95/p99 latency, 5xx count and 5xx rate in ppm.
 //! README.md describes the design in prose; PERF.md has every step with its board run ID.
 //!
-//! Pipeline (one pool of threads runs all of it; one barrier sits between parse and output):
-//! 1. Parse (`parse`): the input is cut into line-aligned chunks claimed in file order. Each line
+//! Pipeline (one pool of threads runs all of it, with no barrier; each takes the next task):
+//! 1. Parse (`parse`): the input is cut into line-aligned chunks claimed in file order (each thread
+//!    finds its chunk's line boundaries itself). Each line
 //!    becomes a 4-byte record `latency(20) | 5xx(1) | endpoint id(11)` filed in its hour's region
 //!    of `Pool`; a latency of ESC or more adds an escape word (PERF.md mechanisms 1, 3, 6).
 //! 2. Summarise (`summarise`), during the parse: once the parsed prefix of the file holds a line of
 //!    hour h + 2, hour h is complete. Count per endpoint, scatter latencies by endpoint, select
 //!    p50/p95/p99 (`pct`), keep five words per endpoint, give the records back (mechanism 10).
-//! 3. Output (`write_hour`): the leader sorts endpoint ids by name and maps `summary.txt`; each
-//!    hour is formatted straight into it once it and all earlier hours are summarised (mechanism 11).
+//! 3. Output (`write_hour`): `summary.txt` is mapped before the threads start, at a sparse upper
+//!    bound. The thread whose chunk completes the parse sorts the ids by name (`Names::key`); then
+//!    each hour is formatted straight into the file once it and all earlier hours are summarised.
 //!
 //! Data structures: `Names` is the endpoint interner shared by all threads (8,192 open-addressing
 //! slots, CRC32 hash, name copies padded to 64-byte lines); `Pool` holds the per-hour record
@@ -35,7 +37,7 @@ use std::arch::x86_64::*;
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
-use std::sync::{Barrier, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -86,8 +88,8 @@ fn map(path: &str) -> &'static [u8] {
     assert!(len < 1 << 32);
 // SAFETY: len + 4096 bytes of zeroed anonymous memory are reserved (PROT_READ), then the file is
 // mapped over the first len bytes with MAP_FIXED (0x12 = MAP_PRIVATE|MAP_FIXED), so the 4 KB tail
-// stays zero. The slice stays inside the mapping, is never written, and is unmapped only by the
-// leader after the parse barrier, when no thread reads it any more. 2 = MADV_SEQUENTIAL.
+// stays zero. The slice stays inside the mapping, is never written, and is unmapped only once every
+// chunk is parsed and the run will not start over, when no thread reads it any more. 2 = MADV_SEQUENTIAL.
     unsafe {
         let p = mmap(std::ptr::null_mut(), len + 4096, 1, 0x22, -1, 0);
         assert!(p as isize != -1 && (len == 0 || mmap(p, len, 1, 0x12, f.as_raw_fd(), 0) == p));
@@ -171,7 +173,7 @@ fn long(b: &[u8], i: usize) -> (u32, usize) {
 struct Names {
     slots: Box<[AtomicU64; SLOTS]>,
     keys: Box<[AtomicU64; 2048]>, // by id: the copy's offset in `text` << 8 | the name's length
-    next: Mutex<(usize, usize)>,  // ids handed out, and where the next copy goes
+    next: Mutex<(usize, usize)>, // ids handed out, and where the next copy goes
     text: *mut u8,
 }
 // SAFETY: `slots` and `keys` are atomics. `text` is written only under the `next` lock, into lines
@@ -185,6 +187,16 @@ impl Names {
         let k = self.keys[id].load(Acquire) as usize;
         // SAFETY: keys[id] (Acquire) pairs with the Release store in `add`: the copy is fully written.
         unsafe { std::slice::from_raw_parts(self.text.add(k >> 8), k & 255) }
+    }
+
+    /// A sort key in the byte order of the names: the first 32 bytes of the zero-padded copy (zero
+    /// is below every endpoint byte, so a proper prefix still sorts first), then the whole name.
+    fn key(&self, id: usize) -> (u128, u128, &[u8]) {
+        let k = self.keys[id].load(Acquire) as usize;
+        // SAFETY: as in `name`; a copy is padded to whole 64-byte lines, so 32 bytes are in bounds.
+        let p = unsafe { self.text.add(k >> 8) as *const [u8; 16] };
+        let be = |i| u128::from_be_bytes(unsafe { *p.add(i) });
+        (be(0), be(1), self.name(id))
     }
 
     /// Id (1..2047) of the endpoint name q[..n] with CRC32 `crc`, adding it if new. Linear probing
@@ -432,7 +444,7 @@ fn summarise(pool: &Pool, names: &Names, h: usize, lat: &mut [u32]) -> usize {
     // of its stats table.
     let (words, st) = (pool.words(h), unsafe { &mut *pool.stats.add(h) });
     // Per endpoint: count | errors << 32, and the next slot. They sit in front of `lat`, not on the
-    // thread's stack, so they are unmapped with it before the output is charged. 6144 words: cnt is
+    // thread's stack, so they are unmapped with it before the output grows. 6144 words: cnt is
     // 2048 u64 (4096 words) and at is 2048 u32. SAFETY (the two casts below): cnt covers words
     // 0..4096 and at 4096..6144, so they do not overlap; the scratch is page-aligned.
     let (tmp, lat) = lat.split_at_mut(6144);
@@ -469,7 +481,7 @@ fn summarise(pool: &Pool, names: &Names, h: usize, lat: &mut [u32]) -> usize {
     }
     zap(words.as_ptr() as *const u8, words.len() * 4 + 4095); // regions are page-aligned
     if pool.used[HOURS].fetch_add(1, AcqRel) == HOURS - 1 {
-        // The last summary: the records' page tables go too, before the output is charged.
+        // The last summary: the records' page tables go too, before the output is complete.
         // SAFETY: the counter says all HOURS summaries are done, so nothing reads the records any more.
         unsafe { munmap(pool.base as *const u8, HOURS * pool.region * 4) };
     }
@@ -510,20 +522,30 @@ fn main() {
     let names = Names { slots, keys, next: Mutex::new((0, 0)), text: anon(2048 * 128) };
     // Any hour may hold every line (two words each at worst) plus a partly filled block per thread.
     let region = (b.len() / 19 + (threads + 1) * B + 1023) & !1023;
-    // Line-aligned chunks of 2 MB: threads working on neighbouring chunks then fault in different
-    // page-table pages of the input. The last 24 MB go in 512 KB chunks, so threads finish together.
-// 1 << 19 is the 512 KB unit: steps of 4 units (2 MB) until 24 MB remain, then single units.
-    let (mut cut, mut p) = (vec![0], 0);
-    while b.len() - p > 1 << 19 {
-        let step = if b.len() - p > 24 << 20 { 4 } else { 1 };
-        p += step << 19;
-        while b[p - 1] != b'\n' {
+    // Chunks of 2 MB: threads working on neighbouring chunks then fault in different page-table
+    // pages of the input. The last 24 MB go in 512 KB chunks, so threads finish together. Chunk k
+    // starts at the first line start at or after edge k; the thread that parses a chunk finds its
+    // edges itself (here they would cost a page fault each before any thread starts).
+    let big = b.len().saturating_sub(24 << 20) >> 21;
+    let chunks = big + ((b.len() - (big << 21) + (1 << 19) - 1) >> 19).max(1);
+    let edge = |k: usize| {
+        let mut p = ((k.min(big) << 21) + (k.saturating_sub(big) << 19)).min(b.len());
+        while p > 0 && p < b.len() && b[p - 1] != b'\n' {
             p += 1;
         }
-        cut.push(p);
-    }
-    cut.push(b.len());
-    let parts: Vec<_> = cut.windows(2).map(|w| (w[0], w[1])).collect();
+        p
+    };
+    // The output is mapped before the threads start (/out is a tmpfs on the box), with room for
+    // every hour at its worst (2,047 lines of at most 213 bytes); it is cut to size at the end.
+    let cap = HOURS * 2047 * 213;
+    let mut f = OpenOptions::new();
+    f.read(true).write(true).create(true).truncate(true);
+    let f = f.open("/out/summary.txt").expect("create summary.txt");
+    f.set_len(cap as u64).expect("size summary.txt");
+    // SAFETY: maps the file just sized to cap bytes shared and writable (3, 1 = PROT_READ|PROT_WRITE,
+    // MAP_SHARED); it lives until exit, and hours write disjoint ranges of it.
+    let o = unsafe { mmap(std::ptr::null_mut(), cap, 3, 1, f.as_raw_fd(), 0) } as usize;
+    assert!(o as isize != -1, "map summary.txt");
     // An hour is complete once the parsed prefix of the file holds a line `wait` hours later. With
     // wait = 2 hours are summarised during the parse; if a line then turns up in an hour already
     // summarised, the run starts over with wait = HOURS: no hour is complete before the whole parse.
@@ -535,31 +557,51 @@ fn main() {
         // chunk its first and last hour once parsed; `pre`; one past the last hour in those; whether
         // a line came too late for its hour.
         let (next, fin, pre): ([AtomicUsize; 3], AtomicUsize, AtomicUsize) = Default::default();
-        let prog = Mutex::new((vec![None; parts.len()], 0, 0, false));
+        let prog = Mutex::new((vec![None; chunks], 0, 0, false));
         // Each hour's output size, usize::MAX until it is summarised.
         let bytes: Vec<AtomicUsize> = (0..HOURS).map(|_| AtomicUsize::new(usize::MAX)).collect();
-        let (bar, out) = (Barrier::new(threads), OnceLock::new());
+        let order: OnceLock<Vec<usize>> = OnceLock::new();
         let work = || {
             let mut cur = [(4 * B - 4) as *mut u32; HOURS];
             // Twice an hour's worst case (a line that comes too late may race a summary), after
             // `summarise`'s two tables.
             let n = region * 2 + 6144;
             // SAFETY: a private zeroed mapping of n u32, used only by this thread.
-            let lat = unsafe { std::slice::from_raw_parts_mut(anon(n * 4), n) };
+            let mut lat = unsafe { std::slice::from_raw_parts_mut(anon(n * 4), n) };
             loop {
-                // A complete hour first, to give its records back; else the next chunk, but not far
-                // past the first one still in work: the records in between would pile up.
-                let (h, j) = (next[1].load(Relaxed), next[0].load(Relaxed));
+                // A complete hour first, to give its records back; then the next hour to format, once
+                // it and every hour before it are summarised; else the next chunk, but not far past the
+                // first one still in work: the records in between would pile up.
+                let [j, h, k] = next.each_ref().map(|x| x.load(Relaxed));
+                if h >= HOURS && !lat.is_empty() {
+                    // Every summary is taken: this thread's scratch goes before the output grows.
+                    // SAFETY: the mapping from `anon` above, not used again.
+                    unsafe { munmap(std::mem::take(&mut lat).as_ptr() as *const u8, n * 4) };
+                }
                 if h < fin.load(Acquire) {
                     if next[1].compare_exchange(h, h + 1, Relaxed, Relaxed).is_ok() {
                         bytes[h].store(summarise(&pool, &names, h, lat), Release);
                     }
-                } else if j == parts.len() {
+                } else if k == HOURS {
                     break;
+                } else if order.get().is_some() && bytes[..=k].iter().all(|x| x.load(Acquire) != usize::MAX) {
+                    if next[2].compare_exchange(k, k + 1, Relaxed, Relaxed).is_ok() {
+                        let off: usize = bytes[..k].iter().map(|x| x.load(Relaxed)).sum();
+                        let (p, order) = ((o + off) as *mut u8, order.get().unwrap());
+                        // SAFETY: bytes[k] is hour k's exact output size, and the range at offset
+                        // sum(bytes[..k]) lies inside the mapping (cap covers every hour at its worst).
+                        unsafe { write_hour(&pool, &names, order, k, p) };
+                        zap(pool.stats.wrapping_add(k) as *const u8, 40960);
+                        // Drop this hour's whole output pages from our page tables now, in parallel;
+                        // the data stays in the file. Exit would otherwise unmap them all on one core.
+                        zap(p, bytes[k].load(Relaxed));
+                    }
+                } else if j == chunks {
+                    std::thread::sleep(std::time::Duration::from_micros(50)); // the last hours are being summarised
                 } else if j >= pre.load(Relaxed) + LAG {
                     std::thread::sleep(std::time::Duration::from_micros(50));
                 } else if next[0].compare_exchange(j, j + 1, Relaxed, Relaxed).is_ok() {
-                    let (lo, hi) = parts[j];
+                    let (lo, hi) = (edge(j), edge(j + 1));
                     let span = parse(&b[..hi], lo, &names, &pool, &mut cur);
                     // Unmap the chunk's whole pages now, on this thread, not all at exit on one.
                     zap(b[lo..].as_ptr(), hi - lo);
@@ -573,55 +615,24 @@ fn main() {
                     }
                     let f = g.2.max(wait) - wait;
                     pre.store(g.1, Relaxed);
-                    fin.store(if g.1 < parts.len() { f } else { HOURS }, Release);
+                    fin.store(if g.1 < chunks { f } else { HOURS }, Release);
+                    if g.1 == chunks {
+                        if !g.3 {
+                            // SAFETY: every chunk is parsed and the run will not start over, so nothing
+                            // reads the input again; its page tables go before the output is complete.
+                            unsafe { munmap(b.as_ptr(), b.len() + 4096) };
+                        }
+                        // Every endpoint is named: endpoint ids in byte order of their names, while
+                        // the last hours are summarised; hours are formatted once it is set.
+                        let mut ids: Vec<usize> = (1..=names.next.lock().unwrap().0).collect();
+                        ids.sort_unstable_by_key(|&id| names.key(id));
+                        assert!(order.set(ids).is_ok());
+                    }
                 }
-            }
-            if bar.wait().is_leader() && !prog.lock().unwrap().3 {
-                // Endpoint ids in byte order of their names. The input's page tables go, and the
-                // output file is mapped now (/out is a tmpfs on the box), with room for the hours
-                // still being summarised (an hour's lines take at most 2,047 x 213 bytes); it is
-                // cut to size at the end.
-                let mut ids: Vec<usize> = (1..=names.next.lock().unwrap().0).collect();
-                ids.sort_unstable_by_key(|&id| names.name(id));
-                // SAFETY: every chunk is parsed (we are past the barrier), and nothing touches the input again.
-                unsafe { munmap(b.as_ptr(), b.len() + 4096) };
-                let len: usize = bytes.iter().map(|x| x.load(Relaxed).min(2047 * 213)).sum();
-                let mut f = OpenOptions::new();
-                f.read(true).write(true).create(true).truncate(true);
-                let f = f.open("/out/summary.txt").expect("create summary.txt");
-                f.set_len(len as u64).expect("size summary.txt");
-                // SAFETY: maps the file just sized to len bytes shared and writable (3, 1 = PROT_READ|PROT_WRITE,
-                // MAP_SHARED); it lives until exit, and hours write disjoint ranges of it.
-                let p = unsafe { mmap(std::ptr::null_mut(), len.max(1), 3, 1, f.as_raw_fd(), 0) };
-                assert!(p as isize != -1, "map summary.txt");
-                assert!(out.set((p as usize, ids, f)).is_ok());
-            }
-            if prog.lock().unwrap().3 {
-                return; // start over
-            }
-            while let h @ 0..HOURS = next[1].fetch_add(1, Relaxed) {
-                bytes[h].store(summarise(&pool, &names, h, lat), Release);
-            }
-            // SAFETY: this thread's scratch (from `anon` above) is not used again.
-            unsafe { munmap(lat.as_ptr() as *const u8, n * 4) };
-            let (o, order, _) = out.wait();
-            // Each hour, in order: once it and every hour before it are summarised, format its
-            // lines into its range of the output.
-            while let h @ 0..HOURS = next[2].fetch_add(1, Relaxed) {
-                while bytes[..=h].iter().any(|x| x.load(Acquire) == usize::MAX) {}
-                let off: usize = bytes[..h].iter().map(|x| x.load(Relaxed)).sum();
-                let (p, len) = ((o + off) as *mut u8, bytes[h].load(Relaxed));
-                // SAFETY: bytes[h] is hour h's exact output size and the range at offset sum(bytes[..h]) lies
-                // inside the mapping (sized from the bounded estimates, cut to size at the end).
-                unsafe { write_hour(&pool, &names, order, h, p) };
-                zap(pool.stats.wrapping_add(h) as *const u8, 40960);
-                // Drop this hour's whole output pages from our page tables now, in parallel; the
-                // data stays in the file. Exit would otherwise unmap them all on one core.
-                zap(p, len);
             }
         };
         std::thread::scope(|s| (0..threads).for_each(|_| drop(s.spawn(&work))));
-        if let Some((_, _, f)) = out.into_inner() {
+        if !prog.into_inner().unwrap().3 {
             let len: usize = bytes.iter().map(|x| x.load(Relaxed)).sum();
             f.set_len(len as u64).expect("size summary.txt");
             std::process::exit(0); // the output is complete; the kernel releases everything else

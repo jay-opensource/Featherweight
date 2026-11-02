@@ -1,3 +1,4 @@
 [build]
-# The scoring box is an i5-13500 (Raptor Lake): AVX2 and BMI2, no AVX-512.
-rustflags = ["-C", "target-feature=+avx2,+bmi1,+bmi2,+lzcnt,+popcnt,+sse4.2,+crt-static"]
+# The scoring box is an i5-13500 (Raptor Lake): AVX2 and BMI2, no AVX-512. A static (not PIE)
+# executable skips the self-relocation at exec.
+rustflags = ["-C", "target-feature=+avx2,+bmi1,+bmi2,+lzcnt,+popcnt,+sse4.2,+crt-static", "-C", "relocation-model=static"]
