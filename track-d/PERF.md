@@ -410,3 +410,14 @@ python -I tools/bench.py d --gate G3 --threads 7 --no-build  # the same with FW_
 
 The data comes from the public generator (`d_traverse.py --seed 1 --scale full`). `FW_THREADS`
 sets the thread count; the default is the available parallelism.
+
+## Memory floor (measured Nov 1, D7)
+
+The peak (58.2 MB anon RSS at the phase ticks, ~59.7 MB sampled; board 62.4 MB) is in the relabel fill, when g0
+(22.2 MB), the new ids (7 MB), the g1 staging (20 MB) and its place array (10 MB) are all live. Every later phase sits
+at ~56.1 MB: g + r are 44.4 MB and ~12 MB of freed heap is reused by the reverse build and then the query state
+(9.1 MB, ~760 KB per thread). Freeing memory early does not pay here: each MB released must be faulted back in by a
+12-thread phase at ~3 µs per fault (~0.8 ms per MB), about what 1 MB is worth in points. Measured and rejected:
+releasing a quarter of g0 during the fill (-2.1 MB, +1.5-3 ms, +11 lines), `malloc_trim` / mmap'd big buffers
+(54.4-55.3 MB, queries +8 ms), a gather-based reverse build (54.9 MB, reverse build 7.6 -> 20.5 ms). The next step
+would be 3-byte slots (98.8% of BFS-order deltas fit 14 bits, 98% of weights fit 10 bits): about -8 MB live.
