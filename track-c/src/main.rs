@@ -41,6 +41,27 @@ use std::{fs::File, os::unix::fs::FileExt, os::unix::io::AsRawFd};
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+    fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+    fn sched_getcpu() -> i32;
+}
+
+/// The CPUs this process may use, as a mask and as a list.
+type Cpus = ([u64; 16], Vec<usize>);
+
+/// Run the calling thread on CPU c only (c < 1024), or on any CPU of `cpus` when c is None.
+fn pin(c: Option<usize>, cpus: &Cpus) {
+    let mut one = [0u64; 16];
+    c.map(|c| one[c / 64] = 1 << c % 64);
+    let mask = if c.is_some() { &one } else { &cpus.0 };
+    // SAFETY: a 128-byte CPU mask for this thread (pid 0); failure only leaves the affinity as it was.
+    unsafe { sched_setaffinity(0, 128, mask.as_ptr()) };
+}
+
+/// Touch 8 KB of stack below the caller's frame: the depth `read` and its callees use later.
+#[inline(never)]
+fn touch() {
+    std::hint::black_box([0u8; 8 << 10]);
 }
 
 /// n zeroed values in fresh anonymous memory: charged only when touched, never freed (the process
@@ -459,7 +480,7 @@ fn jobs(next: &AtomicUsize, n: usize) -> impl Iterator<Item = usize> + '_ {
 ///
 /// The threads first run `pre` (the regions jobs; none are left in a later round) and map their
 /// share of the dictionary, then wait for each other: one round of thread starts, not two.
-fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) -> Option<Vec<Agg>> {
+fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize, cpus: &Cpus) -> Option<Vec<Agg>> {
     let threads = if round > 0 { 1 } else { threads };
 // cap buckets: 1 << 14 = 16,384 (1 MB) in the parallel round, 4 times larger in a redo.
     let cap = 1 << (14 + 2 * round);
@@ -487,19 +508,25 @@ fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize) ->
     let sh = Shared(tab, buckets, 0.into(), bits, locks);
     let ends: Vec<[AtomicUsize; 2]> = (0..k).map(|_| Default::default()).collect();
     let bufs = zeroed::<u8>(threads * (PIECE + 192)); // one buffer per thread (see `read`)
+    populate(bufs); // on main's CPU (see `main`)
     let (next, me) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let (wait, total) = (Barrier::new(threads), Mutex::new([NEW; 256])); // total: what threads add
     par(threads, || {
         let t = me.fetch_add(1, Relaxed); // this thread's buffer, and 2 MB page to map
+        // Disjoint per-thread slice of `bufs`, which only this thread reads or writes from here on.
+        let buf = bufs[t * (PIECE + 192)..].as_ptr() as *mut u8;
+        let mut me: Local = ([NEW; 256], (0, 0), ([[0; 64]; 64], [0; 64]), buf);
+        // The thread starts on main's CPU (see `main`) and maps its stack there, then moves to a CPU
+        // of its own and allows them all again (it stays where it is).
+        touch();
+        pin(Some(cpus.1[t % cpus.1.len()]), cpus);
+        pin(None, cpus);
         // One thread maps each 2 MB page: threads racing to fault one in would each clear and charge
         // a 2 MB page, and all but one would then free theirs.
 // Threads 0..HOT take one 2 MB page each (1 << 18 words); the others get an empty range.
         populate(&hot[t.min(HOT) << 18..(t + 1).min(HOT) << 18]);
         pre();
         wait.wait();
-        // Disjoint per-thread slice of `bufs`, which only this thread reads or writes from here on.
-        let buf = bufs[t * (PIECE + 192)..].as_ptr() as *mut u8;
-        let mut me: Local = ([NEW; 256], (0, 0), ([[0; 64]; 64], [0; 64]), buf);
         for j in jobs(&next, k) {
             let [start, stop] = read(&f, len, cut(j), cut(j + 1), &sh, &mut me);
             ends[j][0].store(start, Relaxed);
@@ -531,6 +558,16 @@ fn main() {
     std::env::set_var("RUST_MIN_STACK", "262144"); // small thread stacks, never on a 2 MB page
     let cores = std::thread::available_parallelism().map_or(1, |p| p.get());
     let threads = std::env::var("FW_THREADS").map_or(cores, |v| v.parse().unwrap());
+    // memory.peak counts, for every CPU that charges a 4 KB page, the unused rest of its batch of 64
+    // pages. So 4 KB pages are first touched on main's CPU: main stays there, maps the shared 4 KB
+    // tables itself, and the threads start there (they inherit the pin) and map their stacks before
+    // they move (see `run`). 2 MB pages are charged whole and may be mapped anywhere.
+    let mut all = [0u64; 16];
+    // SAFETY: a 128-byte mask for this process (pid 0).
+    unsafe { sched_getaffinity(0, 128, all.as_mut_ptr()) };
+    let cpus: Cpus = (all, (0..1024).filter(|&c| all[c / 64] >> (c % 64) & 1 == 1).collect());
+    // SAFETY: no arguments; the result is a CPU number below 1024.
+    pin(Some(unsafe { sched_getcpu() } as usize), &cpus);
 
     // regions.csv: a header, then "id,CCC" lines. tab maps a region id to its group: 0 is
     // _UNMATCHED, and countries are numbered 1.. in order of first sight (codes[g]). Ids ascend, so
@@ -540,7 +577,8 @@ fn main() {
     let c = rg.len() - 5; // the comma of the last line
     let p = rg[..c].iter().rposition(|&x| x == b'\n').unwrap() + 1;
     let tab: &[AtomicU8] = zeroed(numbers([word(rg, c - 8), 0, 0], [c - p, 0, 0])[0] as usize + 1);
-    let (codes, seen) = (Mutex::new(vec![[255u8; 3]]), zeroed::<AtomicU8>(1 << 15));
+    let (codes, seen) = (Mutex::new(Vec::with_capacity(256)), zeroed::<AtomicU8>(1 << 15));
+    (populate(tab), populate(seen), codes.lock().unwrap().push([255u8; 3])); // all on main's CPU
     let (from, k, next) = (find(rg, 0, b'\n') + 1, threads * 4, AtomicUsize::new(0));
     let cut = |j: usize| from + (rg.len() - from) * j / k; // job j's lines start at or after cut(j)
     let regions = || {
@@ -565,7 +603,7 @@ fn main() {
             }
         }
     };
-    let total = (0..).find_map(|k| run(tab, &regions, k, threads)).unwrap();
+    let total = (0..).find_map(|k| run(tab, &regions, k, threads, &cpus)).unwrap();
     let codes = codes.into_inner().unwrap();
     let mut order: Vec<usize> = (0..codes.len()).filter(|&g| total[g][0] > 0).collect();
     order.sort_by_key(|&g| codes[g]); // _UNMATCHED is [255; 3]: last
