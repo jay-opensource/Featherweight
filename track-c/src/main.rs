@@ -458,9 +458,9 @@ fn line_start(b: &[u8], i: usize) -> bool {
     at(b, i - 1) == b'\n' && (at(b, i).is_ascii_digit() || at(b, i) == 0xEF)
 }
 
-/// Run `f` on `threads` threads; the scope waits for them all.
+/// Run `f` on `threads` threads, the calling one included; the scope waits for them all.
 fn par(threads: usize, f: impl Fn() + Sync) {
-    std::thread::scope(|s| (0..threads).for_each(|_| drop(s.spawn(&f))));
+    std::thread::scope(|s| ((1..threads).for_each(|_| drop(s.spawn(&f))), f()));
 }
 
 /// Job numbers below n, handed out one at a time.
@@ -522,9 +522,10 @@ fn run<P: Fn() + Sync>(tab: &[AtomicU8], pre: &P, round: u32, threads: usize, cp
         pin(Some(cpus.1[t % cpus.1.len()]), cpus);
         pin(None, cpus);
         // One thread maps each 2 MB page: threads racing to fault one in would each clear and charge
-        // a 2 MB page, and all but one would then free theirs.
-// Threads 0..HOT take one 2 MB page each (1 << 18 words); the others get an empty range.
-        populate(&hot[t.min(HOT) << 18..(t + 1).min(HOT) << 18]);
+        // a 2 MB page, and all but one would then free theirs. The last threads to start take them,
+        // as a populate holds the address-space lock that each thread start needs for its stack.
+        let u = threads - 1 - t; // threads u = 0..HOT take one 2 MB page each (1 << 18 words)
+        populate(&hot[u.min(HOT) << 18..(u + 1).min(HOT) << 18]);
         pre();
         wait.wait();
         for j in jobs(&next, k) {
@@ -567,7 +568,8 @@ fn main() {
     unsafe { sched_getaffinity(0, 128, all.as_mut_ptr()) };
     let cpus: Cpus = (all, (0..1024).filter(|&c| all[c / 64] >> (c % 64) & 1 == 1).collect());
     // SAFETY: no arguments; the result is a CPU number below 1024.
-    pin(Some(unsafe { sched_getcpu() } as usize), &cpus);
+    let cpu = unsafe { sched_getcpu() } as usize;
+    pin(Some(cpu), &cpus);
 
     // regions.csv: a header, then "id,CCC" lines. tab maps a region id to its group: 0 is
     // _UNMATCHED, and countries are numbered 1.. in order of first sight (codes[g]). Ids ascend, so
@@ -604,6 +606,7 @@ fn main() {
         }
     };
     let total = (0..).find_map(|k| run(tab, &regions, k, threads, &cpus)).unwrap();
+    pin(Some(cpu), &cpus); // main worked as one of the threads; the output's pages go here too
     let codes = codes.into_inner().unwrap();
     let mut order: Vec<usize> = (0..codes.len()).filter(|&g| total[g][0] > 0).collect();
     order.sort_by_key(|&g| codes[g]); // _UNMATCHED is [255; 3]: last
