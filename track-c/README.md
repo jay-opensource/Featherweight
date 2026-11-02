@@ -7,8 +7,8 @@ quotes, embedded LFs, mixed CRLF/LF and stray byte order marks), join every reco
 through `regions.csv`, and write one line per country: count, id sum, amount sum, min and max in
 cents, distinct names, name bytes and note bytes.
 
-Board result for the shipped code (8509525): **24.94 ms, 8.63 MB, 349 lines, 81.54 points**
-(run-52a91432fca0; the other run of this code, 26.13 ms / 9.24 MB, run-02fa2d778aad, was on a push
+Board result for the shipped code (55aea48, C code cc32e4d): **24.93 ms, 8.68 MB, 328 lines, 81.72 points**
+(run-55a33d635b01; the code before the line trim, 8509525, ran 24.94 ms / 8.63 MB / 81.54, run-52a91432fca0; the other run of this code, 26.13 ms / 9.24 MB, run-02fa2d778aad, was on a push
 where the A code had changed). The reference takes 14.444 s and 367.4 MB. [PERF.md](PERF.md) has
 every step with its run ID and the experiments that lost.
 

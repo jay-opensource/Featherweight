@@ -5,8 +5,8 @@ The task, the input files and the exact output format are in the
 read a directed, weighted road-like graph (`graph.txt`: 1,740,512 nodes, 5,000,000 edges, 88 MB of
 text) and 2,000 source-target pairs (`queries.txt`), and write each shortest-path length, or -1.
 
-Board result for the shipped code (d93b8f6): **0.11637 s, 59.89 MB, 483 lines, 73.75 points**
-(run-0c5c2a4acdd4), the best of our runs. The reference takes 72.69 s and 893 MB. Before the last
+Board result for the shipped code (0e4fb56, D code 7c24aa3): **0.11701 s, 60.48 MB, 459 lines, 73.81 points**
+(run-8d7aa56daed0; the D8 code d7c421b ran 0.11637 s / 59.89 MB / 73.75, run-0c5c2a4acdd4), the best of our runs. The reference takes 72.69 s and 893 MB. Before the last
 round the same build ran 0.120-0.126 s at 62.7 MB (best run-0706657d930f, 73.39 points).
 
 ## Approach

@@ -14,7 +14,8 @@ Local box: i5-11400H laptop (6 cores, 12 MB L3) running Docker; the scoring box 
 | Reference (Python) | | | 72.69 s | 893 MB | 43 | 0 |
 | First correct entry | run-811fef4b3870 | 941a1e3 | 1.340 s | 230.6 MB | 141 | 45.37 |
 | Before the final rounds (b1046aa) | run-3e0a39c47769 | b1046aa | 0.1337 s | 64.07 MB | 454 | 72.15 |
-| **Best, and the shipped code** | **run-0c5c2a4acdd4** | **d93b8f6** | **0.11637 s** | **59.89 MB** | **483** | **73.75** |
+| **Best, and the shipped code (7c24aa3 line trim, 476 → 452 code lines)** | **run-8d7aa56daed0** | **0e4fb56** | **0.11701 s** | **60.48 MB** | **459** | **73.81** |
+| D8 (d7c421b) | run-0c5c2a4acdd4 | d93b8f6 | 0.11637 s | 59.89 MB | 483 | 73.75 |
 | Same design, first version | run-1824e747e5f2 | 1f2babf (8f66c96) | 0.11857 s | 59.60 MB | 548 | 73.15 |
 | Previous best (the base of D8) | run-0706657d930f | 01feb2f | 0.12030 s | 62.73 MB | 454 | 73.39 |
 | Earlier best (D6) | run-ad2a7cbc4bf1 | b7db2f2 | 0.1223 s | 62.39 MB | 454 | 73.23 |
@@ -93,7 +94,10 @@ Steps 51-60 are the D8 round (Nov 2). "Same D code" rows re-ran unchanged D code
 | 57 | ca47b93 | Experiment: caaae48, the compact rewrite (list queue with a u32 per node, csr temporaries kept alive); reverted in bd37ea3 | run-df90faccdf42 | 0.13417 | 64.54 | 471 | 71.96 |
 | 58 | aec6eeb | Experiment: D9 (ec8bea9), AVX2 line parse; board-neutral, reverted in 0877fdc | run-fcabe95e4ff5 | 0.12298 | 62.42 | 466 | 73.08 |
 | 59 | ed40986 | D8 (589b2cb): 8f66c96's walk again (VecDeque, one count byte per node), compact, with csr and finish merged | run-8c9a46d5bee5 | 0.11602 | 60.35 | 488 | 73.71 |
-| 60 | d93b8f6 | D8 (d7c421b): memcpy copy, count byte in place; **shipped** | run-0c5c2a4acdd4 | 0.11637 | 59.89 | 483 | 73.75 |
+| 60 | d93b8f6 | D8 (d7c421b): memcpy copy, count byte in place | run-0c5c2a4acdd4 | 0.11637 | 59.89 | 483 | 73.75 |
+| 61 | 0e4fb56 | D (7c24aa3): shorter plumbing, `num` returns u32, fewer inline attributes; 476 → 452 code lines; instructions lower, cycles equal; **shipped** | run-8d7aa56daed0 | 0.11701 | 60.48 | 459 | 73.81 |
+| 62 | 35ab851 | D code d7c421b | run-6111dc942f2f | 0.11855 | 59.56 | 483 | 73.57 |
+| 63 | 55aea48 | Same D code as step 61 | run-965c5a33713a | 0.11864 | 59.95 | 459 | 73.70 |
 
 ## How it works now
 
@@ -434,6 +438,8 @@ with fewer queued entries instead of the smaller key, 7.15M.
 | AVX2 line parse (D9, ec8bea9) | fewer parse cycles | board aec6eeb, run-fcabe95e4ff5: 122.98 ms, 62.42 MB, 73.08, against 120.30 ms for the base | no gain beyond noise; reverted in 0877fdc |
 | Compact walk with a u32-per-node list queue and kept csr temporaries (caaae48) | -80 lines | board ca47b93, run-df90faccdf42: 134.17 ms, 64.54 MB, 71.96 | +5 MB from the queue, +0.7 MB from the temporaries; fixed in 589b2cb by going back to the VecDeque and count bytes |
 | Chunked segments in the walk (the reverse staged in pages the BFS already faulted in) | fewer faults | faults back to the base's, reverse kernel cycles 54M -> 22M | +12 lines; not shipped |
+| Degree-2 chain contraction (exact) | fewer settles | settles −23.5%, query cycles −13.6%, but its two passes over 10M slots made the whole run about +8% | +39–51 lines; not shipped (`fw-notes/trackd-d8.md`) |
+| Reverse staged in the BFS-faulted pages (chunked segments, measured) | fewer faults | faults −17%, kernel −22–25%, user +2–2.6%, wall worse | +12–18 lines; not shipped |
 | MADV_POPULATE_WRITE on csr's staging and places | fewer faults in the reverse build | same fault counts, kernel cycles within noise, process paired 0.97 | no signal |
 
 ## Correctness

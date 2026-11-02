@@ -14,7 +14,9 @@ the run IDs are the record.
 | A2 final | run-9237e503e115 | bbee872 | 19.15 ms | 20.26 MB | 437 | 84.41 |
 | A3 (hours summarised during the parse) | run-eaa93041cda1 | d9663e9 | 19.76 ms | 13.08 MB | 439 | 85.95 |
 | A5 first push (4ad0fec: no serial path at the ends) | run-19f4ee4ee384 | a5424af | 18.33 ms | 12.80 MB | 444 | 86.83 |
-| **Best, and the shipped code (119981d)** | **run-1786b88da083** | **1f2babf** | **18.28 ms** | **12.85 MB** | **443** | **86.85** |
+| Earlier best (119981d) | run-1786b88da083 | 1f2babf | 18.28 ms | 12.85 MB | 443 | 86.85 |
+| Line trim (4652740), 436 → 411 code lines | run-860d4e53b2cc | 35ab851 | 18.16 ms | 13.34 MB | 418 | 86.95 |
+| **Best, and the shipped code (3e5cfd4: batched input zaps after the lock)** | **run-5d916ed36d4c** | **55aea48** | **17.86 ms** | **13.13 MB** | **423** | **87.16** |
 | The same code, another run | run-b150905186c7 | 01feb2f | 19.08 ms | 13.07 MB | 443 | 86.31 |
 
 The best run is 1,753 times faster than the reference with 17.7 times less memory. The A3 change
@@ -280,6 +282,10 @@ exec. Board: 18.28 ms, 12.85 MB, S 443, 86.85 (run-1786b88da083), the best run o
 
 "Same code" rows re-ran unchanged A code (another track had changed); they sample the noise.
 
+| 39 | 35ab851 | Line trim (4652740): setup, output and helpers shortened, 436 → 411 code lines, instructions +0.1% | run-860d4e53b2cc | 18.16 | 13.34 | 418 | 86.95 |
+| 40 | 0e4fb56 | Same A code as step 39 | run-b809e84f3bf7 | 18.78 | 13.12 | 418 | 86.65 |
+| 41 | 55aea48 | A (3e5cfd4): batched input zaps after the lock is released; the zap range is computed under the lock, then the whole parsed prefix is zapped once it grew by 8+ chunks, about 4x fewer TLB shootdowns; kernel x0.971, user x0.985; +5 lines; **shipped** | run-5d916ed36d4c | 17.86 | 13.13 | 423 | 87.16 |
+
 <!-- New runs: append a row with the next step number, and update the Result table above. -->
 
 | Step | Commit | Change | Run ID | T (ms) | M (MB) | S | Points |
@@ -397,6 +403,7 @@ and about 15 per record to formatting.
 | Fixed 128-byte name copy in `write_hour` (A5) | fewer instructions | −1.2M instructions, cycles flat | not worth 3 lines |
 | Strided format order, hours 14 apart, against the output PTE lock (A5) | less lock contention | spinlock share within noise (the `finish_fault` PTE lock is about 0.5% of samples) | |
 | LAG 64 (A5) | | not judgeable on the loaded laptop | |
+| Batched input zaps run inside the lock (80a3856, step 34) | fewer shootdowns | board 19.37 ms, 12.92 MB, 86.17 (run-d0e5effa5996) | the zap ran while holding the lock, so other threads waited on it. The same idea shipped as 3e5cfd4 (step 41) with the range computed under the lock and the zap after it: 17.86 ms |
 
 ## Correctness
 

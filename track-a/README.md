@@ -6,8 +6,8 @@ read `requests.log` (239 MB, about 3.1 million lines of timestamp, method, endpo
 latency) and write, for every hour and endpoint, the request count, the nearest-rank p50, p95 and
 p99 latency, the 5xx count and the 5xx rate in parts per million.
 
-Board result for the shipped code (119981d): **18.28 ms, 12.85 MB, 443 lines, 86.85 points**
-(run-1786b88da083; the code one step earlier, 4ad0fec, ran 18.33 and 18.39 ms at 12.8-12.9 MB, and
+Board result for the shipped code (55aea48, A code 3e5cfd4): **17.86 ms, 13.13 MB, 423 lines, 87.16 points**
+(run-5d916ed36d4c; the earlier 119981d ran 18.28 ms / 12.85 MB / 86.85, run-1786b88da083; the code one step earlier, 4ad0fec, ran 18.33 and 18.39 ms at 12.8-12.9 MB, and
 the shipped code once ran 19.08 ms, run-b150905186c7). The reference takes 32.047 s and 228 MB. [PERF.md](PERF.md) has every step with its run ID and the experiments
 that lost.
 

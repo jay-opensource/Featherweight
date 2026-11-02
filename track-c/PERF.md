@@ -13,7 +13,8 @@ the run IDs are the record.
 | Before the final rounds (C2) | run-be0296de8c66 | bbee872 | 30.44 ms | 12.04 MB | 378 | 77.67 |
 | C4 (stored names, 3.15 MB dictionary) | run-5feec0fbae92 | 96c67ed | 28.38 ms | 11.82 MB | 373 | 78.56 |
 | C6 fingerprint dictionary (68391ae) | run-fa0a945bb7b4 | 2a04827 | 25.49 ms | 8.97 MB | 362 | 81.02 |
-| **Best, and the shipped code (8509525: locked-OR bits)** | **run-52a91432fca0** | **1f2babf** | **24.94 ms** | **8.63 MB** | **349** | **81.54** |
+| Earlier best (8509525: locked-OR bits) | run-52a91432fca0 | 1f2babf | 24.94 ms | 8.63 MB | 349 | 81.54 |
+| **Best, and the shipped code (cc32e4d line trim, 342 → 321 code lines)** | **run-55a33d635b01** | **55aea48** | **24.93 ms** | **8.68 MB** | **328** | **81.72** |
 | The same code, another run | run-02fa2d778aad | ccff89d | 26.13 ms | 9.24 MB | 349 | 80.74 |
 | Dropped: startup change (ee7290e) | run-9b9bbe26dc06 | 01feb2f | 25.66 ms | 10.71 MB | 350 | 80.28 |
 
@@ -269,6 +270,11 @@ dictionary the advised range is 4 MB and two threads map the two pages.
 ## Board runs
 
 "Same code" rows re-ran unchanged C code (another track had changed); they sample the noise.
+
+| 40 | ede89e0 | C (cc32e4d): helpers inlined, 342 → 321 code lines, instructions unchanged | run-3c01be8324a8 | 25.01 | 9.78 | 328 | 81.17 |
+| 41 | 35ab851 | Same C code as step 40 | run-b937f95e1b88 | 25.03 | 8.85 | 328 | 81.59 |
+| 42 | 0e4fb56 | Same C code | run-52b47910693f | 26.75 | 8.82 | 328 | 80.89 |
+| 43 | 55aea48 | Same C code as step 40; **shipped** | run-55a33d635b01 | 24.93 | 8.68 | 328 | 81.72 |
 
 <!-- New runs: append a row with the next step number, and update the Result table above. -->
 
