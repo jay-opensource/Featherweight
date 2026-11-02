@@ -12,12 +12,17 @@ the run IDs are the record.
 | First correct entry (v1) | run-4bc3f917569d | fe231bc | 32.3 ms | 19.3 MB | 486 | 78.6 |
 | Fastest run (A2 line) | run-ac86c3ef1a30 | 477f874 | 18.92 ms | 20.45 MB | 440 | 84.48 |
 | A2 final | run-9237e503e115 | bbee872 | 19.15 ms | 20.26 MB | 437 | 84.41 |
-| **Best, and the shipped code** | **run-eaa93041cda1** | **d9663e9** | **19.76 ms** | **13.08 MB** | **439** | **85.95** |
-| The same code, other runs | run-b5aa7b53480c, run-1e9d7e96bee5, run-2c2546d31c68, run-0ce6f8512645 | 9477275 ... 96c67ed | 20.77, 19.91, 19.66, 19.90 ms | 13.64, 13.49, 13.53, 12.86 MB | 439 | 85.23, 85.74, 85.86, 85.95 |
+| A3 (hours summarised during the parse) | run-eaa93041cda1 | d9663e9 | 19.76 ms | 13.08 MB | 439 | 85.95 |
+| A5 first push (4ad0fec: no serial path at the ends) | run-19f4ee4ee384 | a5424af | 18.33 ms | 12.80 MB | 444 | 86.83 |
+| **Best, and the shipped code (119981d)** | **run-1786b88da083** | **1f2babf** | **18.28 ms** | **12.85 MB** | **443** | **86.85** |
+| The same code, another run | run-b150905186c7 | 01feb2f | 19.08 ms | 13.07 MB | 443 | 86.31 |
 
-The best run is 1,622 times faster than the reference with 17.4 times less memory. The A3 change
+The best run is 1,753 times faster than the reference with 17.7 times less memory. The A3 change
 (steps 27-31) cut memory by 7 MB and cost time that the board noise hides: 19.66-20.77 ms against
-18.92-19.28 ms for the A2 code in its three runs. Points are the
+18.92-19.28 ms for the A2 code in its three runs. The A5 change (steps 32-38) took the serial work out
+of both ends of the run: 19.76 to 18.28-18.39 ms (-7%), memory unchanged. The last run of the shipped
+code (19.08 ms, step 38) was slower; the code is identical to step 37 and we found no cause, so we
+count it as board noise. Points are the
 board's: `50·log10(K)` with K = (T_ref/T)^0.5 × min(50, M_ref/M)^0.2 × min(1, S_ref/S)^0.15. At
 about 20 ms, 1% of T is worth about 0.11 points, 1% of M about 0.04, and 10 lines about 0.07.
 
@@ -58,9 +63,9 @@ One parse pass turns every line of `requests.log` (239 MB, 3.1M lines) into a 4-
 in its hour's memory region. Hours are summarised while the parse is still running (once a line
 of hour h + 2 has been parsed in the file's prefix, hour h is complete): count per endpoint, scatter
 the latencies in name order, select p50/p95/p99, keep six words per group in a small per-hour
-table, and free the hour's records. The output is mapped at the parse barrier, and each hour is
-formatted into it as soon as it and the hours before it are summarised. The README describes the
-design in prose.
+table, and free the hour's records. The output is mapped before the threads start, and each hour is
+formatted into it as soon as it and the hours before it are summarised. There is no barrier: each
+thread takes the next summary, hour to format, or chunk. The README describes the design in prose.
 
 **Per-phase profile** (local, 12 threads, full seed 1, medians of 6-8 runs; cycles summed over
 threads; "u+k" adds kernel cycles):
@@ -115,7 +120,8 @@ threads, local):
 
 The floor is the end state, about 14 MB locally. With hours summarised and freed during the parse
 the local peak fell to 14.1-15.3 MB (G3 maximum of 6 runs 14.58, against 20.05 for bbee872), and
-the board read 12.9-13.6 MB. memory.current and memory.peak also include up to 63 pre-charged
+the board read 12.9-13.6 MB (12.80-12.93 MB with the A5 code, which also unmaps each thread's
+summary scratch once every summary is taken, before the output grows). memory.current and memory.peak also include up to 63 pre-charged
 pages per CPU (memcg charge batching), about 1-1.5 MB of noise that every entry shares.
 
 ## The mechanisms, each with the measurement behind it
@@ -204,7 +210,8 @@ peak 18.0-19.3 → 14.1-15.3 MB; user cycles ×0.998, kernel ×1.05 (+700 faults
 tables), user + kernel ×1.014. The count and slot tables moved from thread stacks into the scratch
 mapping (13a94d2: median peak 14.60 → 14.39 MB). Board: 20.77 ms and 13.64 MB (run-b5aa7b53480c).
 
-**11. Format while the parse finishes (A3 round 2, 86f7011, 403034e).** A timeline sampler showed
+**11. Format while the parse finishes (A3 round 2, 86f7011, 403034e; the leader and the barrier
+were removed in A5, mechanism 12).** A timeline sampler showed
 the last summary almost always finishes before the parse barrier, so the idle time at the end came
 from three places: the imbalance at the end of the parse with 2 MB chunks, two more barriers
 (statistics, then output), and the leader's serial sort and map. Now the leader maps the output at
@@ -215,6 +222,33 @@ from 112 to 39 ms (small chunks alone: 44), in-process wall median 38.6 → 26.8
 equal, peak median 14.35 → 14.26 MB. On bench.py G3 (8 runs, alternating images) the T median on holdout seed 11 was
 24.1 / 28.9 ms for the previous image (two sessions) and 22.1 / 21.4 ms for 403034e. Board: 19.66 ms, 13.53 MB (run-2c2546d31c68), on
 a slow stretch of the box.
+
+**12. No serial path at the ends (A5, 4ad0fec).** A timeline of the 18.5 ms run (local, 12 threads)
+found two serial stretches. Main took 0.6-0.9 ms to start the first thread, 0.4-0.5 ms of it cutting
+the input into chunks and faulting in about 120 input windows. The tail took 4.4 ms: the barrier,
+then the leader's sort of the ids, the unmap of the input and the open and map of `summary.txt`
+(0.5-4 ms), then the formatting. Now:
+- each worker finds its own chunk's edges (the first line start at or after edge k), so nothing
+  touches the input before the threads start (first thread start 0.16-0.4 ms);
+- `summary.txt` is opened, sized to a sparse upper bound (31.4 MB; tmpfs allocates only what is
+  written) and mapped in `main` before the threads start, and the file is cut to size at the end;
+- the thread whose chunk completes the parse unmaps the input and sorts the ids while the others
+  finish the last summaries. The sort key is the first 32 bytes of the zero-padded name copy as two
+  big-endian `u128`s, then the whole name for ties (a proper prefix still sorts first, since zero is
+  below every endpoint byte). Sorting insertions under the add lock instead cost x1.08-1.11 on the
+  sample: the lock is held about 0.4 us per new name while all threads discover names at once;
+- there is no `Barrier` and no leader: formatting starts when the ids are sorted and an hour and all
+  hours before it are summarised; each thread unmaps its scratch once every summary is taken.
+
+Paired wall time over 20 rounds in one container: 0.916 of 10f17ed. Peak 13.5-13.9 against 13.9 MB
+(local). Board: 18.33 / 18.39 ms, 12.80 / 12.91 MB, 86.83 / 86.75 (run-19f4ee4ee384 and
+run-1447925e19cf).
+
+**13. Two parse trims and a non-PIE binary (A5, 119981d).** `swar` no longer masks with 0x0F (the
+bytes it gets are already 0-9), and the `Names` arrays are inline, so a probe needs no pointer load
+first: instructions -1.8%, user cycles x0.987, user + kernel x0.984 (10 rounds, 12 threads). The
+binary is static and not PIE (`-C relocation-model=static`), which skips the self-relocation at
+exec. Board: 18.28 ms, 12.85 MB, S 443, 86.85 (run-1786b88da083), the best run of this track.
 
 ## Findings specific to the scoring box
 
@@ -229,6 +263,9 @@ a slow stretch of the box.
 - **The page-table lock.** In r9's profile the page-table spinlock was about 4% of cycles:
   fault-around on input page-table pages shared by neighbouring chunks, faults on record pages that
   all threads were filling, and the zap. Strided chunks (mechanism 5) cut it to 2.3-2.6%.
+- **Exec and startup.** A static, non-PIE binary skips self-relocation at exec, and workers cut
+  their own chunks, so the first thread starts 0.16-0.4 ms after `main` began, not 0.6-0.9 ms
+  (mechanism 12).
 - **pread against mmap.** Reading each chunk into a 64 KB per-thread buffer (no input mapping, no
   zap) lost on the board: 23.21 ms (run-51d1a447cef1) against 21.49-21.98 ms for the mapped
   versions around it. Locally its parse cost ×1.25 user + kernel cycles: the kernel copy ran at
@@ -278,7 +315,14 @@ a slow stretch of the box.
 | 28 | b5f8df8 | Same A code as step 27 | run-1e9d7e96bee5 | 19.91 | 13.49 | 439 | 85.74 |
 | 29 | a8fb336 | A3 round 2 (403034e): output mapped at the parse barrier, each hour formatted as soon as it and the hours before it are summarised, the last 24 MB in 512 KB chunks; on a slow stretch of the box (unchanged C and D code ran 6-10% slow in the same push) | run-2c2546d31c68 | 19.66 | 13.53 | 439 | 85.86 |
 | 30 | 96c67ed | Same A code as step 29 | run-0ce6f8512645 | 19.90 | 12.86 | 439 | 85.95 |
-| 31 | d9663e9 | Same A code as step 29 (the shipped commit) | run-eaa93041cda1 | 19.76 | 13.08 | 439 | 85.95 |
+| 31 | d9663e9 | Same A code as step 29 (the A3 commit) | run-eaa93041cda1 | 19.76 | 13.08 | 439 | 85.95 |
+| 32 | a5424af | A5 (4ad0fec): workers find their own chunk edges; output mapped in `main`; the thread that completes the parse unmaps the input and sorts the ids; no barrier or leader; non-PIE static binary | run-19f4ee4ee384 | 18.33 | 12.80 | 444 | 86.83 |
+| 33 | 2969af0 | Same A code as step 32 (C pinning pushed) | run-1447925e19cf | 18.39 | 12.91 | 444 | 86.75 |
+| 34 | 0e6cbba | Experiment 80a3856: the input zapped 8 chunks at a time; reverted | run-d0e5effa5996 | 19.37 | 12.92 | 447 | 86.17 |
+| 35 | 99b3888 | Experiment 10d1631 (with 80a3856): record blocks reused across hours; reverted | run-663d09421415 | 20.10 | 13.62 | 464 | 85.42 |
+| 36 | ccff89d | Back to 4ad0fec (run ID not recorded) | | 18.23 | 12.93 | 444 | 86.84 |
+| 37 | 1f2babf | A5 (119981d): 4ad0fec plus two parse trims (the shipped code) | run-1786b88da083 | 18.28 | 12.85 | 443 | 86.85 |
+| 38 | 01feb2f | Same A code as step 37 (C changed) | run-b150905186c7 | 19.08 | 13.07 | 443 | 86.31 |
 
 **r10 and r11 are not in the shipped code.** Both ran within the noise of r9 (steps 12-16). The A2
 line was built on r9 instead and beat both (steps 18-23), so the shipped parse has one cursor per
@@ -343,6 +387,16 @@ and about 15 per record to formatting.
 | Merged exits in `same()` (A3) | fewer lines | +24M instructions | |
 | `Names::add` re-probing through `id()` (A3 round 2) | −3 lines | +12M instructions in the parse loop | |
 | Non-mmap output fallback (A3) | | dropped (not needed once the output mapping is made at the barrier) | −lines |
+| Batched zap: the input zapped 8 chunks at a time (A5, 80a3856) | about 4x fewer TLB shootdowns | locally kernel x0.959, user + kernel x0.974 (8 rounds); board 19.37 ms, 86.17 (run-d0e5effa5996) | the 16 MB zap ran inside the `prog` mutex, so threads finishing chunks queued behind it. A version that zaps after the lock is released (+4 lines) measured user + kernel x0.981 under heavy laptop load, not clear enough to send |
+| Record blocks reused across hours (A5, 10d1631) | fewer faults | locally 1 thread: faults 10,182 → 7,229, kernel x0.81, user + kernel x0.93; 12 threads 11,082 → 8,916. Board 20.10 ms, 13.62 MB, S 464, 85.42 (run-663d09421415, with 80a3856) | on the box, fresh faults plus per-hour zaps beat the shared spare list and the zeroing. Reverted (ab75947). Earlier attempts: a mutex pop in a cold `block()` +19M instructions, per-thread spare lists +25M |
+| Full streaming output: format every hour during the parse (A5) | no tail | the tail fell from about 4.4 to 1.1-1.3 ms, but the parse got longer by the same work, and memory rose 1.7 MB (scratch, records and input page tables alive while the output is nearly complete) | holding back 12 or 24 hours gave the same peak |
+| Sorted insertion of names under the add lock (A5) | no sort at the end | sample set x1.08-1.11 | the lock is held about 0.4 us per new name while all threads discover names at once; replaced by the prefix-keyed sort at parse completion |
+| 4 shared scratch slots instead of one per thread (A5) | less memory | the sample set took 18 rounds of summaries at the end, x1.08 | per-thread scratch kept |
+| Histogram select (464 log buckets) for groups over 64/160/320/1000 (A5) | fewer passes than three quickselects | instructions up 8-20M | `select_nth_unstable` costs only about 15-20 instructions per value here |
+| Two-stage parse in batches of 32 (A5) | shorter dependency chains | +44M instructions, user cycles x1.055 | LLVM still rematerialises the SWAR constants and spills `last` and the length |
+| Fixed 128-byte name copy in `write_hour` (A5) | fewer instructions | −1.2M instructions, cycles flat | not worth 3 lines |
+| Strided format order, hours 14 apart, against the output PTE lock (A5) | less lock contention | spinlock share within noise (the `finish_fault` PTE lock is about 0.5% of samples) | |
+| LAG 64 (A5) | | not judgeable on the loaded laptop | |
 
 ## Correctness
 
@@ -367,6 +421,11 @@ Design points that carry correctness:
 - **Percentiles:** nearest rank as `(q·n + 99)/100 − 1`, zero-based.
 - **5xx:** the status's first digit is `5`, so 499 is not an error and 500-599 are.
 - **Regions:** sized for the worst case, every line in one hour at two words each.
+- **Output bound:** `summary.txt` is mapped at 72 × 2,047 × 213 bytes (an hour has at most 2,047
+  lines of at most 213 bytes) and cut to the exact sum of the hours' sizes at the end.
+- **Name order:** the ids are sorted on the first 32 bytes of the zero-padded copy, then the whole
+  name, which is the byte order of the names. A5 was gated on G1, G2 and G3 at 1, 2, 7 and 12
+  threads, the holdout seeds 11 and 12, and the 6 synthetic cases at 1, 3 and 12 threads.
 
 ## How to reproduce
 

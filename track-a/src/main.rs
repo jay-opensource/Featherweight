@@ -23,7 +23,7 @@
 //! Box-specific decisions (scoring box: i5-13500, THP "always", `/out` is a tmpfs charged as memory;
 //! PERF.md "Findings specific to the scoring box"):
 //! - Memory: hours are summarised and freed while the parse runs, so the 12.55 MB of records are
-//!   never all alive. Board memory about 20 MB to 13.1 MB (mechanism 10, run-eaa93041cda1).
+//!   never all alive. Board memory about 20 MB to 12.8 MB (mechanism 10, run-19f4ee4ee384).
 //! - THP: every big buffer is our own `mmap` with MADV_NOHUGEPAGE (`anon`), thread stacks are 256 KB
 //!   and malloc keeps one arena, because a 2 MB page is charged whole for its first touched byte.
 //! - Page-table work: threads give back their chunk's input pages (`zap`) and each hour's output
@@ -33,6 +33,10 @@
 //!   page-cache pages are scattered (mechanism 4: separator-load stall 13.4% to 5.8%).
 //! - If a line turns up in an hour already summarised (never in generated data), the whole run
 //!   starts over with no early release, so the output is exact for any line order.
+//! - No serial section at either end: workers find their own chunk edges (`edge`), the output is
+//!   mapped before the threads start, and the thread that completes the parse unmaps the input and
+//!   sorts the ids while the rest finish the last summaries (mechanism 12, run-19f4ee4ee384). The
+//!   binary is static and not PIE (`.cargo/config.toml`), which skips self-relocation at exec.
 use std::arch::x86_64::*;
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
@@ -559,6 +563,8 @@ fn main() {
         let prog = Mutex::new((vec![None; chunks], 0, 0, false));
         // Each hour's output size, usize::MAX until it is summarised.
         let bytes: Vec<AtomicUsize> = (0..HOURS).map(|_| AtomicUsize::new(usize::MAX)).collect();
+        // Endpoint ids in name order; set once by the thread whose chunk completes the parse, and
+        // formatting starts when it is set.
         let order: OnceLock<Vec<usize>> = OnceLock::new();
         let work = || {
             let mut cur = [(4 * B - 4) as *mut u32; HOURS];

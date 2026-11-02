@@ -6,20 +6,22 @@ read `requests.log` (239 MB, about 3.1 million lines of timestamp, method, endpo
 latency) and write, for every hour and endpoint, the request count, the nearest-rank p50, p95 and
 p99 latency, the 5xx count and the 5xx rate in parts per million.
 
-Board result for the shipped code (d9663e9): **19.76 ms, 13.08 MB, 439 lines, 85.95 points**
-(run-eaa93041cda1; the same code ran 19.66-20.77 ms and 12.86-13.64 MB in four other runs). The
-reference takes 32.047 s and 228 MB. [PERF.md](PERF.md) has every step with its run ID and the experiments
+Board result for the shipped code (119981d): **18.28 ms, 12.85 MB, 443 lines, 86.85 points**
+(run-1786b88da083; the code one step earlier, 4ad0fec, ran 18.33 and 18.39 ms at 12.8-12.9 MB, and
+the shipped code once ran 19.08 ms, run-b150905186c7). The reference takes 32.047 s and 228 MB. [PERF.md](PERF.md) has every step with its run ID and the experiments
 that lost.
 
 ## Approach
 
 **Mapping the input.** The log is mapped read-only, so the page cache that already holds it is not
-charged to us. At least 4 KB of zeros sit just past its end, so the parser may always read 64 bytes
+charged to us. Nothing touches it before the threads start. At least 4 KB of zeros sit just past its end, so the parser may always read 64 bytes
 ahead without a bounds check.
 
-**Splitting the work.** The file is cut into line-aligned chunks of 2 MB (the last 24 MB into 512 KB
-chunks, so the threads finish together), and threads claim them in file order from a shared
-counter, but never more than 32 chunks past the oldest one not yet parsed.
+**Splitting the work.** The file is cut into chunks of 2 MB (the last 24 MB into 512 KB chunks, so
+the threads finish together), and threads claim them in file order from a shared counter, but never
+more than 32 chunks past the oldest one not yet parsed. A chunk starts at the first line start at or
+after its edge, and the thread that claims it finds that start itself, so the cut costs no serial
+time before the threads start.
 
 **Parsing.** Every line becomes one 4-byte record: 11 bits of endpoint id, one bit for a 5xx status
 and 20 bits of latency. A latency of 2^20 − 2048 or more keeps its low 11 bits in the record and
@@ -34,7 +36,8 @@ the rest in a second word, whose endpoint id is 0. Nothing on a line is searched
 - **Two cache lines 1 KB ahead** are prefetched for every line. The hardware prefetcher stops at
   each 4 KB page, and page-cache pages are scattered in memory.
 
-**Endpoint ids.** All threads share one open-addressing table of 8,192 slots. A CRC32 of the
+**Endpoint ids.** All threads share one open-addressing table of 8,192 slots, held inline in the
+shared struct so a probe needs no pointer load first. A CRC32 of the
 endpoint's length, first 16 and last 8 bytes picks the slot. The name is then compared byte for
 byte against its copy in a small arena, padded to whole 64-byte lines, so a lookup usually reads one
 cache line. A new name is added under a lock, 1,842 times in all.
@@ -65,7 +68,7 @@ mapping can be shared), sized to a sparse upper bound (tmpfs allocates only what
 mapped; the file is cut to the exact size at the end. When the last chunk is parsed, its thread
 releases the input's page tables and sorts the endpoint ids by name, keyed on the first 32 bytes
 of each zero-padded name copy (ties fall back to the whole name), while other threads summarise
-the last hours. From then on each thread formats an hour straight into the file, two digits at a
+the last hours. Nothing waits for it at a barrier or a leader. From then on each thread formats an hour straight into the file, two digits at a
 time, as soon as that hour and all hours before it are summarised. Each hour's output pages are dropped from our page tables once written; the data
 stays in the file. The process then exits without freeing anything.
 
@@ -79,7 +82,8 @@ Thread stacks are 256 KB and malloc keeps one arena.
 **Threads.** One pool of threads runs the parse, the statistics and the formatting, with no
 barrier: each thread takes the next summary, hour to format or chunk, in that order. Each thread
 finds its own chunk's line boundaries, so nothing touches the input before the threads start.
-Each thread unmaps its summary scratch once every summary is taken, before the output grows.
+Each thread unmaps its summary scratch once every summary is taken, before the output grows. The
+binary is static and not PIE (`relocation-model=static`), so exec skips self-relocation.
 
 ## Build and run
 
@@ -98,7 +102,7 @@ checks the published hashes (see PERF.md).
 |---|---|
 | `src/main.rs` | The whole program: the parse, the interner, the per-hour statistics, the output |
 | `Cargo.toml` | No dependencies; release profile with fat LTO, one codegen unit, `panic = "abort"` |
-| `.cargo/config.toml` | Build flags: AVX2, BMI1/2, LZCNT, POPCNT, SSE4.2 (the i5-13500's instruction sets) and a static binary |
+| `.cargo/config.toml` | Build flags: AVX2, BMI1/2, LZCNT, POPCNT, SSE4.2 (the i5-13500's instruction sets) and a static, non-PIE binary |
 | `Dockerfile` | The board's two-stage Rust build, offline |
 | `PERF.md` | Every board run, the measurements behind each choice, and what did not work |
 
@@ -108,10 +112,10 @@ None: Rust standard library only.
 
 ## With another 24 hours
 
-- Overlap the formatting of the first hours with the last two or three summaries (the tail is about
-  one hour's summary, ~0.6 ms on the box).
+- Shrink the tail further. Formatting every hour during the parse cut the tail from 4.4 to about
+  1.2 ms locally but made the parse longer by the same work and cost 1.7 MB, so it needs a way to
+  format without keeping the scratch and the input page tables alive.
 - A software-pipelined interner: hash the next line and prefetch its slot while this one is
   compared.
-- Smaller chunks at the end of the parse still, to shrink the last thread's idle time.
-- Find p50, p95 and p99 of the largest groups from one log-bucket histogram instead of three
-  quickselects.
+- Per-line parse work is about 140 instructions with structural spills; two ways to cut it (a
+  two-stage batched parse and a log-bucket histogram select) were slower, see PERF.md.

@@ -11,11 +11,16 @@ the run IDs are the record.
 | Reference (Python) | | | 14.444 s | 367.4 MB | 108 | 0 |
 | First correct entry | run-0c6e9d04253d | fe231bc | 51.4 ms | 11.7 MB | 549 | 70.9 |
 | Before the final rounds (C2) | run-be0296de8c66 | bbee872 | 30.44 ms | 12.04 MB | 378 | 77.67 |
-| **Best** | **run-5feec0fbae92** | **96c67ed** | **28.38 ms** | **11.82 MB** | **373** | **78.56** |
-| **The shipped code** | **run-53e6d6a5450b** | **d9663e9** | **30.78 ms** | **11.80 MB** | **373** | **77.68** |
-| The same C code, other runs | run-b1d4224ea8b9, run-97705ac8c0bf | b5f8df8, a8fb336 | 29.12, 31.77 ms | 11.61, 11.50 MB | 373 | 78.35, 77.45 |
+| C4 (stored names, 3.15 MB dictionary) | run-5feec0fbae92 | 96c67ed | 28.38 ms | 11.82 MB | 373 | 78.56 |
+| C6 fingerprint dictionary (68391ae) | run-fa0a945bb7b4 | 2a04827 | 25.49 ms | 8.97 MB | 362 | 81.02 |
+| **Best, and the shipped code (8509525: locked-OR bits)** | **run-52a91432fca0** | **1f2babf** | **24.94 ms** | **8.63 MB** | **349** | **81.54** |
+| The same code, another run | run-02fa2d778aad | ccff89d | 26.13 ms | 9.24 MB | 349 | 80.74 |
+| Dropped: startup change (ee7290e) | run-9b9bbe26dc06 | 01feb2f | 25.66 ms | 10.71 MB | 350 | 80.28 |
 
-The best run is 509 times faster than the reference with 31.1 times less memory; the shipped code's run, 469 times and 31.1 times. The four runs of the final C code span 28.4 to 31.8 ms (see board noise below). Points are the board's:
+The best run is 579 times faster than the reference with 42.6 times less memory. The two runs of
+the final C code span 24.9 to 26.1 ms. The C6 changes (steps 32-39) took the track from 28.4 ms /
+11.8 MB / 78.56 to 24.9 ms / 8.6 MB / 81.54: the fingerprint dictionary alone was -2 MB and -3 ms.
+Points are the board's:
 `50·log10(K)` with K = (T_ref/T)^0.5 × min(50, M_ref/M)^0.2 × min(1, S_ref/S)^0.15. At this
 operating point 1% of T is worth about 0.11 points, 1% of M about 0.04, and 10 lines about 0.09.
 
@@ -74,6 +79,8 @@ per-thread aggregates, and its name goes to one shared dictionary and sets one b
 | C2 v2 (shape parse, SIMD numbers, AES hash) | 379 | 228 | 19 | 90 | 48 |
 | Shipped (5c8dd35) | 399 | | | | |
 | C3 (5671ab1): popcount after the barrier, bucket index kept in the record | 383 | | | | |
+| C6 fingerprint dictionary (68391ae) | 352 | | | | |
+| C6 locked-OR bits (8509525, the shipped code) | 340 | | | | |
 
 The phase columns come from builds that skip parts of the work. The 64-byte buckets added after v2
 cost 15 instructions per record and roughly halved the branch misses.
@@ -113,40 +120,51 @@ squeezed out of the amount's last 8 bytes) are joined in one AVX2 register. The 
 digits are masked off, then `maddubs`, `madd` and `mul_epu32` combine digits in pairs, fours and
 eights. Together with the AES hash below: 430 → 379 instructions per record (v2).
 
-**4. One shared name dictionary, one cache line per lookup.** A bucket is 64 bytes with three
-slots: three 32-bit headers (13 bits of hash tag, a set bit, and the dense id + 1) and three
-16-byte keys. A key is the name's first 16 bytes, zero-padded; a longer name keeps its length and
-the rest of its words in a side store. The hash is two AES rounds over the key xor its length. A
-lookup reads one line (prefetched) and finds its slot with one compare of the three headers. The
-key is the raw, still-escaped name: escaping is a bijection, and `""` and an empty unquoted field
-both give the empty key, so this counts exactly the distinct unescaped names. 49,152 buckets
-(3.15 MB) hold the 100,520 names; one name in seven goes on to the next bucket. An insert claims
-its slot with one compare-exchange, and ids come in blocks of 64 per thread.
-- Before: linear probing over 24-byte slots, 2.55-2.65 probes per lookup and about 1.2 branch
-  misses per record.
-- Buckets: branch misses 4.1M → 2.2M on 1 thread. The whole C2 core (v4): 12-thread cycles
-  1.48G → 1.19G.
+**4. One shared fingerprint dictionary, one cache line per lookup (C6, 68391ae).** The dictionary
+stores no names. A bucket is 64 bytes, eight 64-bit entries `fingerprint | id + 1` (0 is empty):
+44 bits of a 128-bit hash of the whole raw, still-escaped name, the dense id + 1 in the low 20 bits,
+and bit 63 always set. The hash is three AES rounds over 32-byte windows of the name, zero-padded
+(escaping is a bijection, and `""` and an empty unquoted field both give the empty name, so this
+counts exactly the distinct unescaped names). The bucket is chosen by 14 other bits of the hash:
+16,384 buckets, 1 MB, for the 100,520 names. A lookup reads one line (prefetched during the parse)
+and compares all eight entries at once with two AVX2 compares; a full bucket goes on to the next,
+and a bucket counts as full at 7 of 8 slots. An insert claims its slot with one compare-exchange,
+and ids come in blocks of 64 per thread.
+- Identity is 44 stored bits plus 14 bucket bits of the hash: for 1e5 names a collision has
+  probability about 3e-8 per run. Names of up to 120 bytes (31, 32, 33, 63, 64, 65, escapes,
+  trailing-space twins) matched the reference on generated files at 1, 2 and 12 threads.
+- Before (C2 to C5): 49,152 buckets (3.15 MB) of three slots, each a 32-bit header and a 16-byte
+  key, with the rest of a long name in a side store (one name in seven went to the next bucket),
+  and before that linear probing over 24-byte slots (2.55-2.65 probes per lookup, about 1.2 branch
+  misses per record).
+- Fingerprints against stored names, 12 threads local: instructions 383 → 352 per record, user
+  cycles 0.898G → 0.736G (-18%), branch misses 2.26M → 1.43M, about -2 MB. Board: 25.49 ms,
+  8.97 MB, S 362, 81.02 (run-fa0a945bb7b4), from 28.56 ms and 11.46 MB.
 
 **5. Lookups in batches of 32, prefetched during the parse.** While a batch is parsed, each
 record's bucket and region byte are prefetched; the batch then does its lookups. Removing the
 bucket prefetch cost +0.5G cycles, removing the region prefetch +0.25G (1 thread). Looking each
 record up right after parsing it saved 9% of instructions but cost 15-25% more cycles.
 
-**6. Distinct names without a locked instruction per record.** Distinct names per country are one
-bit per (country, name id), laid out as [page of 4096 ids][country][64 words], about 3 MB. 90% of
-the records set a new bit, and its cache line is usually owned by another core. A `lock or` per
-record cost +20 ms at 12 threads, against +1 ms for a plain (racy) OR. Instead, each thread queues
-(word, bit) pairs per region of the array (64 regions × 64 pairs) and applies a full queue with
-plain loads and stores under that region's mutex. A word always maps to the same lock, so each bit
-turns on exactly once, and that is when its country's distinct count goes up: no counting pass at
-the end. The apply loop first prefetches all its words for writing. Without that, 1-thread cycles
-rose 0.94G → 1.10G and 12-thread user cycles 1.00G → 1.19G.
-
-Distinct names are counted once, after the parse (C3, 16e30ca): `apply` only sets bits, and after
-the last queues are applied the threads wait at the barrier a second time and each popcounts a
-contiguous 1/T of the used bitset pages (those below the id counter) into its per-group counts.
-This dropped the per-bit count from the locked section: 399 → 394 instructions per record, and
-12-thread user cycles −3.1% (better in 14 of 20 interleaved rounds).
+**6. Distinct names: bits set by a locked OR on words prefetched for writing (C6, 8509525).**
+Distinct names per country are one bit per (country, name id), laid out as
+[page of 4096 ids][country][64 words], about 3 MB. 90% of the records set a new bit, and its cache
+line is usually owned by another core. A `lock or` per record straight after the lookup cost +20 ms
+at 12 threads (step 1), because it waits for the line and blocks every later load meanwhile. Between
+C2 and C5 the bits went through per-region queues (64 regions × 64 pairs) applied under a mutex per
+region. Now `flush` computes each record's bit word as its id is found and issues a prefetch for
+writing on it, and after the batch's 32 lookups ORs the bits in with `fetch_or`: by then the lines
+have arrived. The prefetch must be `prefetchw`: `_MM_HINT_ET0` compiled to `prefetcht0` until
+`+prfchw` went into `.cargo/config.toml` (7c8b895, user cycles -2.3%), and a read prefetch makes each
+store upgrade the line again.
+- Removed: the region queues, their locks and `apply`; 192 KB of stack; 353 → 340 instructions
+  per record, user cycles -2.2%, S 362 → 349. Board: 24.94 ms, 8.63 MB (run-52a91432fca0).
+- Distinct names are counted once, after the parse (C3, 16e30ca): after the last bits are set the
+  threads wait at the barrier a second time and each popcounts a contiguous 1/T of the used bitset
+  pages (those below the id counter) into its per-group counts: 399 → 394 instructions per record
+  and 12-thread user cycles -3.1% (better in 14 of 20 interleaved rounds).
+- Deferring the ORs by one batch (so the RFOs have surely completed) gave 0.675G against 0.677G
+  cycles: what remains is the locked OR's own cost, not its miss.
 
 **7. Map the shared tables before the threads touch them (variant M, step 22; reworked in 10 and 11).** The 11.7% in the
 page-table lock came from first-touch faults on the dictionary and the bitset (`apply` 6.3%,
@@ -174,9 +192,11 @@ a second run (run-665e917d324d). An earlier P build mapped each thread's buffer 
 contended on the address-space lock; all buffers are now one allocation made before the threads
 start.
 
-**9. 2 MB pages where every byte is used (step 25; extended in 13).** Allocations are 2 MB-aligned, and the first
-2 MB of the dictionary (3.15 MB, all touched) and of the bitset (ids below 16,384, all touched at
-full scale) get `MADV_HUGEPAGE`. Both ranges are fully used, so resident memory does not change
+**9. 2 MB pages where every byte is used (step 25; extended in 13; now the first 4 MB).**
+Allocations are 2 MB-aligned, and the first 2 MB of the dictionary (then 3.15 MB, all touched) and
+of the bitset (ids below 16,384, all touched at full scale) got `MADV_HUGEPAGE`. With the 1 MB
+fingerprint dictionary the mapping is the dictionary then the bits, and its first 4 MB (the
+dictionary and the bits of ids below 98,304) are on two 2 MB pages, all used at full scale. Both ranges are fully used, so resident memory does not change
 (RssAnon 8,952 kB either way; AnonHugePages 0 → 4,096 kB) while the TLB covers more. Locally:
 1 thread −4% cycles; 12 threads user −4.5%, kernel −9%, task-clock −9%. Shipped together with a
 line pass (399 → 378 lines): board **30.44 ms** (run-be0296de8c66).
@@ -217,7 +237,8 @@ call fail silently with EINVAL: +527 faults). Memory.peak median 13.03 → 12.52
 advised its first 6 MB (the whole dictionary and the bits of ids below 98,304, all used at full
 scale): three huge pages, three mapping threads. RssAnon is unchanged (8,504 vs 8,508 kB),
 AnonHugePages 4,096 → 6,144 kB; 12 threads user cycles −0.9% to −3.7%, kernel −2.6% to −9%,
-task-clock −3.5% to −4.8%; board 30.89 → 29.12 ms (run-b1d4224ea8b9).
+task-clock −3.5% to −4.8%; board 30.89 → 29.12 ms (run-b1d4224ea8b9). Since the fingerprint
+dictionary the advised range is 4 MB and two threads map the two pages.
 
 ## Findings specific to the scoring box
 
@@ -284,7 +305,15 @@ task-clock −3.5% to −4.8%; board 30.89 → 29.12 ms (run-b1d4224ea8b9).
 | 28 | b5f8df8 | C4 (4b5a3b2): dictionary and bitset in one mapping, its first 6 MB on 2 MB pages, one mapping thread per page | run-b1d4224ea8b9 | 29.12 | 11.61 | 373 | 78.35 |
 | 29 | a8fb336 | Same C code as step 28, on a slow stretch of the box (the same push ran D at 140 ms instead of 133) | run-97705ac8c0bf | 31.77 | 11.50 | 373 | 77.45 |
 | 30 | 96c67ed | Same C code as step 28 | run-5feec0fbae92 | 28.38 | 11.82 | 373 | 78.56 |
-| 31 | d9663e9 | Same C code as step 28 (the shipped commit) | run-53e6d6a5450b | 30.78 | 11.80 | 373 | 77.68 |
+| 31 | d9663e9 | Same C code as step 28 (the C4 commit) | run-53e6d6a5450b | 30.78 | 11.80 | 373 | 77.68 |
+| 32 | 2a04827 | C6 (68391ae): fingerprint dictionary, 1 MB of 16,384 buckets of 8 entries, AES-hashed whole names, AVX2 compare; 373 → 362 lines | run-fa0a945bb7b4 | 25.49 | 8.97 | 362 | 81.02 |
+| 33 | a5424af | C6 (7c8b895): `+prfchw` so the write prefetch compiles to `prefetchw` (neutral on the board) | run-0c2e708e887d | 25.48 | 9.05 | 362 | 80.98 |
+| 34 | 2969af0 | Experiment 8c015d1: all 4 KB first touches on main's CPU, against memcg charge batches; reverted | run-2891fc5ceb19 | 25.81 | 10.17 | 405 | 79.97 |
+| 35 | 0e6cbba | Back to 7c8b895 | run-a4ff52bbb541 | 25.84 | 8.86 | 362 | 80.92 |
+| 36 | 99b3888 | Same C code as step 35 (run ID not recorded) | | 25.34 | 9.00 | 362 | 81.07 |
+| 37 | ccff89d | C6 (8509525): bits set by a locked OR on words prefetched for writing; region queues and `apply` removed; 362 → 349 lines | run-02fa2d778aad | 26.13 | 9.24 | 349 | 80.74 |
+| 38 | 1f2babf | Same C code as step 37 (the shipped code) | run-52a91432fca0 | 24.94 | 8.63 | 349 | 81.54 |
+| 39 | 01feb2f | Experiment ee7290e: the last threads to start populate the 2 MB pages, main runs the thread body; dropped | run-9b9bbe26dc06 | 25.66 | 10.71 | 350 | 80.28 |
 
 **What steps 4 to 16 taught.** The 02:56 code (step 4) ran 43.3-43.7 ms four times. Every later
 version ran 46.5-50.9 ms, even with fewer instructions locally. Steps 15 and 16 bisected that on the
@@ -328,6 +357,23 @@ lines was worth more points than the time it lost. Steps 22 and 23 then removed 
 | Private per-thread bitsets (C4) | no sharing | +18% cycles | 36 MB does not fit in L3 |
 | Trim `record` with a `KEEP[n]` digit-mask table, `pext` for the dot, an `EDGE` table for the name mask (C5, v2/v3) | −10 instructions per record | 383 → 373-375 instructions; 12-thread user cycles 0.905G / 0.892G against 0.90G (−1%, noise) | the parse is stalled, not instruction-bound |
 | The record loop in a call-free `fill()` returning each full batch (C5, v4) | fewer spills | +5 instructions per record (388) | LLVM still spills around ~10 live scalars; the state load and store per batch cost more than they save |
+| One-CPU first touches (C6, 8c015d1): main pins itself and takes all 4 KB first touches | memcg per-CPU charge batches stop inflating memory | locally memory.current minus (anon + kernel + file) fell 1.4-2.0 → 0.6-0.8 MB; board 25.81 ms, 10.17 MB, S 405 (+43 lines after rustfmt), 79.97 (run-2891fc5ceb19) | memory went up on the box, not down. Reverted |
+| Startup: the last threads to start populate the 2 MB pages, main runs the thread body (C6, ee7290e) | the populate holds the address-space lock that each thread start needs for its stack | counters neutral locally; board 25.66 ms, **10.71 MB**, S 350, 80.28 (run-9b9bbe26dc06) against 24.94 ms, 8.63 MB for 8509525 | memory +1.7 MB for no time. Dropped; the shipped code is 8509525 |
+| Names partitioned by hash among threads, each owner doing lookups and bits in its L2, messages via ticketed inboxes (C6) | cache-local lookups | 6 threads +10% cycles, 1 thread +50%; 12 threads livelock with spin waits (3.6 s), +8% with yield | the drain is dominated by unprefetched lookups |
+| Bit regions owned by threads, queues appended to the owner's inbox under a mutex (C6) | fewer RFOs | RFO misses 1.36M → 0.79M but L2 demand misses 0.22M → 1.55M; with a prefetch pass -1.3% cycles | noise; not worth the lines |
+| `apply` without prefetch, or with a rolling distance-8 prefetch (C6) | | +3.5% / +2% at 1 thread, +2% / +1.5% at 12 | the batch-wide prefetch for write won |
+| Prefetch of the previous record's bucket and tab (C6) | | +10 instructions per record, cycles -0.6% at 12 threads | |
+| Dictionary of 20,480 or 24,576 buckets (C6) | keys off their home bucket 6.8% → 2.4% / 0.9% | cycles -1.3% / -1.4%, +0.25 / +0.5 MB | net about 0 |
+| `tab` on its own 2 MB page; `tab`, thread state and read buffers on a third 2 MB page (C6) | fewer TLB misses | cycles -0.4%; -2..3% but +0.37 MB (the third page is partly used) | STLB hits unchanged (24M, about 7 per record, not from `tab`) |
+| Yielding spin barriers instead of `Barrier` (C6) | | kernel cycles x2 under load | |
+| `record` not inlined (C6) | fewer spills in the loop | +33 instructions per record, +10% cycles | |
+| Threads started as a tree, log2 spawns on the critical path (C6) | shorter ramp | not judged: laptop too loaded (VM load 15-20) | |
+| Distinct names counted by the setting thread from the `fetch_or` result (C6) | no end popcount | user cycles +1.9% | LLVM emits a `lock cmpxchg` loop, not `lock bts` |
+| Faster end popcount (row sums, prefetch) (C6) | | the phase is only about 60 us per thread; -40 us | not worth a line |
+| `pext` for the amount's dot, `batch[nb & 31]` (C6) | | -2 / -1 instructions per record, cycles within noise | |
+| Overflow probe to the other bucket of the 128-byte pair first (C6) | L2 fetches pairs | +9 instructions per record (the probe counter leaks into the hot path), cycles +2% | |
+| Compact (rank) region table, 0.45 MB instead of 1 MB (C6) | about +0.27 points of memory | not built: about +15 lines and a dependent load | tab misses are already hidden by the prefetch (tab in 16 KB: no change) |
+| Batches of 20 or 48 instead of 32 (C6) | | flat | |
 | Single-round AES, CRC32 hash, block-level comma queues (C5) | fewer instructions | not built | judged poorer mixing / the same instruction count after the extractions / branchy extraction that mispredicts |
 
 ## Measured but not in the shipped build
@@ -337,7 +383,24 @@ lines was worth more points than the time it lost. Steps 22 and 23 then removed 
   5% slower). On the C2 code: instructions −4.2%, branch misses −2.4% / −6.2%, cycles −0.8% on
   1 thread (16 of 25 rounds won) and −1.1% at 12 threads (18 of 25). Not in the shipped build.
 
-## What is left: the floor, and why we stopped (C4, C5)
+## What is left: the floor, and why we stopped (C4, C5, C6)
+
+**After C6 (68391ae, local, 12 threads, knobs that skip parts of the work; wrong outputs):**
+
+| What-if | User cycles | Instructions per record |
+|---|---|---|
+| 68391ae | 0.728G | 352 |
+| no `apply` (bits not set) | 0.620G (-15%) | 336 |
+| no `apply` and no dictionary lookup | 0.521G (-28%) | 307 |
+| no tab prefetch | +6.5% (1 thread +16%) | 352 |
+| `tab` confined to 16 KB | no change | |
+
+At 1 thread 68391ae runs 0.465G cycles (IPC 2.5); 12 threads cost 0.73G (the hyper-thread sibling
+halves per-thread IPC to about 1.6, about 3.2 per core): the parse is throughput-bound per core,
+and the dictionary and the bit misses are about 30% of the cycles. The memory floor seen locally is
+an empty `main` at 4.43 MB in the bench container; our anonymous memory is about 6.2 MB
+(dictionary and bits 4 MB on 2 MB pages, `tab` 0.98 MB, read buffers 0.39 MB, stacks 0.29 MB,
+bits tail 0.13 MB). The rest of this section is the C4/C5 analysis at bbee872.
 
 C is stall-bound, not instruction-bound. At 12 threads the parse runs at IPC about 1.5. Perf
 annotate (12 threads, bbee872) put about 36% of the parse's samples on its two prefetch

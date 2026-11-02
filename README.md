@@ -8,11 +8,11 @@ page-table locks, exit teardown on one core) are measured and designed around.
 
 | Track | What it does | Best board run | T | M | Points | Docs |
 |---|---|---|---|---|---|---|
-| A: Ingest | per-hour, per-endpoint latency percentiles from a 239 MB log | run-eaa93041cda1 | 19.76 ms | 13.08 MB | 85.95 | [README](track-a/README.md), [PERF](track-a/PERF.md) |
-| C: Join | a hostile 193 MB CSV joined to a region table, aggregated per country | run-5feec0fbae92 | 28.38 ms | 11.82 MB | 78.56 | [README](track-c/README.md), [PERF](track-c/PERF.md) |
-| D: Traverse | 2,000 shortest paths on a 1.7M-node road graph | run-b28ea11afb16 | 125.30 ms | 62.50 MB | 72.93 | [README](track-d/README.md), [PERF](track-d/PERF.md) |
+| A: Ingest | per-hour, per-endpoint latency percentiles from a 239 MB log | run-1786b88da083 | 18.28 ms | 12.85 MB | 86.85 | [README](track-a/README.md), [PERF](track-a/PERF.md) |
+| C: Join | a hostile 193 MB CSV joined to a region table, aggregated per country | run-52a91432fca0 | 24.94 ms | 8.63 MB | 81.54 | [README](track-c/README.md), [PERF](track-c/PERF.md) |
+| D: Traverse | 2,000 shortest paths on a 1.7M-node road graph | run-0706657d930f | 120.30 ms | 62.73 MB | 73.39 | [README](track-d/README.md), [PERF](track-d/PERF.md) |
 
-Run IDs are the best run of each track; the shipped commit (d9663e9) scored 19.76 ms / 85.95 (A), 30.78 ms / 77.68 (C) and 127.00 ms / 72.92 (D). Each `PERF.md` lists every board run with its ID, the measurements behind each design choice,
+Run IDs are the best run of each track; the final code is A 119981d (its run at commit 01feb2f scored 19.08 ms / 86.31, run-b150905186c7), C 8509525 (24.94 ms / 81.54 in its best run; the startup commit ee7290e, run-9b9bbe26dc06, scored 25.66 ms / 80.28 and was dropped) and D at 01feb2f (120.30 ms / 73.39). Each `PERF.md` lists every board run with its ID, the measurements behind each design choice,
 what we found about the scoring box, and the experiments that lost. `tools/bench.py` builds a
 track and runs it with the board's container flags; `check.py` is the organisers' checker.
 

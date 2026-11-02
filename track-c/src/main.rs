@@ -32,6 +32,8 @@
 //! - THP: all memory is MADV_NOHUGEPAGE (a 2 MB page is charged whole to memory.peak) except the
 //!   first 4 MB of the dictionary and bitset, which are fully used anyway (9; run-be0296de8c66).
 //! - One thread pool, no second round of thread starts (11). The process ends without freeing.
+//! - Names are fingerprints in a 1 MB dictionary, not stored copies (4; run-0c2e708e887d, 25.48 ms,
+//!   9.05 MB). Best board run of this code: run-52a91432fca0, 24.94 ms, 8.63 MB.
 //! - Build flags are in .cargo/config.toml (x86-64-v3 plus PCLMULQDQ, AES, PREFETCHW; the intrinsics
 //!   below rely on them).
 use std::arch::x86_64::*;
@@ -164,7 +166,7 @@ type Words = &'static [AtomicU64];
 
 /// The state threads share in one run: tab (region id -> group: 0 is _UNMATCHED, countries are
 /// 1..); the name dictionary (buckets, and the next free block of 64 ids); and one bit per
-/// (group, name id), with a lock per region of it.
+/// (group, name id), set by locked ORs (no queues or per-region locks).
 ///
 /// A dictionary bucket is one cache line of eight entries `fingerprint | (id + 1)` (0 = empty): the
 /// fingerprint is 44 bits of the name's hash (`hash`), and the bucket is chosen by other bits of it.

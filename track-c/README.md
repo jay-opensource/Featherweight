@@ -7,11 +7,10 @@ quotes, embedded LFs, mixed CRLF/LF and stray byte order marks), join every reco
 through `regions.csv`, and write one line per country: count, id sum, amount sum, min and max in
 cents, distinct names, name bytes and note bytes.
 
-Board result for the shipped code (d9663e9): **30.78 ms, 11.80 MB, 373 lines, 77.68 points**
-(run-53e6d6a5450b). The same C code scored 28.38 ms, 11.82 MB, 78.56 points on another push
-(run-5feec0fbae92, commit 96c67ed), the best of four runs that span 28.4 to 31.8 ms. The reference
-takes 14.444 s and 367.4 MB. [PERF.md](PERF.md) has every
-step with its run ID and the experiments that lost.
+Board result for the shipped code (8509525): **24.94 ms, 8.63 MB, 349 lines, 81.54 points**
+(run-52a91432fca0; the other run of this code, 26.13 ms / 9.24 MB, run-02fa2d778aad, was on a push
+where the A code had changed). The reference takes 14.444 s and 367.4 MB. [PERF.md](PERF.md) has
+every step with its run ID and the experiments that lost.
 
 ## Approach
 
@@ -57,34 +56,39 @@ or copied. This relies on guarantees of spec 2.2, which the spec allows: ids and
 most 8 digits, amounts of at most 7 digits of cents, and a terminator after every record. PERF.md
 lists what the parser does outside them.
 
-**Names.** One dictionary is shared by all threads. Each bucket is one 64-byte cache line with
-three slots: a 32-bit header per slot (a hash tag and the name's dense id) and the name's first 16
-bytes; a longer name keeps the rest in a side store. The key is the raw, still-escaped name, which
-identifies the unescaped value exactly (escaping is a bijection, and `""` and an empty field both
-give the empty key). The hash is two AES rounds. A lookup reads one line and checks the three
-headers with one compare. A new name claims a slot with a compare-exchange and takes an id from a
-block of 64 that its thread holds.
+**Names.** One dictionary is shared by all threads, and it stores no names. It is 16,384 buckets of
+one 64-byte cache line, each with eight 64-bit entries: 44 bits of a 128-bit hash of the whole raw,
+still-escaped name (escaping is a bijection, and `""` and an empty field both give the empty
+name), the name's dense id + 1, and a top bit that marks the entry used. The hash is three AES
+rounds over 32-byte windows of the name, zero-padded. A lookup reads one line (prefetched) and
+compares all eight entries with AVX2; a full bucket goes on to the next. A new name claims a slot
+with a compare-exchange and takes an id from a block of 64 that its thread holds. The dictionary
+is 1 MB where the stored-name version needed 3.15 MB. Two names count as one only when their
+hashes agree in about 58 bits; for the 100,520 names of a run that has probability about 3e-8.
+Names of 1 to 120 bytes (31, 32, 33, 63, 64, 65, escapes, trailing-space twins) matched the
+reference on generated files at 1, 2 and 12 threads.
 
 **Batches.** Records are handled 32 at a time. While a batch is parsed, each record's dictionary
 bucket and region byte are prefetched; then the batch does its lookups and adds each record to its
 thread's aggregates for the country.
 
-**Distinct names per country.** One bit per (country, name id), about 3 MB. Setting 3 million bits
-that other cores just wrote with a locked OR stalled every thread. Instead each thread queues its
-bits by region of the array and, when a queue of 64 is full, applies it with plain loads and stores
-under that region's lock. Every bit therefore turns on exactly once. After the last queues are
-applied and all threads have reached the barrier, each thread popcounts its share of the used bitset
-pages into the per-country distinct counts, so the locked section only sets bits.
+**Distinct names per country.** One bit per (country, name id), about 3 MB. A locked OR on a line
+another core just wrote waits for it and blocks every later load meanwhile, so a batch first
+prefetches its 32 bit words for writing (`prefetchw`, hence `+prfchw` in the build flags; without it
+`_MM_HINT_ET0` compiles to a read prefetch) as the ids are found, and then sets the bits with
+`fetch_or`. Region queues, their locks and `apply` are gone. After all threads have reached the
+second barrier, each popcounts its share of the used bitset pages into the per-country distinct
+counts.
 
 **Memory.** All tables come from anonymous `mmap` that is never freed (the process ends first).
 They are marked `MADV_NOHUGEPAGE`: the scoring box backs memory with 2 MB pages, and `memory.peak`
-would charge a whole 2 MB page for its first touched byte. The exception is the first 6 MB of one mapping that holds the
-dictionary and then the bitset: all of the dictionary and the bits of the first 98,304 names are
-always fully used, so they go on 2 MB pages for the TLB at no memory cost. Each thread maps its
+would charge a whole 2 MB page for its first touched byte. The exception is the first 4 MB of one mapping that holds the
+dictionary (1 MB) and then the bitset: all of the dictionary and the bits of the first 98,304
+names are always fully used, so they go on 2 MB pages for the TLB at no memory cost. Each thread maps its
 share of the shared tables with `MADV_POPULATE_WRITE` before the barrier, and exactly one thread
 maps each 2 MB page, because threads racing to fault one in would each clear and charge a whole
-2 MB page. Resident anonymous memory is 8.5 MB (RssAnon, measured locally); the board reports
-11.8 MB for the whole cgroup.
+2 MB page. The board reports 8.63 MB for the whole cgroup (it was 11.8 MB with the 3.15 MB
+dictionary of stored names).
 
 **Output.** The per-thread aggregates are merged, the countries sorted by code with `_UNMATCHED`
 last, and the lines written in one call.
@@ -106,7 +110,7 @@ board's container flags and checks the published hashes (see PERF.md).
 |---|---|
 | `src/main.rs` | The whole program: regions, the parallel parse, the dictionary, the bitset, output |
 | `Cargo.toml` | No dependencies; release profile with fat LTO, one codegen unit, `panic = "abort"` |
-| `.cargo/config.toml` | Build flags: `target-cpu=x86-64-v3` plus `pclmulqdq` and `aes` (the i5-13500 has AVX2, BMI2, PCLMULQDQ and AES-NI) |
+| `.cargo/config.toml` | Build flags: `target-cpu=x86-64-v3` plus `pclmulqdq`, `aes` and `prfchw` (the i5-13500 has AVX2, BMI2, PCLMULQDQ, AES-NI and PREFETCHW) |
 | `Dockerfile` | The board's two-stage Rust build, offline |
 | `PERF.md` | Every board run, the measurements behind each choice, and what did not work |
 
@@ -116,12 +120,13 @@ None: Rust standard library only. CPU features come from `.cargo/config.toml`, n
 
 ## With another 24 hours
 
-- A new parse kernel. The parse is stalled (IPC about 1.5; ~36% of its samples sit on its two
-  prefetches), so trimming instructions does not pay: 10 fewer per record moved cycles by 0 to −1%.
-  The floor for this box is about 12-13 ms against 28-31 now; reaching it needs about 200
-  instructions per record instead of 383, with the table lookup and the numeric aggregates done at
-  parse time and the name lookup deferred through a small ring.
+- A new parse kernel. At 12 threads the parse is throughput-bound per core (IPC about 1.6 per
+  hyper-thread), so trimming instructions pays little: 10 fewer per record moved cycles by 0 to −1%.
+  The dictionary lookup and the bit ORs are about 30% of the cycles. The floor for this box is about
+  12-13 ms against 25 now; reaching it needs about 200 instructions per record instead of 340, with
+  the table lookup and the numeric aggregates done at parse time and the name lookup deferred
+  through a small ring.
 - Profile-guided optimisation: measured −1.1% cycles at 12 threads on this code, not yet shipped.
 - Keep each thread's state in pre-mapped memory to avoid thread-stack faults (about 100 traps per
   run, under 10 µs).
-- A rank/select region table (about −0.6 MB).
+- A rank/select region table (about −0.6 MB; judged not worth +15 lines and a dependent load).
