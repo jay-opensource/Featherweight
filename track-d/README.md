@@ -5,9 +5,9 @@ The task, the input files and the exact output format are in the
 read a directed, weighted road-like graph (`graph.txt`: 1,740,512 nodes, 5,000,000 edges, 88 MB of
 text) and 2,000 source-target pairs (`queries.txt`), and write each shortest-path length, or -1.
 
-Board result for the shipped code (d9663e9): **0.1270 s, 62.40 MB, 440 lines, 72.92 points**
-(run-14368b934a65). The best run of the same build code is run-b28ea11afb16 (96c67ed): 0.1253 s,
-62.50 MB, 458 lines, 72.93 points. The reference takes 72.69 s and 893 MB.
+Board result for the shipped code (d93b8f6): **0.11637 s, 59.89 MB, 483 lines, 73.75 points**
+(run-0c5c2a4acdd4), the best of our runs. The reference takes 72.69 s and 893 MB. Before the last
+round the same build ran 0.120-0.126 s at 62.7 MB (best run-0706657d930f, 73.39 points).
 
 ## Approach
 
@@ -27,12 +27,15 @@ through memory, so the program spends its effort on making that memory small and
    counting pass). Each bucket is then finished on its own: offsets are laid out from the slots' u16
    places and the slots are sorted by node in a 94 KB scratch copy. No atomics, and no store lands
    outside the bucket being worked on.
-3. **Breadth-first relabelling.** Node ids are a random relabelling of a road lattice, so a
-   search on the raw ids jumps all over memory. Each thread grows a breadth-first region from
-   its own seed (claiming nodes with one bit each in a 218 KB bitset) and the relabelled graph is
-   built from the first one by the same bucketed builder, with no separate copy; neighbours in the
-   network become neighbours in memory. The reverse graph is built from that with the same builder,
-   into the first graph's edge array, whose pages are already mapped.
+3. **Breadth-first relabelling in one pass.** Node ids are a random relabelling of a road lattice,
+   so a search on the raw ids jumps all over memory. Each thread grows a breadth-first region from
+   its own seed, claiming nodes with one bit each in a 218 KB bitset. A node is dequeued with its edge
+   list already in cache, so the walk gives it its new id (region and rank) and copies its slots with
+   one `memcpy` to the end of the region's segment of a scratch array, keeping one count byte per
+   node. A bucket pass then lays out the offsets and moves the slots into the first graph's mapped
+   edge array with every target rewritten, and counts the reverse graph's slots on the way. This
+   replaced a relabel builder whose 30 MB of staging were the memory peak (62.7 -> 59.9 MB). The
+   reverse graph is built from the result by the same bucketed builder into a fresh array.
 4. **Two-ended Dijkstra.** Forward from s and backward from t on the reverse graph, always
    expanding the side with fewer queued entries, stopping when the two queue minimums together
    reach the best meeting length. Over the 2,000 queries this settles 7.15M nodes instead of
@@ -74,7 +77,7 @@ board's container flags and checks the published hashes (see PERF.md).
 
 | File | What it is |
 |---|---|
-| `src/main.rs` | The whole program: parse and CSR builder, BFS relabelling, the two-ended search, the u64 fallback |
+| `src/main.rs` | The whole program: parse and CSR builder (`csr`), BFS relabelling (`relabel`), the two-ended search (`bidir`), `via` and the u64 fallback |
 | `Cargo.toml` | No dependencies; release profile with fat LTO, one codegen unit, `panic = "abort"` |
 | `.cargo/config.toml` | Build flags: `target-cpu=x86-64-v3` (AVX2, BMI2, LZCNT on the i5-13500) and a static binary |
 | `Dockerfile` | The board's two-stage Rust build, offline |
@@ -86,8 +89,11 @@ None (Rust standard library only).
 
 ## With another 24 hours
 
-- Collect the reverse graph's counts in the relabel finish (about -2 ms for about +10 lines), and
-  reuse the text's u16 places for the relabel (about -1 ms for +6 lines).
+- Fit the reverse graph's staging into pages the BFS already faulted in (chunked segments: reverse
+  kernel cycles 54M -> 22M, about +12 lines; the reverse build now writes fresh memory).
+- 3-byte slots: -7.7 MB measured, but +16-22% time with a direct-copy relabel. It would need the
+  relabel staged as per-node runs with escaped edges in per-bucket lists (estimated -7 MB at the
+  peak, +35-45 lines, about +0.1 points net).
 - Interleave the u32 block base and the u8 offsets in one cache line, so `off(v)` is one miss
   instead of two (about 25% of query samples); a plain 32-byte record was slower, so it needs a
   layout that keeps the base array cache-resident.

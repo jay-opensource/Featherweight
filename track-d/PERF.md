@@ -14,17 +14,20 @@ Local box: i5-11400H laptop (6 cores, 12 MB L3) running Docker; the scoring box 
 | Reference (Python) | | | 72.69 s | 893 MB | 43 | 0 |
 | First correct entry | run-811fef4b3870 | 941a1e3 | 1.340 s | 230.6 MB | 141 | 45.37 |
 | Before the final rounds (b1046aa) | run-3e0a39c47769 | b1046aa | 0.1337 s | 64.07 MB | 454 | 72.15 |
-| **Best, and the shipped code** | **run-ad2a7cbc4bf1** | **b7db2f2** | **0.1223 s** | **62.39 MB** | **454** | **73.23** |
-| Earlier best (before D6) | run-b28ea11afb16 | 96c67ed | 0.1253 s | 62.50 MB | 458 | 72.93 |
+| **Best, and the shipped code** | **run-0c5c2a4acdd4** | **d93b8f6** | **0.11637 s** | **59.89 MB** | **483** | **73.75** |
+| Same design, first version | run-1824e747e5f2 | 1f2babf (8f66c96) | 0.11857 s | 59.60 MB | 548 | 73.15 |
+| Previous best (the base of D8) | run-0706657d930f | 01feb2f | 0.12030 s | 62.73 MB | 454 | 73.39 |
+| Earlier best (D6) | run-ad2a7cbc4bf1 | b7db2f2 | 0.1223 s | 62.39 MB | 454 | 73.23 |
+| Earlier best (before D6, D5) | run-b28ea11afb16 | 96c67ed | 0.1253 s | 62.50 MB | 458 | 72.93 |
 | The same build code, other runs | run-665c3b98b9ee, run-1a26c84a5351, run-29a3a688b9e1 | 48198af, b5f8df8, a8fb336 | 0.1331, 0.1361, 0.1402 s | 63.28, 62.68, 62.52 MB | 430 | 72.43, 72.23, 71.92 |
 
-The best run is 580 times faster than the reference with 14.3 times less memory; the shipped code, 572 times and 14.3 times. Points are the
+The shipped code's best run is 625 times faster than the reference (72.69 s / 0.11637 s) with 14.9 times less memory (893 / 59.89 MB). Points are the
 board's: `50·log10(K)` with K = (T_ref/T)^0.5 × min(50, M_ref/M)^0.2 × min(1, S_ref/S)^0.15. At this
 operating point 1% of T is worth about 0.11 points, 1% of M about 0.04, and 10 lines about 0.07.
 
 ## Board runs
 
-"Same D code" rows re-ran unchanged D code (another track had changed); they sample the noise.
+Steps 51-60 are the D8 round (Nov 2). "Same D code" rows re-ran unchanged D code (another track had changed); they sample the noise.
 
 <!-- New runs: append a row with the next step number, and update the Result table above. -->
 
@@ -81,6 +84,16 @@ operating point 1% of T is worth about 0.11 points, 1% of M about 0.04, and 10 l
 | 48 | 96c67ed | Text parsed once with overflow restart; BFS claims in a bitset; helper inlining (7f21d9f) + far pairs first and the capped `via` fallback (D4) | run-b28ea11afb16 | 0.1253 | 62.5 | 458 | 72.93 |
 | 49 | d9663e9 | 18 fewer lines (b764d34): `store`, `Dial::min`/`clear`, `Pages::clear` inlined into their one caller, the query loop a while-let; behaviour unchanged | run-14368b934a65 | 0.1270 | 62.4 | 440 | 72.92 |
 | 50 | b7db2f2 | D6 (a604076): the relabelled build counts slots per node from g0's offsets; the reverse graph's counts are collected per 8192-node bucket in the relabel finish (nb x nb table, 181 KB), so the reverse count pass is gone. Local: instructions 0.964, user cycles 0.969 | run-ad2a7cbc4bf1 | 0.1223 | 62.4 | 454 | 73.23 |
+| 51 | 10f17ed | Same D code as step 50 (another track changed) | run-120aa8b8076a | 0.12348 | 63.0 | 454 | 73.08 |
+| 52 | 0e6cbba | Same D code as step 50 | run-81a650904f09 | 0.12595 | | | |
+| 53 | 2969af0 | Same D code as step 50 | run-6a8c3a2f1e66 | 0.12602 | | | |
+| 54 | a5424af | Same D code as step 50 | run-1204a27891d0 | 0.12060 | 62.74 | | 73.36 |
+| 55 | 01feb2f | Same D code as step 50 (the base of D8) | run-0706657d930f | 0.12030 | 62.73 | 454 | 73.39 |
+| 56 | 1f2babf | D8 (8f66c96): the BFS walk copies each node's slots into the final array as it visits the node; the relabel builder and its ~30 MB staging are deleted | run-1824e747e5f2 | 0.11857 | 59.60 | 548 | 73.15 |
+| 57 | ca47b93 | Experiment: caaae48, the compact rewrite (list queue with a u32 per node, csr temporaries kept alive); reverted in bd37ea3 | run-df90faccdf42 | 0.13417 | 64.54 | 471 | 71.96 |
+| 58 | aec6eeb | Experiment: D9 (ec8bea9), AVX2 line parse; board-neutral, reverted in 0877fdc | run-fcabe95e4ff5 | 0.12298 | 62.42 | 466 | 73.08 |
+| 59 | ed40986 | D8 (589b2cb): 8f66c96's walk again (VecDeque, one count byte per node), compact, with csr and finish merged | run-8c9a46d5bee5 | 0.11602 | 60.35 | 488 | 73.71 |
+| 60 | d93b8f6 | D8 (d7c421b): memcpy copy, count byte in place; **shipped** | run-0c5c2a4acdd4 | 0.11637 | 59.89 | 483 | 73.75 |
 
 ## How it works now
 
@@ -95,17 +108,24 @@ operating point 1% of T is worth about 0.11 points, 1% of M about 0.04, and 10 l
    out from the bucket's first slot (blocks of 16 nodes, falling back to smaller blocks if an
    in-block offset does not fit in a byte) and reorder the slots through a 94 KB scratch copy,
    packing in place and waiting only for earlier buckets whose staged slots it overwrites. There is
-   no degree array and no separate layout pass.
-2. **Relabel** nodes in breadth-first order: each thread grows its own region from a seed and
-   claims nodes with one bit in a 218 KB bitset (the 7 MB id array is written once, at the end, so
-   the walk no longer faults it in with a CAS per node). The BFS prefetches offsets 16 nodes ahead
-   and edge lists 8 ahead. The relabelled graph is not copied: it is built by the same bucketed
-   builder from g0, with edges read as `id[u] -> id[v]` (the id lookups are prefetched in the fill
-   pass only). Neighbours in the road network become neighbours in memory.
-3. **Reverse graph**, built from the relabelled one with the same builder, written into g0's
-   already-mapped edge array (it has exactly as many slots). The builder is split into count/fill
-   and finish so that the ids and g0's offsets are freed before the relabelled finish reuses that
-   heap.
+   no degree array and no separate layout pass. `csr` and its finish are one function: every build
+   finishes at once.
+2. **Relabel** (`relabel`) nodes in breadth-first order, in one pass over each node's data. Each
+   thread grows its own region from a seed and claims nodes with one bit in a 218 KB bitset. A node
+   is dequeued with its edge list already in cache (its neighbours were just claimed from it), so
+   the walk writes the node's provisional id (region number and rank in the region, at dequeue),
+   copies the node's raw slots with one `memcpy` to the end of the region's segment of a scratch
+   array, and writes the count (one byte per node; 255 means the count is in a short side list).
+   The queue is a `VecDeque<u32>`. The walk prefetches offsets 16 nodes ahead and edge lists 8
+   ahead. Then offsets are laid out from the counts (blocks of 16 nodes, smaller if an in-block
+   offset does not fit a byte), and per bucket of 8,192 new ids the slots are moved into g0's own
+   edge array with every target rewritten to its new id. The same pass counts the reverse graph's
+   slots per (bucket, bucket) pair (an nb x nb table, 181 KB). This replaces the old relabel
+   builder (count, fill into about 30 MB of staging, finish), which held the process's memory
+   peak. The ids and segments are one scratch allocation, freed at once; only pages written are
+   charged. Neighbours in the road network become neighbours in memory.
+3. **Reverse graph**, built from the relabelled one by `csr`, from the table's counts, into a fresh
+   array (g0's array now holds the forward graph).
 4. **Queries**, 12 threads pulling from an atomic counter, in order of |s - t| (BFS ids)
    descending, so the long searches start early: two-ended Dijkstra, forward from s and backward
    from t, expanding the side with fewer queued entries, stopping when the two queue minimums
@@ -126,7 +146,7 @@ operating point 1% of T is worth about 0.11 points, 1% of M about 0.04, and 10 l
 | Forward + reverse graph | 2 x 22.2 MB | |
 | Labels, per thread | pages of 64 node ids per side from a pool, found through a u16 page number per 64 ids (one directory per side) | BFS order keeps a search inside few pages; measured pool over 12 threads: about 9 MB |
 | Queue, per thread and side | Dial queue: 8,192 bucket heads (32 KB) and a pool of 16-byte entries [label index, first edge slot, end slot, next] that reuses popped entries | a pop starts on the label and the edges without a lookup |
-| Build only | a u16 bucket position per slot (about 10 MB, plus holes: the text staging is about 27% larger than the final slot count), the 7 MB id array | freed before the queries; the peak is in the text phase (about 41 MB) and the relabel finish |
+| Build only | text phase: a u16 bucket position per slot (about 10 MB, plus holes: the staging is about 27% larger than the final slot count); relabel: the 7 MB id array, one segment per thread holding each node's raw slots (20 MB written in all) and one count byte per node (1.7 MB) | freed before the queries; the board peak is 59.89 MB (62.4 before D8) |
 
 ### Where the time goes
 
@@ -140,9 +160,10 @@ Local, 12 threads, on the loaded laptop, from the commits that measured each pha
 | Whole build: parse, BFS, copy, reverse | 97.2 ms (median) | a68518e |
 | Whole build after steps 44-48 | about 65 ms (77 ms at a9974c9 minus 12.4 ms) of a 107.7 ms process; at step 42 it was 89 of 137 ms | 7f21d9f |
 | Queries | 56.0 ms (308.1 ms on one thread) | after step 30 |
+| Relabel, before and after D8 (laptop, user cycles) | old relabel about 515M; walk with copy 638M (701M before d7c421b) plus bucket pass about 235M. The copy itself is +100M user and +52M kernel cycles (segment page faults) | D8 notes, 589b2cb/d7c421b |
 | From the write to process end | 3.6 ms (median; 8.5 ms before step 40) | f29f0fa |
 
-The board's T for the shipped code is 0.134-0.143 s.
+The board's T for the shipped code is 0.116-0.118 s (steps 59-60); steps 51-55, the same build before D8, ran 0.120-0.126 s.
 
 ## The steps, with what each one taught
 
@@ -278,9 +299,39 @@ and 12, and 12 adversarial graphs (fallback to smaller blocks and to the countin
 70,000, n = 8192/8193/16385, weights near W and above 2^31, a wrong header m, n = 1, an empty
 graph) at 1/3/12 threads; D4 also passed a 300-graph, 120,000-query randomized self-test of `via`.
 
+**Steps 56-60 (D8): the BFS copies the edge lists.** The old relabel built the new graph with the
+bucketed builder: a count pass, a fill into about 30 MB of staging, a finish. That staging, with
+g0, the ids and the u16 places, was the process's memory peak (see "Memory floor"). The new walk
+does the work when it already holds the data: the node is dequeued with its raw slots in cache
+(the walk just read them to claim its neighbours), so it copies them to the end of its region's
+segment and writes its id; a bucket pass later lays out the offsets and moves the slots into g0's
+array with the new targets (see "How it works now").
+- **First version (8f66c96, run-1824e747e5f2):** 118.57 ms, 59.60 MB, 73.15 (548 lines), against
+  120.6-126.0 ms and 62.7 MB for the same base. Locally: user cycles -2%, kernel cycles +17%
+  (+5K page faults: the segments are fresh memory), process time -3..+3%.
+- **Compact rewrite (caaae48, run-df90faccdf42): worse, reverted.** 134.17 ms, 64.54 MB, 471
+  lines. Bisect with `bench.py` memory.peak (max of 5): a list queue holding a u32 per node (7 MB,
+  as in the old code) where 8f66c96 had a `VecDeque` and one count byte per node, +5 MB; and the
+  merged `csr`/finish kept `csr`'s step-1 temporaries (ni x nb counters; 0.7 MB for the reverse
+  graph's 213 items) alive through the queries, +0.7 MB.
+- **589b2cb (run-8c9a46d5bee5):** 8f66c96's walk again (VecDeque, count bytes, 8-slot copy), ids
+  written at dequeue, the compaction kept: 116.02 ms, 60.35 MB, 73.71. Against the old code: user
+  cycles -3.6%, kernel +20%, process time paired 0.935.
+- **d7c421b = d93b8f6 (run-0c5c2a4acdd4, shipped):** a `memcpy` for the copy and the count byte in
+  place: walk user cycles 701M -> 638M against 589b2cb, process paired 0.97. 116.37 ms, 59.89 MB,
+  483 lines, 73.75. Against the base (01feb2f): memory 62.73 -> 59.89 MB, time 120.30 -> 116.37 ms.
+- **Lines 548 -> 471 -> 483:** one `relabel` (walk, per-bucket layout, copy, reverse counts)
+  instead of `bfs_order` + layout + `relabel`; the old list queue reused, its entries becoming the
+  nodes' first slots; `csr` and finish merged; `find` over the block sizes.
+- **Cost inside the walk** (elimination builds): the copy +100M user and +52M kernel cycles, the
+  ids +22M over the old id pass, the counts +14M.
+- Wall time on the laptop swung +-25% with other jobs running, so these were decided on cycle
+  counters and `bench.py` memory.peak (reproducible to +-0.4 MB). Rejected ideas are in the failure
+  museum (3-byte slots, AVX2 parse, chunked segments).
+
 **Board noise.** Identical D code gave 0.1447 / 0.1405 s (steps 28-29), 0.1364 / 0.1381 s
 (30-31), 0.1368 / 0.1378 s (32-33), 0.1394 / 0.1441 / 0.1402 / 0.1409 s (34, 35, 38, 39) and
-0.1337 / 0.1337 / 0.1432 s (40-42) and 0.1344 s (43); the step-44 build code gave 0.1331 / 0.1327 / 0.1361 / 0.1402 s (44-47), the last while unchanged C code also ran 8% slow. A single run cannot resolve changes under about 4%, and one in
+0.1337 / 0.1337 / 0.1432 s (40-42) and 0.1344 s (43); steps 50-55 (before D8) gave 0.1223 / 0.1235 / 0.1260 / 0.1260 / 0.1206 / 0.1203 s; the step-44 build code gave 0.1331 / 0.1327 / 0.1361 / 0.1402 s (44-47), the last while unchanged C code also ran 8% slow. A single run cannot resolve changes under about 4%, and one in
 three runs is off by 7%. So query-side changes were decided on hardware counters (perf user-space
 cycles, instructions and branch misses in docker, interleaved A/B), which reproduce within a few
 percent on a loaded machine, and then confirmed on the board.
@@ -379,6 +430,11 @@ with fewer queued entries instead of the smaller key, 7.15M.
 | Drop `#[inline(always)]` from `off`/`adj`/`slots`/`ix` (b764d34, -4 lines) | | BFS walk cycles +6%, reverse fill +6% | LLVM does not inline them |
 | Reverse counts collected in the relabel finish; text u16 places reused for the relabel | -2 ms and -1 ms | not built | +10 and +6 lines for those gains; the text munmap only moves, and keeping the buffer would put a 10 MB array in the query-phase peak |
 | Relabel copy in new-id order (sequential writes through the inverse permutation, three prefetch stages) | sequential stores | 12 threads min 23.4 -> 22.6 ms but q1 27.1 -> 27.2 ms; 1 thread +20% cycles, +9% instructions | each node now costs three random line reads instead of two reads and one random write |
+| 3-byte slots for g and r (D8 round 8): weight in the top 10 bits, v - u in the other 14; g0 stays 4 bytes | -8 MB | memory.peak -7.7 MB (64.6 -> 56.9) but process min 110.9 -> 129.4 ms (+16-22%): relabel 535M -> 1025M user cycles, reverse 237M -> 360M, queries +3% | a target's new id is unknown before the BFS, so g needed a count pass of 5M random id lookups and a direct copy with random writes; the delta decode adds latency before each label lookup. 1 MB is worth about 0.075 points, +16% time costs 1.6, the memory gain only 0.57 |
+| AVX2 line parse (D9, ec8bea9) | fewer parse cycles | board aec6eeb, run-fcabe95e4ff5: 122.98 ms, 62.42 MB, 73.08, against 120.30 ms for the base | no gain beyond noise; reverted in 0877fdc |
+| Compact walk with a u32-per-node list queue and kept csr temporaries (caaae48) | -80 lines | board ca47b93, run-df90faccdf42: 134.17 ms, 64.54 MB, 71.96 | +5 MB from the queue, +0.7 MB from the temporaries; fixed in 589b2cb by going back to the VecDeque and count bytes |
+| Chunked segments in the walk (the reverse staged in pages the BFS already faulted in) | fewer faults | faults back to the base's, reverse kernel cycles 54M -> 22M | +12 lines; not shipped |
+| MADV_POPULATE_WRITE on csr's staging and places | fewer faults in the reverse build | same fault counts, kernel cycles within noise, process paired 0.97 | no signal |
 
 ## Correctness
 
@@ -411,7 +467,12 @@ python -I tools/bench.py d --gate G3 --threads 7 --no-build  # the same with FW_
 The data comes from the public generator (`d_traverse.py --seed 1 --scale full`). `FW_THREADS`
 sets the thread count; the default is the available parallelism.
 
-## Memory floor (measured Nov 1, D7)
+## Memory floor (measured Nov 1, D7; the shipped D8 code follows the note)
+
+Nov 2 note: D8 (d93b8f6) removed the 20 MB g1 staging and the 10 MB place array of the relabel fill
+that this section describes. The board's M fell from 62.73 MB (01feb2f, run-0706657d930f) to
+59.89 MB (run-0c5c2a4acdd4). The figures below were measured on the old relabel and are kept as the
+record of why D8 was built.
 
 The peak (58.2 MB anon RSS at the phase ticks, ~59.7 MB sampled; board 62.4 MB) is in the relabel fill, when g0
 (22.2 MB), the new ids (7 MB), the g1 staging (20 MB) and its place array (10 MB) are all live. Every later phase sits
